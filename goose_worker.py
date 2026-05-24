@@ -195,7 +195,7 @@ def claim_next_job() -> dict | None:
     if code == 200 and resp:
         return resp
     if code != 204 and code != 0:
-        print(f"[worker] dequeue unexpected code={code}", flush=True)
+        print(f"[worker] dequeue unexpected code={code} resp={resp}", flush=True)
     return None
 
 

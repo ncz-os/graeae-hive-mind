@@ -179,11 +179,17 @@ class SqliteHiveMindRepository:
         self.db_path = db_path
 
     async def init(self) -> None:
-        raise NotImplementedError(
-            "SqliteHiveMindRepository.init: migrate service.py lifespan SCHEMA "
-            "+ ALTER TABLE block into this method, then have lifespan() call "
-            "repo.init() instead of running SQL directly."
-        )
+        import os
+        import aiosqlite
+
+        db_dir = os.path.dirname(self.db_path)
+        if db_dir:
+            os.makedirs(db_dir, exist_ok=True)
+        async with aiosqlite.connect(self.db_path, check_same_thread=False) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute("PRAGMA synchronous=NORMAL")
+            await db.execute("PRAGMA busy_timeout=5000")
+            await db.commit()
 
     # ---------- agents (Phase 2 migration cut 1) ----------
 
@@ -206,7 +212,10 @@ class SqliteHiveMindRepository:
         import json as _json
         import aiosqlite
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with aiosqlite.connect(self.db_path, check_same_thread=False) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute("PRAGMA synchronous=NORMAL")
+            await db.execute("PRAGMA busy_timeout=5000")
             await db.execute(
                 "INSERT INTO agents (urn, kind, runtime, model, provider, cost_tier, "
                 "autonomy_level, auth_method, plan_cap_usd, plan_period_used_usd, "

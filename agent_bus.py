@@ -31,9 +31,27 @@ HEARTBEAT_OFFLINE_AFTER = 300.0
 EVENTS_RETAIN_HOURS = 168  # 7 days
 SSE_PING_INTERVAL = 15.0
 EVENT_QUEUE: dict[str, asyncio.Queue] = {}  # subscriber_id -> queue
+SQLITE_BUSY_TIMEOUT_MS = int(os.environ.get("AGENT_BUS_SQLITE_BUSY_TIMEOUT_MS", "5000"))
+MAX_EVENT_SUBSCRIBERS = int(os.environ.get("AGENT_BUS_MAX_EVENT_SUBSCRIBERS", "100"))
 
 
 # ---------- helpers ----------
+
+@asynccontextmanager
+async def connect_db():
+    db = await aiosqlite.connect(
+        DB_PATH,
+        timeout=SQLITE_BUSY_TIMEOUT_MS / 1000,
+        check_same_thread=False,
+    )
+    try:
+        await db.execute("PRAGMA journal_mode=WAL")
+        await db.execute("PRAGMA synchronous=NORMAL")
+        await db.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+        yield db
+    finally:
+        await db.close()
+
 
 def uuidv7() -> str:
     """Time-ordered UUID for monotonic index inserts."""
@@ -346,6 +364,16 @@ def json_list(raw: Optional[str]) -> list[Any]:
     return val if isinstance(val, list) else []
 
 
+def clamp_limit(value: int, *, default: int = 100, max_limit: int = 1000) -> int:
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        return default
+    if limit < 1:
+        return default
+    return min(limit, max_limit)
+
+
 def agent_kind_aliases(kind: str, runtime: Optional[str]) -> set[str]:
     aliases = {kind}
     if runtime:
@@ -369,7 +397,7 @@ def field_was_set(model: BaseModel, name: str) -> bool:
 async def require_registered_agent(urn: str, *, active_only: bool = False) -> tuple[str, str]:
     if not urn or not urn.strip():
         raise HTTPException(422, "agent urn is required")
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_db() as db:
         async with db.execute(
             "SELECT runtime, status FROM agents WHERE urn=?",
             (urn,),
@@ -667,7 +695,7 @@ async def reaper_task(app: FastAPI):
     while True:
         await asyncio.sleep(HEARTBEAT_REAP_INTERVAL)
         try:
-            async with aiosqlite.connect(DB_PATH) as db:
+            async with connect_db() as db:
                 # 1. Heartbeat reaper: online/idle -> stale after 90s, offline after 5m.
                 now_ts = time.time()
                 stale_cutoff = now_ts - HEARTBEAT_STALE_AFTER
@@ -815,7 +843,7 @@ async def reaper_task(app: FastAPI):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_db() as db:
         await db.executescript("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
         await db.executescript(SCHEMA)
         # graeae:schema-drift (2026-05-23): additive migrations for live DBs.
@@ -1021,7 +1049,7 @@ async def register(req: AgentRegister):
     session_id = str(uuid.uuid4())
     urn = make_urn(kind, req.host, session_id)
     now = time.time()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_db() as db:
         await db.execute(
             "INSERT INTO agents (urn, kind, runtime, model, provider, cost_tier, autonomy_level, "
             "auth_method, plan_cap_usd, plan_period_used_usd, "
@@ -1056,7 +1084,7 @@ async def heartbeat(req: AgentHeartbeat):
     status = (req.status or "online").lower()
     if status not in VALID_AGENT_STATUSES:
         raise HTTPException(422, f"agent status must be one of {sorted(VALID_AGENT_STATUSES)}, got {status!r}")
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_db() as db:
         if req.metadata is not None:
             async with db.execute(
                 "SELECT metadata FROM agents WHERE urn=?",
@@ -1114,7 +1142,7 @@ async def list_agents(
     if cost_tier: sql += " AND cost_tier=?"; args.append(cost_tier)
     sql += " ORDER BY last_heartbeat DESC"
     rows = []
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_db() as db:
         async with db.execute(sql, args) as cur:
             async for r in cur:
                 meta = json.loads(r[7]) if r[7] else {}
@@ -1146,7 +1174,7 @@ async def list_agents(
 @app.get("/v1/agents/stats")
 async def agent_stats():
     counts = {status: 0 for status in VALID_AGENT_STATUSES}
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_db() as db:
         async with db.execute(
             "SELECT status, COUNT(*) FROM agents GROUP BY status"
         ) as cur:
@@ -1164,7 +1192,7 @@ async def agent_stats():
 @app.get("/v1/agents/{urn_path:path}/throttle")
 async def agent_throttle(urn_path: str):
     """Inspect an agent's plan-cap throttle state."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_db() as db:
         async with db.execute(
             "SELECT urn, kind, runtime, auth_method, plan_cap_usd, plan_period_used_usd "
             "FROM agents WHERE urn=?", (urn_path,)) as cur:
@@ -1187,7 +1215,7 @@ async def agent_throttle(urn_path: str):
 @app.post("/v1/agents/{urn_path:path}/plan-reset")
 async def reset_plan_period(urn_path: str):
     """Operator zeros the MTD usage — call monthly on billing rollover."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_db() as db:
         cur = await db.execute(
             "UPDATE agents SET plan_period_used_usd = 0 WHERE urn=?", (urn_path,))
         await db.commit()
@@ -1200,7 +1228,7 @@ async def reset_plan_period(urn_path: str):
 async def whoami(host: str, pid: int):
     """Help a session find ITS OWN urn by (host, pid) — most recent online registration wins.
     Useful when a session forgets its urn after restart and needs to re-discover its identity."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_db() as db:
         async with db.execute(
             "SELECT urn, kind, runtime, model, provider, cost_tier, autonomy_level, started_at "
             "FROM agents WHERE host=? AND pid=? AND status='online' "
@@ -1239,7 +1267,7 @@ async def create_job(req: JobCreate):
     if req.depends_on:
         if job_id in req.depends_on:
             raise HTTPException(422, "depends_on cannot include self")
-        async with aiosqlite.connect(DB_PATH) as _vd:
+        async with connect_db() as _vd:
             placeholders = ",".join("?" * len(req.depends_on))
             async with _vd.execute(
                 f"SELECT id FROM jobs WHERE id IN ({placeholders})",
@@ -1257,7 +1285,7 @@ async def create_job(req: JobCreate):
 
     # RESULT-CACHE CHECK: identical (kind, description, max_cost_tier, required_caps) within TTL → return cached result, mark new job done immediately
     ck = cache_key_for(req.kind, req.description, max_cost_tier, req.required_capabilities)
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_db() as db:
         cached = await cache_lookup(db, ck)
         if cached:
             # short-circuit: store job as done with cached result + cost=0
@@ -1348,17 +1376,19 @@ async def dequeue_next_job(agent_urn: str):
     Race-safe via SQLite immediate-mode UPDATE...WHERE rowid=(SELECT...LIMIT 1) under a transaction.
     """
     now = time.time()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_db() as db:
         async with db.execute(
             "SELECT kind, capabilities, runtime, model, provider, cost_tier, "
-            "auth_method, plan_cap_usd, plan_period_used_usd "
-            "FROM agents WHERE urn=? AND status IN ('online','idle')",
+            "auth_method, plan_cap_usd, plan_period_used_usd, status "
+            "FROM agents WHERE urn=?",
             (agent_urn,),
         ) as cur:
             row = await cur.fetchone()
         if not row:
-            raise HTTPException(404, f"agent not registered or offline: {agent_urn}")
-        agent_kind, caps_json, a_runtime, a_model, a_provider, a_tier, a_auth, a_cap, a_used = row
+            raise HTTPException(404, f"claim failed: agent not registered: {agent_urn}")
+        agent_kind, caps_json, a_runtime, a_model, a_provider, a_tier, a_auth, a_cap, a_used, agent_status = row
+        if agent_status not in ACTIVE_AGENT_STATUSES:
+            raise HTTPException(409, f"claim failed: agent status is {agent_status!r}, not online/idle: {agent_urn}")
         agent_caps = set(json.loads(caps_json)) if caps_json else set()
         eligible_aliases = agent_kind_aliases(agent_kind, a_runtime)
         a_tier = a_tier or "C"
@@ -1368,6 +1398,7 @@ async def dequeue_next_job(agent_urn: str):
         sub_throttled = (a_auth == "subscription" and a_cap and a_used and a_used >= THROTTLE_HEADROOM * a_cap)
 
         await db.execute("BEGIN IMMEDIATE")
+        committed = False
         try:
             async with db.execute(
                 "SELECT id, kind, description, priority, deadline, required_capabilities, eligible_kinds, "
@@ -1406,6 +1437,8 @@ async def dequeue_next_job(agent_urn: str):
                             continue
                     # filter: cost-tier cap (token-miser default: A=free only)
                     job_max_tier = (j_max_tier or "A").upper()
+                    if job_max_tier not in COST_TIERS:
+                        continue
                     if COST_TIERS.index(a_tier) > COST_TIERS.index(job_max_tier):
                         continue
                     # throttle: subscription claude past 85% MTD limited to tier-A only
@@ -1430,6 +1463,7 @@ async def dequeue_next_job(agent_urn: str):
                          now + CLAIM_LEASE_SECONDS, job_id),
                     )
                     await db.execute("COMMIT")
+                    committed = True
                     await emit_event(db, "job.claimed", {
                         "id": job_id, "claimed_by": agent_urn, "kind": j_kind,
                         "runtime": a_runtime, "model": a_model,
@@ -1447,10 +1481,23 @@ async def dequeue_next_job(agent_urn: str):
                         },
                     }
             await db.execute("COMMIT")
+            committed = True
+        except aiosqlite.Error as e:
+            if not committed:
+                await db.execute("ROLLBACK")
+            raise HTTPException(500, f"claim failed: database error while claiming next job: {e}") from e
         except Exception:
-            await db.execute("ROLLBACK")
+            if not committed:
+                await db.execute("ROLLBACK")
             raise
-    return JSONResponse(status_code=204, content=None)
+    return JSONResponse(
+        status_code=204,
+        content=None,
+        headers={
+            "X-Hive-Claim-Result": "no_jobs_available",
+            "X-Hive-Claim-Detail": "no queued jobs matched agent eligibility, dependencies, backoff, or cost tier",
+        },
+    )
 
 
 @app.patch("/v1/jobs/{job_id}")
@@ -1489,7 +1536,7 @@ async def update_job(job_id: str, req: JobUpdate):
     )
     cost_estimate = None
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_db() as db:
         await db.execute("BEGIN IMMEDIATE")
         try:
             async with db.execute(
@@ -1671,7 +1718,7 @@ async def update_job(job_id: str, req: JobUpdate):
             await db.execute("ROLLBACK")
             raise
 
-    async with aiosqlite.connect(DB_PATH) as event_db:
+    async with connect_db() as event_db:
         if req.status == "failed" and retry_count < max_retries:
             await emit_event(event_db, "job.retry", {
                 "id": job_id, "retry_count": retry_count + 1,
@@ -1702,7 +1749,7 @@ async def create_schedule(req: ScheduleCreate):
     except Exception as e:
         raise HTTPException(422, f"job_template invalid: {e}")
     await require_orchestrator_submitter(tpl_copy["submitter_urn"])
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_db() as db:
         await db.execute(
             "INSERT INTO scheduled_jobs (id, name, created_by_urn, interval_seconds, "
             "job_template, enabled, last_fired_at, next_fire_at, created_at) "
@@ -1718,7 +1765,7 @@ async def create_schedule(req: ScheduleCreate):
 @app.get("/v1/schedules")
 async def list_schedules():
     rows = []
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_db() as db:
         async with db.execute(
             "SELECT id, name, created_by_urn, interval_seconds, enabled, "
             "last_fired_at, next_fire_at, fire_count, created_at FROM scheduled_jobs"
@@ -1750,7 +1797,7 @@ async def patch_schedule(sid: str, enabled: Optional[bool] = None,
     if not sets:
         raise HTTPException(422, "no fields to update")
     args.append(sid)
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_db() as db:
         cur = await db.execute(
             f"UPDATE scheduled_jobs SET {', '.join(sets)} WHERE id=?", args)
         await db.commit()
@@ -1761,7 +1808,7 @@ async def patch_schedule(sid: str, enabled: Optional[bool] = None,
 
 @app.delete("/v1/schedules/{sid}")
 async def delete_schedule(sid: str):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_db() as db:
         cur = await db.execute("DELETE FROM scheduled_jobs WHERE id=?", (sid,))
         await db.commit()
     if cur.rowcount == 0:
@@ -1777,6 +1824,7 @@ async def worker_stats(kind: Optional[str] = None, top_n: int = 30,
     #8 FIX (review 2026-05-23): exclude `system` kind agents by default (they're host monitors,
     not compute workers — including them was misleading). Pass include_system=true to override.
     """
+    top_n = clamp_limit(top_n, default=30, max_limit=500)
     sql = ("SELECT urn, kind, success_count, fail_count, cancelled_count, "
            "total_tokens_in, total_tokens_out, ROUND(total_cost_usd,4), "
            "ROUND(total_duration_sec/NULLIF(success_count+fail_count,0),1) AS avg_dur, "
@@ -1790,9 +1838,9 @@ async def worker_stats(kind: Optional[str] = None, top_n: int = 30,
     if not include_system:
         sql += " AND urn NOT LIKE 'urn:agent:system:%'"
     sql += " ORDER BY success_count DESC, success_pct DESC LIMIT ?"
-    args.append(int(top_n))
+    args.append(top_n)
     rows = []
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_db() as db:
         async with db.execute(sql, args) as cur:
             async for r in cur:
                 rows.append({
@@ -1808,7 +1856,8 @@ async def worker_stats(kind: Optional[str] = None, top_n: int = 30,
 @app.get("/v1/stats/cache")
 async def cache_stats(top_n: int = 20):
     """Result-cache hit-rate + cost savings."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    top_n = clamp_limit(top_n, default=20, max_limit=500)
+    async with connect_db() as db:
         async with db.execute(
             "SELECT COUNT(*), SUM(hit_count), ROUND(SUM(cost_saved_usd),4) FROM hive_cache"
         ) as cur:
@@ -1826,7 +1875,7 @@ async def cache_stats(top_n: int = 20):
             "SELECT cache_key, hit_count, cost_saved_usd, model, provider, "
             "datetime(cached_at,'unixepoch') AS cached_at, source_job_id "
             "FROM hive_cache ORDER BY hit_count DESC, cost_saved_usd DESC LIMIT ?",
-            (int(top_n),)
+            (top_n,)
         ) as cur:
             entries = []
             async for row in cur:
@@ -1872,7 +1921,7 @@ async def cost_stats(since_hours: int = 168, group_by: str = "provider"):
         f"GROUP BY bucket ORDER BY tot_cost_usd DESC, job_count DESC"
     )
     rows = []
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_db() as db:
         async with db.execute(sql, (cutoff,)) as cur:
             async for r in cur:
                 rows.append({
@@ -1888,6 +1937,26 @@ async def cost_stats(since_hours: int = 168, group_by: str = "provider"):
         "estimated_cost_usd": round(sum(r["estimated_cost_usd"] or 0 for r in rows), 4),
     }
     return {"since_hours": since_hours, "group_by": group_by, "totals": totals, "buckets": rows}
+
+
+@app.get("/v1/jobs/metrics")
+async def job_metrics():
+    counts = {"pending": 0, "running": 0, "completed": 0, "failed": 0, "total": 0}
+    async with connect_db() as db:
+        async with db.execute(
+            "SELECT status, COUNT(*) FROM jobs GROUP BY status"
+        ) as cur:
+            async for status, count in cur:
+                counts["total"] += count
+                if status in {"queued", "offered"}:
+                    counts["pending"] += count
+                elif status in {"claimed", "running"}:
+                    counts["running"] += count
+                elif status == "done":
+                    counts["completed"] += count
+                elif status == "failed":
+                    counts["failed"] += count
+    return counts
 
 
 @app.post("/v1/jobs/{job_id}/claim")
@@ -1907,19 +1976,21 @@ async def claim_job(job_id: str, by: str):
     contract as auto-claims.
     """
     now = time.time()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_db() as db:
         # 1. agent must exist + be online/idle
         async with db.execute(
             "SELECT kind, capabilities, runtime, model, provider, cost_tier, "
-            "auth_method, plan_cap_usd, plan_period_used_usd "
-            "FROM agents WHERE urn=? AND status IN ('online','idle')",
+            "auth_method, plan_cap_usd, plan_period_used_usd, status "
+            "FROM agents WHERE urn=?",
             (by,),
         ) as cur:
             agent_row = await cur.fetchone()
         if not agent_row:
-            raise HTTPException(404, f"agent not registered or offline: {by}")
+            raise HTTPException(404, f"claim failed: agent not registered: {by}")
         (agent_kind, caps_json, a_runtime, a_model, a_provider, a_tier,
-         a_auth, a_cap, a_used) = agent_row
+         a_auth, a_cap, a_used, agent_status) = agent_row
+        if agent_status not in ACTIVE_AGENT_STATUSES:
+            raise HTTPException(409, f"claim failed: agent status is {agent_status!r}, not online/idle: {by}")
         agent_caps = set(json.loads(caps_json)) if caps_json else set()
         eligible_aliases = agent_kind_aliases(agent_kind, a_runtime)
         a_tier = a_tier or "C"
@@ -1994,6 +2065,8 @@ async def claim_job(job_id: str, by: str):
 
         # cost-tier ceiling
         job_max_tier = (j_max_tier or "A").upper()
+        if job_max_tier not in COST_TIERS:
+            raise HTTPException(422, f"job max_cost_tier is invalid: {job_max_tier!r}")
         if COST_TIERS.index(a_tier) > COST_TIERS.index(job_max_tier):
             raise HTTPException(
                 403,
@@ -2056,6 +2129,7 @@ async def list_jobs(
     since: Optional[float] = None,
     limit: int = 100,
 ):
+    limit = clamp_limit(limit, default=100, max_limit=1000)
     sql = ("SELECT id, submitter_urn, parent_job_id, kind, description, priority, status, "
            "claimed_by, started_at, ended_at, result, estimated_cost_usd FROM jobs WHERE 1=1")
     args: list = []
@@ -2068,9 +2142,10 @@ async def list_jobs(
     if since:
         sql += " AND started_at >= ?"
         args.append(since)
-    sql += f" ORDER BY priority DESC, started_at DESC LIMIT {int(limit)}"
+    sql += " ORDER BY priority DESC, started_at DESC LIMIT ?"
+    args.append(limit)
     rows = []
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_db() as db:
         async with db.execute(sql, args) as cur:
             async for r in cur:
                 rows.append({
@@ -2089,7 +2164,7 @@ async def publish_message(req: MessagePublish):
     msg_id = uuidv7()
     now = time.time()
     await require_registered_agent(req.from_urn, active_only=True)
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_db() as db:
         await db.execute(
             "INSERT INTO messages (id, from_urn, to_urn, in_reply_to, topic, payload, ts) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -2110,6 +2185,7 @@ async def list_messages(
     since: Optional[float] = None,
     limit: int = 100,
 ):
+    limit = clamp_limit(limit, default=100, max_limit=1000)
     sql = "SELECT id, from_urn, to_urn, in_reply_to, topic, payload, ts FROM messages WHERE 1=1"
     args: list = []
     if to_urn:
@@ -2121,9 +2197,10 @@ async def list_messages(
     if since:
         sql += " AND ts >= ?"
         args.append(since)
-    sql += f" ORDER BY ts DESC LIMIT {int(limit)}"
+    sql += " ORDER BY ts DESC LIMIT ?"
+    args.append(limit)
     rows = []
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_db() as db:
         async with db.execute(sql, args) as cur:
             async for r in cur:
                 rows.append({
@@ -2136,6 +2213,8 @@ async def list_messages(
 @app.get("/v1/events")
 async def stream_events(request: Request, since_id: Optional[int] = None):
     """SSE stream of events. Optional since_id for catch-up."""
+    if len(EVENT_QUEUE) >= MAX_EVENT_SUBSCRIBERS:
+        raise HTTPException(503, f"too many event subscribers; max={MAX_EVENT_SUBSCRIBERS}")
     sub_id = str(uuid.uuid4())
     queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
     EVENT_QUEUE[sub_id] = queue
@@ -2144,7 +2223,7 @@ async def stream_events(request: Request, since_id: Optional[int] = None):
         try:
             # catch-up phase
             if since_id is not None:
-                async with aiosqlite.connect(DB_PATH) as db:
+                async with connect_db() as db:
                     async with db.execute(
                         "SELECT id, ts, kind, payload FROM events WHERE id > ? ORDER BY id ASC",
                         (since_id,),
@@ -2179,14 +2258,16 @@ async def stream_events(request: Request, since_id: Optional[int] = None):
 @app.get("/v1/events/log")
 async def events_log(since_id: Optional[int] = None, limit: int = 100):
     """JSON polling alternative to SSE."""
+    limit = clamp_limit(limit, default=100, max_limit=1000)
     sql = "SELECT id, ts, kind, payload, agent_urn FROM events"
     args: list = []
     if since_id is not None:
         sql += " WHERE id > ?"
         args.append(since_id)
-    sql += f" ORDER BY id ASC LIMIT {int(limit)}"
+    sql += " ORDER BY id ASC LIMIT ?"
+    args.append(limit)
     rows = []
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_db() as db:
         async with db.execute(sql, args) as cur:
             async for r in cur:
                 rows.append({
