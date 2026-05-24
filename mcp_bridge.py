@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
@@ -48,6 +49,14 @@ MNEMOS_TOKEN = os.environ.get("MNEMOS_TOKEN", "")
 
 server = Server("graeae-hive-mind")
 client = httpx.AsyncClient(timeout=15.0)
+
+
+@asynccontextmanager
+async def lifespan(app):
+    try:
+        yield
+    finally:
+        await client.aclose()
 
 
 async def _hive(method: str, path: str, **kw) -> dict:
@@ -289,6 +298,7 @@ async def handle_sse(request):
 
 app = Starlette(
     debug=False,
+    lifespan=lifespan,
     routes=[
         Route("/sse", endpoint=handle_sse),
         Mount("/messages/", app=sse.handle_post_message),

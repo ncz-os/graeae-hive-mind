@@ -15,6 +15,7 @@ import secrets
 import time
 import uuid
 from contextlib import asynccontextmanager
+from contextlib import suppress
 from typing import Optional, Any
 
 import aiosqlite
@@ -262,6 +263,8 @@ DEFAULT_PLAN_CAPS = {
     "unknown":      50.0,    # conservative
 }
 THROTTLE_HEADROOM = 0.85  # at >=85% of plan cap, prefer non-subscription workers for tier-B/C jobs
+VALID_AGENT_STATUSES = {"online", "idle", "offline", "error"}
+ACTIVE_AGENT_STATUSES = {"online", "idle"}
 
 # ROLE SPLIT (user directive 2026-05-23): opencode + goose + codex + hermes +
 # claw-family + ic-engine + unknown = WORKERS (claim-only). Cannot submit jobs.
@@ -360,6 +363,38 @@ def field_was_set(model: BaseModel, name: str) -> bool:
     if fields_set is None:
         fields_set = getattr(model, "__fields_set__", set())
     return name in fields_set
+
+
+async def require_registered_agent(urn: str, *, active_only: bool = False) -> tuple[str, str]:
+    if not urn or not urn.strip():
+        raise HTTPException(422, "agent urn is required")
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT runtime, status FROM agents WHERE urn=?",
+            (urn,),
+        ) as cur:
+            row = await cur.fetchone()
+    if not row:
+        raise HTTPException(403, f"agent is not registered: {urn}")
+    runtime = (row[0] or "unknown").lower()
+    status = (row[1] or "unknown").lower()
+    if active_only and status not in ACTIVE_AGENT_STATUSES:
+        raise HTTPException(403, f"agent {urn} is not active; current status={status!r}")
+    return runtime, status
+
+
+async def require_orchestrator_submitter(submitter_urn: str) -> str:
+    runtime, _status = await require_registered_agent(submitter_urn, active_only=True)
+    if runtime in WORKER_ONLY_RUNTIMES or runtime not in ORCHESTRATOR_RUNTIMES:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"role-violation: runtime={runtime!r} is not an orchestrator. "
+                f"Workers CLAIM jobs via POST /v1/jobs/next; only registered active "
+                f"orchestrators may SUBMIT jobs. Orchestrators: {sorted(ORCHESTRATOR_RUNTIMES)}."
+            ),
+        )
+    return runtime
 
 
 def normalize_result_payload(status: str, result: Optional[dict]) -> Optional[dict]:
@@ -816,8 +851,12 @@ async def lifespan(app: FastAPI):
             await db.execute(stmt)
         await db.commit()
     task = asyncio.create_task(reaper_task(app))
-    yield
-    task.cancel()
+    try:
+        yield
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
 
 
 app = FastAPI(title="GRAEAE Hive Mind", version="0.1.0", lifespan=lifespan)
@@ -929,10 +968,13 @@ async def register(req: AgentRegister):
 @app.post("/v1/agents/heartbeat")
 async def heartbeat(req: AgentHeartbeat):
     now = time.time()
+    status = (req.status or "online").lower()
+    if status not in VALID_AGENT_STATUSES:
+        raise HTTPException(422, f"agent status must be one of {sorted(VALID_AGENT_STATUSES)}, got {status!r}")
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             "UPDATE agents SET last_heartbeat=?, status=? WHERE urn=?",
-            (now, req.status, req.urn),
+            (now, status, req.urn),
         )
         await db.commit()
         if cur.rowcount == 0:
@@ -1057,6 +1099,9 @@ async def create_job(req: JobCreate):
     """
     job_id = uuidv7()
     now = time.time()
+    max_cost_tier = (req.max_cost_tier or "A").upper()
+    if max_cost_tier not in COST_TIERS:
+        raise HTTPException(422, f"max_cost_tier must be one of {COST_TIERS}, got {max_cost_tier!r}")
     if req.mnemos_refs:
         bad = [r for r in req.mnemos_refs if not (isinstance(r, str) and r.startswith("mem_"))]
         if bad:
@@ -1077,32 +1122,12 @@ async def create_job(req: JobCreate):
                 raise HTTPException(422, f"depends_on references unknown job ids: {missing}")
     # ROLE ENFORCEMENT: check submitter runtime BEFORE the cache lookup so
     # worker-only runtimes get a 403 consistently for both cache hits and
-    # cache misses. Previously this check ran AFTER cache_lookup, which
-    # meant a registered goose/opencode/codex worker that POSTed a job
-    # matching a recent cached result was returned the cached payload
-    # instead of being rejected — letting workers bypass the orchestrator-
-    # only submission policy whenever the cache had a relevant entry.
-    async with aiosqlite.connect(DB_PATH) as _role_db:
-        async with _role_db.execute(
-            "SELECT runtime FROM agents WHERE urn=?", (req.submitter_urn,)
-        ) as cur:
-            row = await cur.fetchone()
-        if row:
-            submitter_runtime = (row[0] or "unknown").lower()
-            if submitter_runtime in WORKER_ONLY_RUNTIMES:
-                raise HTTPException(
-                    status_code=403,
-                    detail=(
-                        f"role-violation: runtime={submitter_runtime!r} is a WORKER, not an orchestrator. "
-                        f"Workers CLAIM jobs via POST /v1/jobs/next, they don't SUBMIT them. "
-                        f"If you need to delegate, message a human or claude-code orchestrator instead. "
-                        f"Orchestrators: {sorted(ORCHESTRATOR_RUNTIMES)}."
-                    ),
-                )
-        # else: submitter not registered → allowed (human/external curl)
+    # cache misses. Unregistered submitter_urn values are rejected too; the
+    # endpoint contract says jobs are submitted by registered orchestrators.
+    await require_orchestrator_submitter(req.submitter_urn)
 
     # RESULT-CACHE CHECK: identical (kind, description, max_cost_tier, required_caps) within TTL → return cached result, mark new job done immediately
-    ck = cache_key_for(req.kind, req.description, (req.max_cost_tier or "A").upper(), req.required_capabilities)
+    ck = cache_key_for(req.kind, req.description, max_cost_tier, req.required_capabilities)
     async with aiosqlite.connect(DB_PATH) as db:
         cached = await cache_lookup(db, ck)
         if cached:
@@ -1119,7 +1144,7 @@ async def create_job(req: JobCreate):
                     json.dumps(req.required_capabilities) if req.required_capabilities else None,
                     json.dumps(req.eligible_kinds) if req.eligible_kinds else None,
                     req.project,
-                    (req.max_cost_tier or "A").upper(),
+                    max_cost_tier,
                     json.dumps(req.preferred_providers) if req.preferred_providers else None,
                     json.dumps(req.preferred_models) if req.preferred_models else None,
                     json.dumps(req.mnemos_refs) if req.mnemos_refs else None,
@@ -1160,7 +1185,7 @@ async def create_job(req: JobCreate):
                 json.dumps(req.required_capabilities) if req.required_capabilities else None,
                 json.dumps(req.eligible_kinds) if req.eligible_kinds else None,
                 req.project,
-                (req.max_cost_tier or "A").upper(),
+                max_cost_tier,
                 json.dumps(req.preferred_providers) if req.preferred_providers else None,
                 json.dumps(req.preferred_models) if req.preferred_models else None,
                 json.dumps(req.mnemos_refs) if req.mnemos_refs else None,
@@ -1175,7 +1200,7 @@ async def create_job(req: JobCreate):
             "description": req.description, "priority": req.priority,
             "required_capabilities": req.required_capabilities,
             "eligible_kinds": req.eligible_kinds,
-            "max_cost_tier": (req.max_cost_tier or "A").upper(),
+            "max_cost_tier": max_cost_tier,
             "mnemos_refs": req.mnemos_refs,
         })
     return {"id": job_id, "created_at": now, "mnemos_refs": req.mnemos_refs}
@@ -1360,27 +1385,41 @@ async def update_job(job_id: str, req: JobUpdate):
                 await db.execute("ROLLBACK")
                 raise HTTPException(409, f"terminal job status {old_status!r} cannot be reopened by PATCH")
 
-            if req.status == "queued" and old_status in {"claimed", "running", "offered"}:
-                if not claimed_by_was_set or req.claimed_by is not None:
-                    await db.execute("ROLLBACK")
-                    raise HTTPException(409, "release to queued requires explicit claimed_by=null")
-
-            if claimed_by_was_set and req.claimed_by is None and req.status not in {"queued", "cancelled"}:
+            if old_status in {"queued", "offered"} and req.status in {"claimed", "running"}:
                 await db.execute("ROLLBACK")
-                raise HTTPException(422, "claimed_by=null is only valid when releasing or cancelling a job")
+                raise HTTPException(
+                    409,
+                    "claim bypass rejected: use POST /v1/jobs/next or POST /v1/jobs/{job_id}/claim "
+                    "so agent registration, capabilities, dependencies, and cost tier are checked",
+                )
+
+            release_to_queue = req.status == "queued" and old_status in {"claimed", "running", "offered"}
+            if req.status == "queued" and old_status in {"claimed", "running", "offered"}:
+                if not old_claimed_by:
+                    await db.execute("ROLLBACK")
+                    raise HTTPException(409, "cannot release a job with no current claimant")
+                if not claimed_by_was_set or req.claimed_by != old_claimed_by:
+                    await db.execute("ROLLBACK")
+                    raise HTTPException(403, "release to queued requires claimed_by to match the current claimant")
+
+            if claimed_by_was_set and req.claimed_by is None:
+                await db.execute("ROLLBACK")
+                raise HTTPException(422, "claimed_by=null is not accepted; provide the current claimant urn")
 
             if claimed_by_was_set and req.claimed_by is not None:
                 if old_claimed_by and req.claimed_by != old_claimed_by:
                     await db.execute("ROLLBACK")
                     raise HTTPException(
-                        409,
+                        403,
                         f"claimed_by overwrite rejected: current={old_claimed_by!r} requested={req.claimed_by!r}",
                     )
-                if req.status == "queued":
-                    await db.execute("ROLLBACK")
-                    raise HTTPException(422, "queued jobs cannot retain claimed_by")
 
-            effective_claimed_by = req.claimed_by if req.claimed_by is not None else old_claimed_by
+            if old_claimed_by and req.status in {"claimed", "running", "done", "failed", "cancelled"}:
+                if not claimed_by_was_set or req.claimed_by != old_claimed_by:
+                    await db.execute("ROLLBACK")
+                    raise HTTPException(403, "job update requires claimed_by to match the current claimant")
+
+            effective_claimed_by = None if release_to_queue else (req.claimed_by or old_claimed_by)
             if req.status in {"claimed", "running"} and not effective_claimed_by:
                 await db.execute("ROLLBACK")
                 raise HTTPException(422, f"status={req.status!r} requires an existing or explicit claimed_by")
@@ -1393,15 +1432,11 @@ async def update_job(job_id: str, req: JobUpdate):
             if req.result is not None:
                 fields.append("result=?")
                 args.append(json.dumps(req.result))
-            if claimed_by_was_set:
-                if req.claimed_by is None:
-                    fields.extend([
-                        "claimed_by=NULL", "claimed_at=NULL", "claimed_runtime=NULL",
-                        "claimed_model=NULL", "claimed_provider=NULL", "claimed_cost_tier=NULL",
-                    ])
-                else:
-                    fields.extend(["claimed_by=?", "claimed_at=?"])
-                    args.extend([req.claimed_by, now])
+            if release_to_queue:
+                fields.extend([
+                    "claimed_by=NULL", "claimed_at=NULL", "claimed_runtime=NULL",
+                    "claimed_model=NULL", "claimed_provider=NULL", "claimed_cost_tier=NULL",
+                ])
             if req.status in {"claimed", "running"}:
                 fields.append("claim_lease_expires_at=?")
                 args.append(now + CLAIM_LEASE_SECONDS)
@@ -1496,7 +1531,7 @@ async def update_job(job_id: str, req: JobUpdate):
                     job_id, now, req.claimed_by or old_claimed_by, old_status,
                     "queued" if retried else req.status,
                     old_claimed_by,
-                    None if (claimed_by_was_set and req.claimed_by is None) else effective_claimed_by,
+                    None if release_to_queue else effective_claimed_by,
                     json.dumps(patch_payload, default=str),
                 ),
             )
@@ -1532,10 +1567,12 @@ async def create_schedule(req: ScheduleCreate):
     # Validate the template parses as a JobCreate
     try:
         tpl_copy = dict(req.job_template)
-        tpl_copy.setdefault("submitter_urn", "urn:agent:human:scheduler-placeholder")
+        if not tpl_copy.get("submitter_urn"):
+            raise ValueError("job_template.submitter_urn is required and must be a registered orchestrator")
         JobCreate(**tpl_copy)
     except Exception as e:
         raise HTTPException(422, f"job_template invalid: {e}")
+    await require_orchestrator_submitter(tpl_copy["submitter_urn"])
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "INSERT INTO scheduled_jobs (id, name, created_by_urn, interval_seconds, "
@@ -1922,6 +1959,7 @@ async def list_jobs(
 async def publish_message(req: MessagePublish):
     msg_id = uuidv7()
     now = time.time()
+    await require_registered_agent(req.from_urn, active_only=True)
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "INSERT INTO messages (id, from_urn, to_urn, in_reply_to, topic, payload, ts) "

@@ -143,7 +143,7 @@ def update_job(job_id: str, status: str, result: dict):
     # body or agent_bus.py never moves them into jobs.tokens_in/tokens_out
     # columns. Keep them in result too for caller introspection, but lift
     # to top-level for the PATCH so /v1/stats/workers counts populate.
-    body = {"status": status, "result": result}
+    body = {"status": status, "result": result, "claimed_by": _urn}
     if isinstance(result, dict):
         t_in = result.get("tokens_in")
         t_out = result.get("tokens_out")
