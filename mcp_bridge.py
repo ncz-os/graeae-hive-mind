@@ -88,7 +88,11 @@ async def _mnemos(method: str, path: str, **kw) -> dict:
 async def handle_list_tools() -> list[Tool]:
     return [
         Tool(name="hive.agent_list", description="List registered agents in the GRAEAE Hive Mind.",
-             inputSchema={"type": "object", "properties": {"kind": {"type": "string"}, "status": {"type": "string"}}}),
+             inputSchema={"type": "object", "properties": {
+                 "kind": {"type": "string"},
+                 "status": {"type": "string"},
+                 "include_offline": {"type": "boolean"},
+             }}),
         Tool(name="hive.agent_register",
              description="Register this session as an agent in the Hive. Returns urn + session_id. Bridge fills sensible defaults for runtime/model/provider/autonomy_level/auth_method so urn always populates.",
              inputSchema={"type": "object",

@@ -26,7 +26,8 @@ from sse_starlette.sse import EventSourceResponse
 
 DB_PATH = os.environ.get("AGENT_BUS_DB", "/srv/agent-bus/agents.db")
 HEARTBEAT_REAP_INTERVAL = 30.0
-HEARTBEAT_DEAD_AFTER = 60.0
+HEARTBEAT_STALE_AFTER = 90.0
+HEARTBEAT_OFFLINE_AFTER = 300.0
 EVENTS_RETAIN_HOURS = 168  # 7 days
 SSE_PING_INTERVAL = 15.0
 EVENT_QUEUE: dict[str, asyncio.Queue] = {}  # subscriber_id -> queue
@@ -85,7 +86,7 @@ CREATE TABLE IF NOT EXISTS agents (
   version TEXT,
   started_at REAL NOT NULL,
   last_heartbeat REAL NOT NULL,
-  status TEXT NOT NULL CHECK(status IN ('online','idle','offline','error')),
+  status TEXT NOT NULL CHECK(status IN ('online','idle','stale','offline','error')),
   metadata TEXT,
   -- v0.2 cost/runtime/autonomy columns (graeae:schema-drift)
   runtime TEXT,
@@ -263,7 +264,7 @@ DEFAULT_PLAN_CAPS = {
     "unknown":      50.0,    # conservative
 }
 THROTTLE_HEADROOM = 0.85  # at >=85% of plan cap, prefer non-subscription workers for tier-B/C jobs
-VALID_AGENT_STATUSES = {"online", "idle", "offline", "error"}
+VALID_AGENT_STATUSES = {"online", "idle", "stale", "offline", "error"}
 ACTIVE_AGENT_STATUSES = {"online", "idle"}
 
 # ROLE SPLIT (user directive 2026-05-23): opencode + goose + codex + hermes +
@@ -666,18 +667,54 @@ async def reaper_task(app: FastAPI):
         await asyncio.sleep(HEARTBEAT_REAP_INTERVAL)
         try:
             async with aiosqlite.connect(DB_PATH) as db:
-                # 1. Heartbeat reaper — mark dead agents offline
-                cutoff = time.time() - HEARTBEAT_DEAD_AFTER
+                # 1. Heartbeat reaper: online/idle -> stale after 90s, offline after 5m.
+                now_ts = time.time()
+                stale_cutoff = now_ts - HEARTBEAT_STALE_AFTER
+                offline_cutoff = now_ts - HEARTBEAT_OFFLINE_AFTER
+                async with db.execute(
+                    "SELECT urn FROM agents "
+                    "WHERE status IN ('online','idle','error') "
+                    "AND last_heartbeat < ? AND last_heartbeat >= ?",
+                    (stale_cutoff, offline_cutoff),
+                ) as cur:
+                    stale = [row[0] async for row in cur]
+                if stale:
+                    await db.executemany(
+                        "UPDATE agents SET status='stale' WHERE urn=? AND status != 'offline'",
+                        [(u,) for u in stale],
+                    )
+                    await db.commit()
+                    for urn in stale:
+                        await emit_event(db, "agent.stale", {"urn": urn, "reason": "heartbeat_stale"})
+
                 async with db.execute(
                     "SELECT urn FROM agents WHERE status != 'offline' AND last_heartbeat < ?",
-                    (cutoff,),
+                    (offline_cutoff,),
                 ) as cur:
                     dead = [row[0] async for row in cur]
                 if dead:
-                    await db.executemany(
-                        "UPDATE agents SET status='offline' WHERE urn=?",
-                        [(u,) for u in dead],
-                    )
+                    for urn in dead:
+                        async with db.execute(
+                            "SELECT id FROM jobs WHERE claimed_by=? AND status IN ('offered','claimed','running')",
+                            (urn,),
+                        ) as cur:
+                            assigned_jobs = [row[0] async for row in cur]
+                        await db.execute(
+                            "UPDATE jobs SET status='queued', claimed_by=NULL, claimed_at=NULL, "
+                            "claimed_runtime=NULL, claimed_model=NULL, claimed_provider=NULL, "
+                            "claimed_cost_tier=NULL, claim_lease_expires_at=NULL "
+                            "WHERE claimed_by=? AND status IN ('offered','claimed','running')",
+                            (urn,),
+                        )
+                        await db.execute(
+                            "UPDATE agents SET status='offline' WHERE urn=?",
+                            (urn,),
+                        )
+                        for job_id in assigned_jobs:
+                            await emit_event(db, "job.unclaimed", {
+                                "id": job_id, "prior_claimer": urn,
+                                "reason": "agent_offline_heartbeat_timeout",
+                            })
                     await db.commit()
                     for urn in dead:
                         await emit_event(db, "agent.offline", {"urn": urn, "reason": "heartbeat_timeout"})
@@ -789,6 +826,50 @@ async def lifespan(app: FastAPI):
             if col not in cols:
                 await conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl_fragment}")
 
+        async def _ensure_agents_status_allows_stale(conn) -> None:
+            async with conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='agents'"
+            ) as cur:
+                row = await cur.fetchone()
+            table_sql = row[0] if row else ""
+            if "stale" in table_sql:
+                return
+            cols = (
+                "urn", "kind", "host", "session_id", "pid", "capabilities",
+                "version", "started_at", "last_heartbeat", "status", "metadata",
+                "runtime", "model", "provider", "autonomy_level", "cost_tier",
+                "current_load", "auth_method", "plan_cap_usd", "plan_period_used_usd",
+            )
+            col_list = ", ".join(cols)
+            await conn.execute("ALTER TABLE agents RENAME TO agents__pre_stale_migration")
+            await conn.execute(
+                "CREATE TABLE agents ("
+                "urn TEXT PRIMARY KEY, "
+                "kind TEXT NOT NULL, "
+                "host TEXT NOT NULL, "
+                "session_id TEXT NOT NULL, "
+                "pid INTEGER, "
+                "capabilities TEXT, "
+                "version TEXT, "
+                "started_at REAL NOT NULL, "
+                "last_heartbeat REAL NOT NULL, "
+                "status TEXT NOT NULL CHECK(status IN ('online','idle','stale','offline','error')), "
+                "metadata TEXT, "
+                "runtime TEXT, "
+                "model TEXT, "
+                "provider TEXT, "
+                "autonomy_level TEXT, "
+                "cost_tier TEXT, "
+                "current_load TEXT, "
+                "auth_method TEXT, "
+                "plan_cap_usd REAL, "
+                "plan_period_used_usd REAL DEFAULT 0)"
+            )
+            await conn.execute(
+                f"INSERT INTO agents ({col_list}) SELECT {col_list} FROM agents__pre_stale_migration"
+            )
+            await conn.execute("DROP TABLE agents__pre_stale_migration")
+
         live_columns = (
             # agents — v0.2 cost/runtime/autonomy columns
             ("agents", "runtime", "runtime TEXT"),
@@ -827,8 +908,11 @@ async def lifespan(app: FastAPI):
         )
         for table, col, ddl_fragment in live_columns:
             await _ensure_column(db, table, col, ddl_fragment)
+        await _ensure_agents_status_allows_stale(db)
         # Idempotent index re-creates (in case live DB pre-dates an index).
         live_indexes = (
+            "CREATE INDEX IF NOT EXISTS idx_agents_status      ON agents(status)",
+            "CREATE INDEX IF NOT EXISTS idx_agents_kind        ON agents(kind)",
             "CREATE INDEX IF NOT EXISTS idx_agents_runtime     ON agents(runtime)",
             "CREATE INDEX IF NOT EXISTS idx_agents_model       ON agents(model)",
             "CREATE INDEX IF NOT EXISTS idx_agents_provider    ON agents(provider)",
@@ -990,12 +1074,18 @@ async def list_agents(
     runtime: Optional[str] = None,
     pid: Optional[int] = None,
     cost_tier: Optional[str] = None,
+    include_offline: bool = False,
 ):
     sql = ("SELECT urn, kind, host, status, last_heartbeat, capabilities, version, metadata, "
            "pid, runtime, model, provider, cost_tier, autonomy_level "
            "FROM agents WHERE 1=1")
     args: list = []
-    if status:    sql += " AND status=?";    args.append(status)
+    if status:
+        if status not in VALID_AGENT_STATUSES:
+            raise HTTPException(422, f"status must be one of {sorted(VALID_AGENT_STATUSES)}, got {status!r}")
+        sql += " AND status=?";    args.append(status)
+    elif not include_offline:
+        sql += " AND status='online'"
     if kind:      sql += " AND kind=?";      args.append(kind)
     if host:      sql += " AND host=?";      args.append(host)
     if runtime:   sql += " AND runtime=?";   args.append(runtime)
@@ -1030,6 +1120,24 @@ async def list_agents(
                     "display": display,
                 })
     return {"count": len(rows), "agents": rows}
+
+
+@app.get("/v1/agents/stats")
+async def agent_stats():
+    counts = {status: 0 for status in VALID_AGENT_STATUSES}
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT status, COUNT(*) FROM agents GROUP BY status"
+        ) as cur:
+            async for status, count in cur:
+                counts[status] = count
+    total = sum(counts.values())
+    return {
+        "online": counts.get("online", 0),
+        "stale": counts.get("stale", 0),
+        "offline": counts.get("offline", 0),
+        "total": total,
+    }
 
 
 @app.get("/v1/agents/{urn_path:path}/throttle")
