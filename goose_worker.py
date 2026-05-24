@@ -54,6 +54,8 @@ def timeout_for_kind(kind: str) -> int:
 
 _urn: str = ""
 _last_heartbeat = 0.0
+_heartbeat_count = 0
+_local_inference_cache: list[dict] = []
 _running = True
 
 
@@ -121,11 +123,70 @@ def _goose_version() -> str:
         return "unknown"
 
 
+def _json_get(url: str, timeout: float = 2.0) -> dict | list | None:
+    try:
+        req = urllib.request.Request(url, method="GET", headers={"accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read()
+        return json.loads(raw) if raw else None
+    except Exception:
+        return None
+
+
+def _extract_model_names(payload: dict | list | None, *, response_type: str) -> list[str]:
+    if not payload:
+        return []
+    if response_type == "ollama":
+        items = payload.get("models", []) if isinstance(payload, dict) else []
+    else:
+        if isinstance(payload, dict):
+            items = payload.get("data", payload.get("models", []))
+        else:
+            items = payload
+    names: list[str] = []
+    if not isinstance(items, list):
+        return names
+    for item in items:
+        name = ""
+        if isinstance(item, str):
+            name = item
+        elif isinstance(item, dict):
+            name = str(item.get("id") or item.get("name") or item.get("model") or "")
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def probe_local_inference() -> list[dict]:
+    found: list[dict] = []
+    probes = (
+        ("http://localhost:8080/v1/models", "llama-server"),
+        ("http://localhost:8082/v1/models", "llama-server"),
+        ("http://localhost:11434/api/tags", "ollama"),
+    )
+    for url, kind in probes:
+        payload = _json_get(url, timeout=2.0)
+        if payload is None:
+            continue
+        found.append({
+            "url": url,
+            "models": _extract_model_names(payload, response_type=kind),
+            "type": kind,
+        })
+    return found
+
+
 def heartbeat():
-    global _last_heartbeat
+    global _last_heartbeat, _heartbeat_count, _local_inference_cache
     if time.time() - _last_heartbeat < HEARTBEAT_INTERVAL:
         return
-    _http("POST", "/v1/agents/heartbeat", {"urn": _urn})
+    _heartbeat_count += 1
+    if not _local_inference_cache or _heartbeat_count % 5 == 0:
+        _local_inference_cache = probe_local_inference()
+    body = {"urn": _urn}
+    if _local_inference_cache:
+        body["metadata"] = {"local_inference": _local_inference_cache}
+    _http("POST", "/v1/agents/heartbeat", body)
     _last_heartbeat = time.time()
 
 
