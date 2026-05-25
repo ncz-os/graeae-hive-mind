@@ -15,6 +15,8 @@ Env:
   HEARTBEAT_INTERVAL    15 seconds
   GOOSE_TIMEOUT         600 seconds per job
   GOOSE_EXTRA_ARGS      extra goose run args, e.g. "--agent build"
+  AGENT_PROVIDER        provider name for cost-tier classification (default "unknown" → tier C)
+  AGENT_MODEL           model name reported to hive for dispatch filtering
 """
 from __future__ import annotations
 import json
@@ -44,6 +46,8 @@ GOOSE_TIMEOUT = int(os.environ.get("GOOSE_TIMEOUT", "600"))
 ORCHESTRATION_TIMEOUT = int(os.environ.get("ORCHESTRATION_TIMEOUT", "3600"))
 GOOSE_EXTRA_ARGS = os.environ.get("GOOSE_EXTRA_ARGS", "").split()
 WORKDIR = os.environ.get("HIVE_WORKDIR", os.getcwd())
+AGENT_PROVIDER = os.environ.get("AGENT_PROVIDER", "unknown")
+AGENT_MODEL = os.environ.get("AGENT_MODEL", "unknown")
 
 
 def timeout_for_kind(kind: str) -> int:
@@ -98,6 +102,8 @@ def register() -> str:
         "host": AGENT_HOST,
         "pid": os.getpid(),
         "capabilities": AGENT_CAPABILITIES,
+        "provider": AGENT_PROVIDER,
+        "model": AGENT_MODEL,
         "version": _goose_version(),
         "metadata": {
             "daemon": "goose_worker.py",
@@ -299,25 +305,59 @@ def git_result_delta(before_head: str | None, before_status: set[str], cwd: str 
     return commits, files
 
 
-def run_goose(description: str, kind: str = "") -> dict:
+# Interval at which workers send a job-level proof-of-work heartbeat via PATCH status=running.
+# Must be well under CLAIM_LEASE_SECONDS (1800s) so long orchestration jobs don't get reaped.
+JOB_HEARTBEAT_INTERVAL = int(os.environ.get("JOB_HEARTBEAT_INTERVAL", "300"))  # 5 min default
+
+
+def run_goose(description: str, kind: str = "", job_heartbeat_fn=None) -> dict:
     cmd = [GOOSE_BIN, "run", "--text", description, "--no-session"] + GOOSE_EXTRA_ARGS
     print(f"[worker] $ {' '.join(cmd[:6])} … [desc len={len(description)}]", flush=True)
     start = time.time()
     timeout = timeout_for_kind(kind)
     before_head, before_status = git_snapshot()
     try:
-        proc = subprocess.run(cmd, cwd=WORKDIR, capture_output=True, text=True, timeout=timeout)
-        err_tag = detect_goose_error(proc.stdout)
-        t_in, t_out = parse_tokens(proc.stdout, proc.stderr)
+        proc = subprocess.Popen(cmd, cwd=WORKDIR, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+        last_job_hb = time.time()
+        while True:
+            try:
+                proc.wait(timeout=30)
+                break  # process finished
+            except subprocess.TimeoutExpired:
+                elapsed = time.time() - start
+                if elapsed >= timeout:
+                    proc.kill()
+                    proc.wait()
+                    return {
+                        "exit_code": -1,
+                        "error": f"timeout {timeout}s exceeded",
+                        "duration_sec": round(elapsed, 1),
+                        "commits": [],
+                        "files_changed": [],
+                        "workdir": WORKDIR,
+                    }
+                # Proof-of-work heartbeat: renew job lease on the Hive so reaper doesn't
+                # reclaim long-running orchestration/migration jobs while worker is alive.
+                if job_heartbeat_fn and (time.time() - last_job_hb) >= JOB_HEARTBEAT_INTERVAL:
+                    try:
+                        job_heartbeat_fn(round(elapsed, 1))
+                    except Exception:
+                        pass
+                    last_job_hb = time.time()
+
+        stdout, stderr = proc.stdout.read(), proc.stderr.read()
+        err_tag = detect_goose_error(stdout)
+        t_in, t_out = parse_tokens(stdout, stderr)
         commits, files_changed = git_result_delta(before_head, before_status)
         # Fallback estimate when goose doesn't surface counts: char/4 (rough GPT-tokenizer heuristic)
         if t_in == 0 and t_out == 0:
             t_in = max(1, len(description) // 4)
-            t_out = max(1, len(proc.stdout) // 4)
+            t_out = max(1, len(stdout) // 4)
         result = {
             "exit_code": proc.returncode,
-            "stdout": proc.stdout[-12000:],
-            "stderr": proc.stderr[-4000:],
+            "stdout": stdout[-12000:],
+            "stderr": stderr[-4000:],
             "duration_sec": round(time.time() - start, 1),
             "goose_cmd": " ".join(cmd[:6]),
             "tokens_in": t_in,
@@ -330,15 +370,6 @@ def run_goose(description: str, kind: str = "") -> dict:
             result["exit_code"] = 1
             result["worker_error"] = err_tag
         return result
-    except subprocess.TimeoutExpired:
-        return {
-            "exit_code": -1,
-            "error": f"timeout {timeout}s exceeded",
-            "duration_sec": round(time.time() - start, 1),
-            "commits": [],
-            "files_changed": [],
-            "workdir": WORKDIR,
-        }
     except Exception as e:
         return {
             "exit_code": -1,
@@ -363,7 +394,10 @@ def main():
         backoff = 1.0  # reset on success
         print(f"[worker] claimed job {job['id'][:8]} kind={job['kind']} priority={job.get('priority')}", flush=True)
         update_job(job["id"], "running", {"started_by": _urn, "started_at": time.time()})
-        result = run_goose(job.get("description") or job.get("kind", ""), job.get("kind", ""))
+        job_id = job["id"]
+        def _job_hb(elapsed):
+            update_job(job_id, "running", {"heartbeat_at": time.time(), "elapsed_sec": elapsed})
+        result = run_goose(job.get("description") or job.get("kind", ""), job.get("kind", ""), job_heartbeat_fn=_job_hb)
         status = "done" if result.get("exit_code") == 0 else "failed"
         result["finished_at"] = time.time()
         update_job(job["id"], status, result)

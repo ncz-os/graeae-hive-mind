@@ -263,7 +263,7 @@ RUNTIME_KIND_MAP: dict[str, set[str]] = {
     "codex":         {"codex"},
     "codex-cli":     {"codex"},
     "hermes":        {"hermes"},
-    "zeroclaw":      {"zeroclaw"},
+    "zeroclaw":      {"zeroclaw", "claude", "goose", "codex", "opencode"},  # zeroclaw delegates to any sub-runtime
     "openclaw":      {"openclaw"},
     "ic-engine":     {"ic-engine"},
     "mnemos":        {"mnemos"},
@@ -310,33 +310,38 @@ ORCHESTRATOR_RUNTIMES: set[str] = {
 #   C = RESERVE — Anthropic Opus/Sonnet, OpenAI GPT-5.5/Pro, Gemini Pro, Together DeepSeek-Pro
 #                 (Together DeepSeek-V4-Pro = anti-pattern — use DeepSeek direct instead)
 PROVIDER_COST_TIER: dict[str, str] = {
-    "ngc":             "A",
-    "nvidia":          "A",
-    "nvidia-ngc":      "A",
-    "local-llamacpp":  "A",
-    "local-vllm":      "A",
-    "ollama":          "A",
-    "ollama-cerberus": "A",
-    "local":           "A",
+    # Tier A = PREMIUM (highest quality, expensive) - operator authorizes top budget
+    "anthropic":       "A",
+    "claude":          "A",
+    "openai":          "A",
+    "openai-pro":      "A",
+    "openai-gpt55":    "A",
+    "gemini":          "A",
+    "gemini-pro":      "A",
+    "together-pro":    "A",
 
+    # Tier B = MID (cheap paid commercial)
     "groq":            "B",
     "xai":             "B",
     "deepseek":        "B",
     "deepseek-direct": "B",
-    "together":        "B",  # default — only MiniMax + cheap models; DO NOT default to Together DeepSeek-V4-Pro
+    "together":        "B",
     "gemini-flash":    "B",
     "openai-mini":     "B",
     "perplexity":      "B",
 
-    "anthropic":       "C",
-    "openai":          "C",
-    "openai-pro":      "C",
-    "openai-gpt55":    "C",
-    "gemini":          "C",
-    "gemini-pro":      "C",
-    "together-pro":    "C",
+    # Tier C = ROUTINE (local / free NGC / Nvidia inference)
+    "ngc":             "C",
+    "nvidia":          "C",
+    "nvidia-ngc":      "C",
+    "local-llamacpp":  "C",
+    "local-vllm":      "C",
+    "ollama":          "C",
+    "ollama-cerberus": "C",
+    "local":           "C",
+    "pantheon":        "C",  # fleet PANTHEON router routes to free/cheap providers
 
-    "unknown":         "C",  # treat as expensive until classified
+    "unknown":         "C",  # treat as routine when classification missing
 }
 COST_TIERS = ["A", "B", "C"]
 VALID_JOB_STATUSES = {"queued", "offered", "claimed", "running", "done", "failed", "cancelled"}
@@ -643,7 +648,7 @@ class JobCreate(BaseModel):
     project: Optional[str] = None
     max_retries: int = 2                               # auto-resubmit after worker reports failed (up to N times)
     # COST DISCIPLINE (per CLAUDE.md llm-usage-policy):
-    max_cost_tier: str = "A"                           # cap which tier may execute: A=free, B=cheap, C=reserve. Default A=free first.
+    max_cost_tier: str = "B"                           # adaptive tier cap: A=local/NGC first (free), B=Groq/xAI overflow (paid), C=reserve. Default B=Tier A preferred, Tier B fallback when Tier A overloaded.
     preferred_providers: Optional[list[str]] = None    # ranked preference (first match wins among tier-eligible)
     preferred_models: Optional[list[str]] = None       # ranked model preference
     # MNEMOS provenance:
@@ -1256,7 +1261,7 @@ async def create_job(req: JobCreate):
     """
     job_id = uuidv7()
     now = time.time()
-    max_cost_tier = (req.max_cost_tier or "A").upper()
+    max_cost_tier = (req.max_cost_tier or "B").upper()
     if max_cost_tier not in COST_TIERS:
         raise HTTPException(422, f"max_cost_tier must be one of {COST_TIERS}, got {max_cost_tier!r}")
     if req.mnemos_refs:
@@ -1436,7 +1441,7 @@ async def dequeue_next_job(agent_urn: str):
                         if not need.issubset(agent_caps):
                             continue
                     # filter: cost-tier cap (token-miser default: A=free only)
-                    job_max_tier = (j_max_tier or "A").upper()
+                    job_max_tier = (j_max_tier or "B").upper()
                     if job_max_tier not in COST_TIERS:
                         continue
                     if COST_TIERS.index(a_tier) > COST_TIERS.index(job_max_tier):
@@ -1731,6 +1736,37 @@ async def update_job(job_id: str, req: JobUpdate):
         })
     return {"ok": True, "ts": now, "estimated_cost_usd": cost_estimate}
 
+
+
+
+class RequeueRequest(BaseModel):
+    job_ids: list[str]
+    reason: str = "manual-requeue"
+
+@app.post("/v1/admin/jobs/requeue")
+async def admin_requeue_jobs(req: RequeueRequest):
+    """Force-requeue terminal (failed/cancelled) or any non-done jobs back to queued."""
+    now = time.time()
+    results = {"ok": [], "not_found": [], "skipped_done": []}
+    async with connect_db() as db:
+        for job_id in req.job_ids:
+            async with db.execute("SELECT status FROM jobs WHERE id=?", (job_id,)) as cur:
+                row = await cur.fetchone()
+            if not row:
+                results["not_found"].append(job_id)
+                continue
+            if row[0] == "done":
+                results["skipped_done"].append(job_id)
+                continue
+            await db.execute(
+                """UPDATE jobs SET status='queued', claimed_by=NULL, claimed_at=NULL,
+                   retry_count=0, retry_backoff_until=NULL
+                   WHERE id=?""",
+                (job_id,),
+            )
+            await db.commit()
+            results["ok"].append(job_id)
+    return results
 
 @app.post("/v1/schedules")
 async def create_schedule(req: ScheduleCreate):
@@ -2064,7 +2100,7 @@ async def claim_job(job_id: str, by: str):
                 )
 
         # cost-tier ceiling
-        job_max_tier = (j_max_tier or "A").upper()
+        job_max_tier = (j_max_tier or "B").upper()
         if job_max_tier not in COST_TIERS:
             raise HTTPException(422, f"job max_cost_tier is invalid: {job_max_tier!r}")
         if COST_TIERS.index(a_tier) > COST_TIERS.index(job_max_tier):

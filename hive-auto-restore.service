@@ -1,0 +1,11 @@
+[Unit]
+Description=Hive auto-restore failed jobs to queue
+After=multi-user.target
+
+[Service]
+Type=oneshot
+User=graeae-hive
+Group=graeae-hive
+ExecStart=/opt/agent-bus-venv/bin/python /opt/hive-auto-restore.py
+StandardOutput=journal
+StandardError=journal
