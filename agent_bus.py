@@ -2,7 +2,7 @@
 GRAEAE Hive Mind — fleet-wide MCP-compatible agent coordination + triage queue.
 
 Brand: GRAEAE Hive Mind (extension of GRAEAE consensus engine — sister to mnemos memory)
-Identity: urn:agent:<kind>:<host>:<session_uuid>   (kinds: claude, goose, opencode, codex, zeroclaw, openclaw, hermes, human, ic-engine, mnemos, ...)
+Identity: urn:agent:<kind>:<host>:<session_uuid>   (kinds: claude, opencode, codex, zeroclaw, openclaw, hermes, human, ic-engine, mnemos, ...)
 Backend: SQLite WAL (Phase 1) — PG migration documented for Phase 2 when >50 agents OR LISTEN/NOTIFY needed
 Pub/sub: SSE (Phase 1) — NATS migration Phase 2 when >20 concurrent OR >100 msg/s
 Triage queue: /v1/jobs/next dequeues highest-priority eligible work; no central scheduler — agents self-claim.
@@ -258,8 +258,6 @@ RUNTIME_KIND_MAP: dict[str, set[str]] = {
     "claude-cli":    {"claude", "claude-code"},
     "opencode":      {"opencode"},                 # opencode CAN run any model — kind=opencode
     "opencode-cli":  {"opencode"},
-    "goose":         {"goose"},
-    "goose-cli":     {"goose"},
     "codex":         {"codex"},
     "codex-cli":     {"codex"},
     "hermes":        {"hermes"},
@@ -285,12 +283,12 @@ THROTTLE_HEADROOM = 0.85  # at >=85% of plan cap, prefer non-subscription worker
 VALID_AGENT_STATUSES = {"online", "idle", "stale", "offline", "error"}
 ACTIVE_AGENT_STATUSES = {"online", "idle"}
 
-# ROLE SPLIT (user directive 2026-05-23): opencode + goose + codex + hermes +
+# ROLE SPLIT (user directive 2026-05-23): opencode + codex + hermes +
 # claw-family + ic-engine + unknown = WORKERS (claim-only). Cannot submit jobs.
 # Orchestrators: claude-code, human, mnemos. They submit work; workers execute it.
 WORKER_ONLY_RUNTIMES: set[str] = {
     "opencode", "opencode-cli",
-    "goose", "goose-cli",
+    "opencode", "opencode-cli",
     "codex", "codex-cli",
     "hermes",
     "zeroclaw", "openclaw",
@@ -605,7 +603,7 @@ class AgentRegister(BaseModel):
     # with runtime (prevents opencode-misregistering-as-claude). Soft fields
     # below default to "unknown" if not declared.
     #
-    #   runtime          = TOOL/ORCHESTRATOR (claude-code, opencode, goose, codex, hermes, zeroclaw, openclaw, ic-engine, mnemos, human)
+    #   runtime          = TOOL/ORCHESTRATOR (claude-code, opencode, codex, hermes, zeroclaw, openclaw, ic-engine, mnemos, human)
     #   model            = LLM (claude-opus-4-7, grok-4.3, kimi-k2.6, deepseek-v4-pro, gpt-5.5, gemini-3.1-pro, ...)
     #   provider         = INFERENCE HOST (anthropic, xai, ngc, openai, deepseek, together, groq, gemini, local-llamacpp, ...)
     #   kind             = URN routing segment — MUST be in RUNTIME_KIND_MAP[runtime] if runtime known
@@ -1009,7 +1007,7 @@ async def register(req: AgentRegister):
     kind = (req.kind or runtime).lower()
     if runtime == "unknown" and not req.kind:
         raise HTTPException(
-            422, "must provide runtime (claude-code/opencode/goose/codex/...) OR explicit kind. "
+            422, "must provide runtime (claude-code/opencode/codex/...) OR explicit kind. "
                  "Defaulting to 'unknown' was masking session-bricking misregistrations."
         )
     # If kind was provided but runtime omitted/unknown, default runtime to the
@@ -1017,7 +1015,7 @@ async def register(req: AgentRegister):
     # kind-only registration left runtime='unknown', which cascaded into
     # provider='unknown' + cost_tier='C', so default-A jobs never dequeued
     # AND the WORKER_ONLY_RUNTIMES role check stopped applying (unknown is
-    # in ORCHESTRATOR_RUNTIMES). README, test/smoke.sh, and goose_worker.py
+    # in ORCHESTRATOR_RUNTIMES). README, test/smoke.sh
     # all register kind-only. Fix: lift kind to runtime when safe.
     if runtime == "unknown" and req.kind:
         if kind in RUNTIME_KIND_MAP:
@@ -1255,7 +1253,7 @@ async def create_job(req: JobCreate):
     """Submit work to the triage queue. No agent assignment — workers self-claim via /v1/jobs/next.
 
     ROLE ENFORCEMENT (user directive 2026-05-23):
-    Worker runtimes (opencode/goose/codex/hermes/claw-family/ic-engine) are CLAIMERS, not submitters.
+    Worker runtimes (opencode/codex/hermes/claw-family/ic-engine) are CLAIMERS, not submitters.
     Posting jobs requires submitter to be registered with an orchestrator runtime (claude-code/human/mnemos).
     Workers attempting to POST jobs get 403 — they should call /v1/jobs/next instead.
     """
