@@ -25,7 +25,7 @@ LOG_FILE = "/var/log/hive-auto-restore.log"
 
 MAX_RETRIES = 5          # never restore more than 5 times per job
 BACKOFF_BASE = 300       # 5 min after 1st fail, doubles each
-MIN_FAIL_AGE_SEC = 60    # only restore failures older than 60s (give workers time to truly finish)
+MIN_FAIL_AGE_SEC = 300    # only restore failures older than 60s (give workers time to truly finish)
 
 def log(msg):
     line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}"
