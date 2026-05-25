@@ -263,7 +263,7 @@ RUNTIME_KIND_MAP: dict[str, set[str]] = {
     "codex":         {"codex"},
     "codex-cli":     {"codex"},
     "hermes":        {"hermes"},
-    "zeroclaw":      {"zeroclaw", "claude", "goose", "codex", "opencode"},  # zeroclaw delegates to any sub-runtime
+    "zeroclaw":      {"zeroclaw"},  # zeroclaw is its own kind; does not alias goose/codex/opencode/claude
     "openclaw":      {"openclaw"},
     "ic-engine":     {"ic-engine"},
     "mnemos":        {"mnemos"},
