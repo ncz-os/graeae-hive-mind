@@ -270,6 +270,18 @@ small.dim{font-size:.85em}
     </table>
   </div>
 
+  <div class="panel full-width" id="doctor-panel">
+    <h2>🩺 Doctor Queue <span class="cnt" id="doctor-cnt"></span>
+        <small class="dim" id="doctor-workers" style="margin-left:1em;font-weight:normal"></small></h2>
+    <div style="margin-bottom:.6em;font-size:.78em" class="dim">
+      Jobs eligible for the PYTHIA zeroclaw-doctor (kind=doctor). Claimed jobs stay here until released back to the regular queue or terminated.
+    </div>
+    <table id="doctor-tbl">
+      <thead><tr><th>P</th><th>kind</th><th>status</th><th>description</th><th>claimed_by</th><th>age</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
   <div class="panel full-width" id="failed-panel">
     <h2>❌ Failed Jobs <span class="cnt" id="failed-cnt"></span></h2>
     <div id="failed-list"></div>
@@ -675,6 +687,56 @@ async function refreshResults(){
 }
 
 let _failedJobs={};
+async function refreshDoctor(){
+  // Pull jobs across all relevant statuses; filter doctor-eligible OR claimed-by-doctor
+  const [q,c,r,off]=await Promise.all([
+    api('GET','/v1/jobs?status=queued&limit=500').catch(()=>({jobs:[]})),
+    api('GET','/v1/jobs?status=claimed&limit=200').catch(()=>({jobs:[]})),
+    api('GET','/v1/jobs?status=running&limit=200').catch(()=>({jobs:[]})),
+    api('GET','/v1/jobs?status=offered&limit=50').catch(()=>({jobs:[]})),
+  ]);
+  const all=[...(q.jobs||[]),...(c.jobs||[]),...(r.jobs||[]),...(off.jobs||[])];
+  const doctorJobs=all.filter(j=>{
+    const ek=j.eligible_kinds||[];
+    if(ek.includes('doctor')) return true;
+    const cb=j.claimed_by||'';
+    if(cb.startsWith('urn:agent:doctor:')) return true;
+    return false;
+  }).sort((a,b)=>{
+    // Group by status: claimed/running first (active), then queued
+    const order={running:0,claimed:1,offered:2,queued:3};
+    const ao=order[a.status]??9, bo=order[b.status]??9;
+    if(ao!==bo) return ao-bo;
+    return (b.priority||0)-(a.priority||0);
+  });
+  document.getElementById('doctor-cnt').textContent=`(${doctorJobs.length})`;
+  // Active doctor agents
+  const ag=await api('GET','/v1/agents').catch(()=>({agents:[]}));
+  const docs=(ag.agents||[]).filter(a=>a.kind==='doctor');
+  const onlineDocs=docs.filter(a=>a.status==='online'||a.status==='idle');
+  document.getElementById('doctor-workers').textContent=
+    `${onlineDocs.length}/${docs.length} doctor agents online`;
+  // Render table
+  const tb=document.querySelector('#doctor-tbl tbody');tb.innerHTML='';
+  const now=Date.now()/1000;
+  for(const j of doctorJobs.slice(0,80)){
+    const row=tb.insertRow();
+    row.className='row-clickable';
+    row.onclick=()=>showJobModal(j);
+    row.appendChild(td(`<b>${j.priority||0}</b>`));
+    row.appendChild(td(`<span style="color:#a5d6ff">${esc(j.kind||'')}</span>`));
+    const statusColor={running:'#7ee787',claimed:'#ffa657',queued:'#c9d1d9',offered:'#a5d6ff'}[j.status]||'#c9d1d9';
+    row.appendChild(td(`<span style="color:${statusColor}">${esc(j.status||'?')}</span>`));
+    row.appendChild(td(`<small class="dim">${esc((j.description||'').slice(0,60))}</small>`));
+    const cb=j.claimed_by||'';
+    const cbShort=cb?cb.split(':').slice(2,4).join('@'):'<i class="dim">unclaimed</i>';
+    row.appendChild(td(`<small>${esc(cbShort)}</small>`));
+    const ref=j.started_at||j.claimed_at||0;
+    const age=ref?Math.floor(now-ref):null;
+    row.appendChild(td(age!==null?`<small class="dim">${age}s</small>`:'<small class="dim">-</small>'));
+  }
+}
+
 async function refreshFailed(){
   const d=await api('GET','/v1/jobs?status=failed&limit=50').catch(()=>({jobs:[]}));
   const jobs=(d.jobs||[]).sort((a,b)=>(b.ended_at||0)-(a.ended_at||0));
@@ -870,7 +932,7 @@ async function refreshAll(){
     await Promise.all([
       refreshRunning(),refreshAgents(),refreshJobs(),refreshResults(),
       refreshFailed(),refreshCosts(),refreshWorkers(),refreshSchedules(),
-      refreshHosts(),
+      refreshHosts(),refreshDoctor(),
     ]);
   }catch(e){document.getElementById('meta-time').textContent='error: '+e;}
 }
@@ -906,6 +968,9 @@ function initSSE(){
         }
         if(d.kind==='job.queued'){
           refreshJobs().catch(()=>{});
+        }
+                if(d.kind==='message' && (p.topic||'').startsWith('doctor.')){
+          refreshDoctor().catch(()=>{});
         }
         if(['job.claimed','job.running','job.started'].includes(d.kind)){
           refreshRunning().catch(()=>{});
