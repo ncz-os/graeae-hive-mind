@@ -377,7 +377,7 @@ CLAIM_LEASE_SECONDS = float(os.environ.get("CLAIM_LEASE_SECONDS", "1800"))
 # the failed queue with 241/243 recent fails — denylist it until config-fix.
 # Format: lowercase short hostname. Updated via env or admin endpoint.
 HOST_DENYLIST: set[str] = {
-    h.strip().lower() for h in os.environ.get("HIVE_HOST_DENYLIST", "pegasus").split(",")
+    h.strip().lower() for h in os.environ.get("HIVE_HOST_DENYLIST", "").split(",")
     if h.strip()
 }
 
