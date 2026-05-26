@@ -307,10 +307,14 @@ ORCHESTRATOR_RUNTIMES: set[str] = {
 # When a job kind matches a prefix, the server adds eligible_hosts if not already set.
 # This ensures e.g. cixmini-os: jobs only run on cixmini hardware without callers needing to specify.
 KIND_HOST_AFFINITY: dict[str, list[str]] = {
-    "cixmini-os:":    ["cixmini"],   # CIX Sky1 NPU jobs — cixmini only
-    "ncz-os:":        ["cixmini"],   # NCZ OS jobs — cixmini or Pi (cixmini primary)
-    "pi:":            ["bigpi", "clawpi", "zeropi"],  # Pi-native tasks
-    "arm64-test:":    ["bigpi", "clawpi", "zeropi", "cixmini"],  # any arm64 device
+    # Hardware-bound: needs physical CIX Sky1 NPU — zeroclaw cannot substitute with SSH
+    "cixmini-os:":    ["cixmini"],
+    "ncz-os:":        ["cixmini"],
+    # Pi-specific tasks (explicit opt-in; general jobs use any worker)
+    "pi:":            ["bigpi", "clawpi", "zeropi"],
+    "arm64-test:":    ["bigpi", "clawpi", "zeropi", "cixmini"],
+    # Note: investorclaw/investorclaude are NOT here — any zeroclaw can execute
+    # those by SSHing to the appropriate host. Host affinity would over-restrict.
 }
 
 # COST-TIER MAP (per ~/.claude/rules/llm-usage-policy-2026-05-22.md):
