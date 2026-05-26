@@ -244,9 +244,105 @@ def dynamic_load() -> dict:
         except Exception:
             pass
     try:
+        # Legacy single-volume fields (back-compat for older dashboards)
         s = shutil.disk_usage("/srv" if os.path.exists("/srv") else "/")
         out["srv_used_pct"] = round(100 * (s.total - s.free) / s.total, 1)
         out["srv_free_gb"] = round(s.free / 1024**3, 1)
+    except Exception:
+        pass
+    # Multi-volume disk snapshot — enumerate all real filesystems (skip
+    # pseudo/loop/tmpfs mounts). Each entry: {mount, total_gb, used_pct, free_gb, fstype}.
+    try:
+        volumes = []
+        seen = set()
+        def _add_vol(mnt):
+            try:
+                if mnt in seen or not os.path.isdir(mnt):
+                    return
+                s = shutil.disk_usage(mnt)
+                if s.total < 1024**3:   # skip <1GB (probably pseudo)
+                    return
+                seen.add(mnt)
+                volumes.append({
+                    "mount": mnt,
+                    "total_gb": round(s.total / 1024**3, 1),
+                    "free_gb": round(s.free / 1024**3, 1),
+                    "used_pct": round(100 * (s.total - s.free) / s.total, 1),
+                })
+            except Exception:
+                pass
+        if _IS_MACOS:
+            # macOS: parse `df -k`
+            try:
+                r = subprocess.run(["df", "-k"], capture_output=True, text=True, timeout=5)
+                for line in r.stdout.splitlines()[1:]:
+                    parts = line.split()
+                    if len(parts) < 6:
+                        continue
+                    fs = parts[0]; mnt = parts[-1]
+                    if fs.startswith("/dev/") and not mnt.startswith(("/System", "/private/var/vm")):
+                        _add_vol(mnt)
+            except Exception:
+                pass
+        else:
+            # Linux: parse /proc/mounts
+            try:
+                with open("/proc/mounts") as f:
+                    for line in f:
+                        parts = line.split()
+                        if len(parts) < 3:
+                            continue
+                        dev, mnt, fstype = parts[0], parts[1], parts[2]
+                        if fstype in {"tmpfs","devtmpfs","proc","sysfs","cgroup","cgroup2",
+                                      "devpts","mqueue","pstore","bpf","tracefs","debugfs",
+                                      "configfs","fusectl","rpc_pipefs","squashfs","autofs",
+                                      "binfmt_misc","hugetlbfs","fuse.gvfsd-fuse","fuse.portal",
+                                      "overlay","nsfs"}:
+                            continue
+                        # Skip nfs auto-mount points that aren't actually mounted
+                        if "x-systemd.automount" in line and fstype == "autofs":
+                            continue
+                        if not dev.startswith(("/dev/", "192.168.", "10.", "/")):
+                            continue
+                        _add_vol(mnt)
+            except Exception:
+                pass
+        # Always include / explicitly
+        _add_vol("/")
+        out["volumes"] = volumes
+    except Exception:
+        pass
+    # CPU utilization snapshot (instantaneous; system_watcher polls every ~15s)
+    try:
+        if _IS_MACOS:
+            # parse `iostat -c2 1` second sample → user+sys
+            r = subprocess.run(["iostat", "-c", "2", "1"], capture_output=True, text=True, timeout=8)
+            lines = [l for l in r.stdout.splitlines() if l.strip()]
+            if len(lines) >= 2:
+                parts = lines[-1].split()
+                # us sy id format
+                if len(parts) >= 5:
+                    try:
+                        out["cpu_used_pct"] = float(parts[-5]) + float(parts[-4])
+                    except Exception:
+                        pass
+        else:
+            # /proc/stat — single-sample using `top -bn2 -d 0.5`-style isn't portable;
+            # use two reads of /proc/stat 200ms apart
+            def _read_cpu():
+                with open("/proc/stat") as f:
+                    line = f.readline()
+                vals = [int(x) for x in line.split()[1:]]
+                idle = vals[3] + vals[4]   # idle + iowait
+                total = sum(vals)
+                return idle, total
+            i1, t1 = _read_cpu()
+            time.sleep(0.25)
+            i2, t2 = _read_cpu()
+            dt = t2 - t1
+            di = i2 - i1
+            if dt > 0:
+                out["cpu_used_pct"] = round(100.0 * (1 - di/dt), 1)
     except Exception:
         pass
     # uptime

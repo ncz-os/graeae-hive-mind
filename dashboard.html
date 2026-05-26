@@ -265,7 +265,7 @@ small.dim{font-size:.85em}
   <div class="panel full-width" id="hosts-panel">
     <h2>🖥️ Fleet Hosts <span class="cnt" id="hosts-cnt"></span></h2>
     <table id="hosts-tbl">
-      <thead><tr><th>host</th><th>cpu</th><th>RAM</th><th>gpu</th><th>load avg</th><th>RAM%</th><th>disk free</th><th>caps</th><th>age</th></tr></thead>
+      <thead><tr><th>host</th><th>cpu</th><th>RAM</th><th>gpu</th><th>load avg</th><th>CPU%</th><th>RAM%</th><th>volumes</th><th>caps</th><th>age</th></tr></thead>
       <tbody></tbody>
     </table>
   </div>
@@ -913,10 +913,29 @@ async function refreshHosts(){
     const threads=h.cpu_threads||h.cpu_count||1;
     const loadPct=load!=null?Math.round(100*load/threads):null;
     r.appendChild(td(load!=null?`${load.toFixed(2)}${loadPct!=null?' ('+loadBar(loadPct)+')':''}`:'-'));
+    // CPU%
+    r.appendChild(td(loadBar(h.cpu_used_pct)));
     // RAM%
     r.appendChild(td(loadBar(h.ram_used_pct)));
-    // disk free
-    var dfg=h.srv_free_gb; var dColor=dfg==null?"#8b949e":dfg<10?"#da3633":dfg<25?"#9e6a03":"#7ee787"; r.appendChild(td(dfg!=null?"<span style=\"color:"+dColor+"\">"+dfg.toFixed(1)+"GB free</span>":"-"));
+    // Volumes (multi-mount support)
+    const vols=h.volumes||[];
+    if(vols.length){
+      const cell=document.createElement('td');
+      cell.style.fontSize='.78em';
+      cell.innerHTML=vols.slice(0,8).map(v=>{
+        const used=v.used_pct||0;
+        const free=v.free_gb||0;
+        const total=v.total_gb||0;
+        const barCls=used<70?'load-ok':used<90?'load-warn':'load-crit';
+        const dColor=free<10?'#da3633':free<25?'#9e6a03':'#7ee787';
+        return `<div style="margin-bottom:.15em;line-height:1.4"><span style="display:inline-block;width:180px"><span style="color:#a5d6ff">${esc(v.mount)}</span></span> <span class="load-bar" style="width:60px"><span class="load-bar-fill ${barCls}" style="width:${used}%"></span></span> ${used.toFixed(0)}% <span style="color:${dColor}">${free.toFixed(1)}/${total.toFixed(0)}GB</span></div>`;
+      }).join('');
+      r.appendChild(cell);
+    } else {
+      // Fallback to legacy single-volume field if volumes[] empty
+      var dfg=h.srv_free_gb; var dColor=dfg==null?'#8b949e':dfg<10?'#da3633':dfg<25?'#9e6a03':'#7ee787';
+      r.appendChild(td(dfg!=null?'<span style="color:'+dColor+'">'+dfg.toFixed(1)+'GB free</span>':'-'));
+    }
     // caps (brief)
     const caps=(h.capabilities||[]).filter(c=>!['system','host'].includes(c)).slice(0,6);
     r.appendChild(td(caps.map(c=>`<span class="dim" style="font-size:.72em;border:1px solid #30363d;border-radius:3px;padding:.05em .25em">${esc(c)}</span>`).join(' ')));
