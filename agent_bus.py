@@ -678,6 +678,9 @@ class JobUpdate(BaseModel):
     tokens_in: Optional[int] = None    # workers SHOULD report token usage on done/failed for cost audit
     tokens_out: Optional[int] = None
     result_mnemos_id: Optional[str] = None   # mem_XXX id where worker stored the outcome — closes provenance loop
+    # Routing re-assignment (queued/offered jobs only — use status=queued to re-route)
+    eligible_kinds: Optional[list[str]] = None
+    eligible_hosts: Optional[list[str]] = None
 
 
 class ScheduleCreate(BaseModel):
@@ -1722,6 +1725,20 @@ async def update_job(job_id: str, req: JobUpdate):
                 cost_estimate = estimate_cost(prov or "unknown", mod or "unknown", t_in, t_out)
                 fields.extend(["tokens_in=?", "tokens_out=?", "estimated_cost_usd=?"])
                 args.extend([t_in, t_out, cost_estimate])
+
+            # Routing re-assignment: only allowed for non-terminal, non-claimed jobs
+            if field_was_set(req, "eligible_kinds") and req.eligible_kinds is not None:
+                if old_status not in {"queued", "offered"}:
+                    await db.execute("ROLLBACK")
+                    raise HTTPException(409, f"eligible_kinds can only be updated on queued/offered jobs, not {old_status!r}")
+                fields.append("eligible_kinds=?")
+                args.append(json.dumps(req.eligible_kinds))
+            if field_was_set(req, "eligible_hosts") and req.eligible_hosts is not None:
+                if old_status not in {"queued", "offered"}:
+                    await db.execute("ROLLBACK")
+                    raise HTTPException(409, f"eligible_hosts can only be updated on queued/offered jobs, not {old_status!r}")
+                fields.append("eligible_hosts=?")
+                args.append(json.dumps(req.eligible_hosts))
 
             args.append(job_id)
             sql = f"UPDATE jobs SET {', '.join(fields)} WHERE id=?"
