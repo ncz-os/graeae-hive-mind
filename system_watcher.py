@@ -435,13 +435,11 @@ def heartbeat():
         "urn": _urn,
         "metadata": {"load": load},
     })
-    # Also broadcast as system.load message for SSE listeners.
-    _http("POST", "/v1/messages", {
-        "from_urn": _urn,
-        "to_urn": None,
-        "topic": "system.load",
-        "payload": load,
-    })
+    # NOTE: previous code also POSTed to /v1/messages as topic=system.load,
+    # but that flooded the bus (11 hosts × 4 msgs/min = 2640/hr of pure
+    # telemetry). The load is already in agent metadata via heartbeat above
+    # and /v1/hosts surfaces it; SSE listeners can subscribe to agent.metadata
+    # events instead. Broadcast removed 2026-05-26.
 
 
 def main():
