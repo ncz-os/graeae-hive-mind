@@ -633,7 +633,8 @@ async function refreshRunning(){
 async function refreshResults(){
   const d=await api('GET','/v1/jobs?status=done&limit=20');
   const jobs=(d.jobs||[]).sort((a,b)=>(b.ended_at||0)-(a.ended_at||0));
-  document.getElementById('results-cnt').textContent=`(${jobs.length})`;
+  const rtotal=d.total||jobs.length;
+  document.getElementById('results-cnt').textContent=`(${rtotal})`;
   const el=document.getElementById('results-list');
   el.innerHTML='';
   if(!jobs.length){el.innerHTML='<div class="dim" style="font-size:.82em;padding:.3em">No completed jobs yet</div>';return;}
@@ -665,7 +666,8 @@ async function refreshFailed(){
   const jobs=(d.jobs||[]).sort((a,b)=>(b.ended_at||0)-(a.ended_at||0));
   _failedJobs=Object.fromEntries(jobs.map(j=>[j.id,j]));
   const cntEl=document.getElementById('failed-cnt');
-  if(cntEl)cntEl.textContent=jobs.length?`(${jobs.length})`:'';
+  const total=d.total||0;
+  if(cntEl)cntEl.textContent=jobs.length?(total>jobs.length?`(${jobs.length} of ${total})`:`(${jobs.length})`):'';
   const el=document.getElementById('failed-list');
   if(!el)return;
   el.innerHTML='';

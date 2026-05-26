@@ -130,6 +130,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   deadline REAL,
   required_capabilities TEXT,                   -- json array; worker must have ALL
   eligible_kinds TEXT,                          -- json array; agent kinds eligible (null = any)
+  eligible_hosts TEXT,                          -- json array; agent hosts eligible (null = any); e.g. ["cixmini"]
   project TEXT,                                 -- #10 FIX: separate project tag from capabilities (riskyeats/investorclaw/etc)
   status TEXT NOT NULL CHECK(status IN ('queued','offered','claimed','running','done','failed','cancelled')),
   claimed_by TEXT,                              -- worker urn (set on claim/dequeue)
@@ -300,6 +301,16 @@ ORCHESTRATOR_RUNTIMES: set[str] = {
     "human",
     "mnemos",
     "unknown",
+}
+
+# HOST AFFINITY — automatic eligible_hosts injection based on job kind prefix.
+# When a job kind matches a prefix, the server adds eligible_hosts if not already set.
+# This ensures e.g. cixmini-os: jobs only run on cixmini hardware without callers needing to specify.
+KIND_HOST_AFFINITY: dict[str, list[str]] = {
+    "cixmini-os:":    ["cixmini"],   # CIX Sky1 NPU jobs — cixmini only
+    "ncz-os:":        ["cixmini"],   # NCZ OS jobs — cixmini or Pi (cixmini primary)
+    "pi:":            ["bigpi", "clawpi", "zeropi"],  # Pi-native tasks
+    "arm64-test:":    ["bigpi", "clawpi", "zeropi", "cixmini"],  # any arm64 device
 }
 
 # COST-TIER MAP (per ~/.claude/rules/llm-usage-policy-2026-05-22.md):
@@ -640,6 +651,7 @@ class JobCreate(BaseModel):
     deadline: Optional[float] = None                   # unix ts, optional SLA
     required_capabilities: Optional[list[str]] = None  # worker must have ALL of these
     eligible_kinds: Optional[list[str]] = None         # restrict to agent kinds; null = any
+    eligible_hosts: Optional[list[str]] = None         # restrict to agent hosts (e.g. ["cixmini"]); null = any
     # #10 FIX (review 2026-05-23): project tag — separate from worker capabilities.
     # 'riskyeats'/'investorclaw' are PROJECTS, not capabilities. Workers don't gain/lose
     # the ability to do work because of a project label; the label is for filter+routing.
@@ -915,6 +927,7 @@ async def lifespan(app: FastAPI):
             ("agents", "plan_period_used_usd", "plan_period_used_usd REAL DEFAULT 0"),
             # jobs — project tag + v0.2 cost/autonomy/retry columns
             ("jobs", "project", "project TEXT"),
+            ("jobs", "eligible_hosts", "eligible_hosts TEXT"),
             ("jobs", "required_autonomy", "required_autonomy TEXT"),
             ("jobs", "max_cost_tier", "max_cost_tier TEXT"),
             ("jobs", "preferred_providers", "preferred_providers TEXT"),
@@ -1280,6 +1293,12 @@ async def create_job(req: JobCreate):
             missing = [d for d in req.depends_on if d not in found]
             if missing:
                 raise HTTPException(422, f"depends_on references unknown job ids: {missing}")
+    # AUTO HOST AFFINITY: inject eligible_hosts based on kind prefix if not already set.
+    if req.eligible_hosts is None:
+        for prefix, hosts in KIND_HOST_AFFINITY.items():
+            if req.kind.startswith(prefix):
+                req = req.model_copy(update={"eligible_hosts": hosts})
+                break
     # ROLE ENFORCEMENT: check submitter runtime BEFORE the cache lookup so
     # worker-only runtimes get a 403 consistently for both cache hits and
     # cache misses. Unregistered submitter_urn values are rejected too; the
@@ -1294,15 +1313,16 @@ async def create_job(req: JobCreate):
             # short-circuit: store job as done with cached result + cost=0
             await db.execute(
                 "INSERT INTO jobs (id, submitter_urn, parent_job_id, kind, description, priority, deadline, "
-                "required_capabilities, eligible_kinds, project, max_cost_tier, preferred_providers, preferred_models, "
+                "required_capabilities, eligible_kinds, eligible_hosts, project, max_cost_tier, preferred_providers, preferred_models, "
                 "mnemos_refs, status, started_at, ended_at, result, claimed_provider, claimed_model, "
                 "claimed_cost_tier, estimated_cost_usd, result_mnemos_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'done', ?, ?, ?, ?, ?, 'A', 0, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'done', ?, ?, ?, ?, ?, 'A', 0, ?)",
                 (
                     job_id, req.submitter_urn, req.parent_job_id, req.kind, req.description,
                     req.priority, req.deadline,
                     json.dumps(req.required_capabilities) if req.required_capabilities else None,
                     json.dumps(req.eligible_kinds) if req.eligible_kinds else None,
+                    json.dumps(req.eligible_hosts) if req.eligible_hosts else None,
                     req.project,
                     max_cost_tier,
                     json.dumps(req.preferred_providers) if req.preferred_providers else None,
@@ -1336,14 +1356,15 @@ async def create_job(req: JobCreate):
         # near the role-enforcement block above).
         await db.execute(
             "INSERT INTO jobs (id, submitter_urn, parent_job_id, kind, description, priority, deadline, "
-            "required_capabilities, eligible_kinds, project, max_cost_tier, preferred_providers, preferred_models, "
+            "required_capabilities, eligible_kinds, eligible_hosts, project, max_cost_tier, preferred_providers, preferred_models, "
             "mnemos_refs, depends_on, max_retries, status, started_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
             (
                 job_id, req.submitter_urn, req.parent_job_id, req.kind, req.description,
                 req.priority, req.deadline,
                 json.dumps(req.required_capabilities) if req.required_capabilities else None,
                 json.dumps(req.eligible_kinds) if req.eligible_kinds else None,
+                json.dumps(req.eligible_hosts) if req.eligible_hosts else None,
                 req.project,
                 max_cost_tier,
                 json.dumps(req.preferred_providers) if req.preferred_providers else None,
@@ -1405,16 +1426,19 @@ async def dequeue_next_job(agent_urn: str):
         try:
             async with db.execute(
                 "SELECT id, kind, description, priority, deadline, required_capabilities, eligible_kinds, "
-                "submitter_urn, parent_job_id, started_at, max_cost_tier, preferred_providers, preferred_models, "
+                "eligible_hosts, submitter_urn, parent_job_id, started_at, max_cost_tier, preferred_providers, preferred_models, "
                 "mnemos_refs, depends_on "
                 "FROM jobs WHERE status='queued' "
                 "AND (retry_backoff_until IS NULL OR retry_backoff_until <= ?) "
                 "ORDER BY priority DESC, started_at ASC",
                 (time.time(),)
             ) as cur:
+                # parse agent host from URN: urn:agent:<kind>:<host>:<session_id>
+                urn_parts = agent_urn.split(":")
+                agent_host = urn_parts[3] if len(urn_parts) > 3 else None
                 async for r in cur:
                     (job_id, j_kind, j_desc, j_prio, j_dead, j_caps_json, j_kinds_json,
-                     j_sub, j_par, j_started, j_max_tier, j_pref_providers, j_pref_models,
+                     j_hosts_json, j_sub, j_par, j_started, j_max_tier, j_pref_providers, j_pref_models,
                      j_mnemos_refs, j_deps_json) = r
                     # DAG gate: all depends_on must be status='done'
                     if j_deps_json:
@@ -1432,6 +1456,11 @@ async def dequeue_next_job(agent_urn: str):
                     if j_kinds_json:
                         kinds = set(json_list(j_kinds_json))
                         if kinds and "*" not in kinds and not kinds.intersection(eligible_aliases):
+                            continue
+                    # filter: eligible_hosts (host affinity)
+                    if j_hosts_json:
+                        hosts = set(json_list(j_hosts_json))
+                        if hosts and "*" not in hosts and agent_host not in hosts:
                             continue
                     # filter: required_capabilities
                     if j_caps_json and "*" not in agent_caps:
@@ -2165,21 +2194,33 @@ async def list_jobs(
 ):
     limit = clamp_limit(limit, default=100, max_limit=1000)
     sql = ("SELECT id, submitter_urn, parent_job_id, kind, description, priority, status, "
-           "claimed_by, started_at, ended_at, result, estimated_cost_usd FROM jobs WHERE 1=1")
+           "claimed_by, started_at, ended_at, result, estimated_cost_usd, eligible_kinds, eligible_hosts FROM jobs WHERE 1=1")
     args: list = []
+    cnt_sql = "SELECT COUNT(*) FROM jobs WHERE 1=1"
+    cnt_args: list = []
     if status:
         sql += " AND status=?"
+        cnt_sql += " AND status=?"
         args.append(status)
+        cnt_args.append(status)
     if agent_urn:
         sql += " AND (submitter_urn=? OR claimed_by=?)"
+        cnt_sql += " AND (submitter_urn=? OR claimed_by=?)"
         args.extend([agent_urn, agent_urn])
+        cnt_args.extend([agent_urn, agent_urn])
     if since:
         sql += " AND started_at >= ?"
+        cnt_sql += " AND started_at >= ?"
         args.append(since)
+        cnt_args.append(since)
     sql += " ORDER BY priority DESC, started_at DESC LIMIT ?"
     args.append(limit)
     rows = []
+    total = 0
     async with connect_db() as db:
+        async with db.execute(cnt_sql, cnt_args) as cur:
+            row = await cur.fetchone()
+            total = row[0] if row else 0
         async with db.execute(sql, args) as cur:
             async for r in cur:
                 rows.append({
@@ -2189,8 +2230,10 @@ async def list_jobs(
                     "started_at": r[8], "ended_at": r[9],
                     "result": json.loads(r[10]) if r[10] else None,
                     "estimated_cost_usd": r[11],
+                    "eligible_kinds": json.loads(r[12]) if r[12] else None,
+                    "eligible_hosts": json.loads(r[13]) if r[13] else None,
                 })
-    return {"count": len(rows), "jobs": rows}
+    return {"count": len(rows), "total": total, "jobs": rows}
 
 
 @app.post("/v1/messages")
@@ -2265,10 +2308,9 @@ async def stream_events(request: Request, since_id: Optional[int] = None):
                         async for r in cur:
                             yield {
                                 "id": str(r[0]),
-                                "event": r[2],
                                 "data": json.dumps({"ts": r[1], "kind": r[2], "payload": json.loads(r[3])}),
                             }
-            # live stream
+            # live stream — use un-typed events (event: message) so browser onmessage fires
             last_ping = time.time()
             while True:
                 if await request.is_disconnected():
@@ -2276,7 +2318,6 @@ async def stream_events(request: Request, since_id: Optional[int] = None):
                 try:
                     evt = await asyncio.wait_for(queue.get(), timeout=SSE_PING_INTERVAL)
                     yield {
-                        "event": evt["kind"],
                         "data": json.dumps(evt),
                     }
                 except asyncio.TimeoutError:
