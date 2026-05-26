@@ -116,6 +116,21 @@ small.dim{font-size:.85em}
 .pbar{display:inline-block;width:30px;height:6px;background:#21262d;border-radius:3px;vertical-align:middle}
 .pbar-fill{height:100%;border-radius:3px;background:#1f6feb}
 
+/* active workers */
+#workers-wrap{margin-bottom:.75em}
+.worker-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:.5em;margin-top:.5em}
+.worker-card{background:#161b22;border:1px solid #238636;border-radius:6px;padding:.6em .75em;position:relative}
+.worker-card.idle{border-color:#30363d;opacity:.6}
+.worker-card .wc-agent{font-size:.78em;color:#7ee787;font-weight:700;margin-bottom:.2em;display:flex;align-items:center;gap:.35em}
+.worker-card .wc-kind-badge{background:#1a4d2e;color:#7ee787;padding:.05em .35em;border-radius:3px;font-size:.75em}
+.worker-card .wc-job{font-size:.8em;color:#a5d6ff;font-weight:600;margin-bottom:.15em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.worker-card .wc-desc{font-size:.75em;color:#8b949e;max-height:2.8em;overflow:hidden;line-height:1.4}
+.worker-card .wc-meta{font-size:.72em;color:#6e7681;margin-top:.3em;display:flex;gap:.5em}
+.worker-card .wc-dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#238636;animation:pulse 1.5s infinite}
+.worker-card.idle .wc-dot{background:#6e7681;animation:none}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+#workers-empty{color:#6e7681;font-size:.82em;padding:.3em}
+
 /* responsive */
 @media(max-width:700px){
   .grid{grid-template-columns:1fr}
@@ -123,11 +138,13 @@ small.dim{font-size:.85em}
   .form-row-3{grid-template-columns:1fr 1fr}
   table{font-size:.78em}
   .act-btns .btn-sm{padding:.2em .4em}
-  th:nth-child(4),td:nth-child(4){display:none} /* hide claimed_by on mobile */
+  th:nth-child(4),td:nth-child(4){display:none}
+  .worker-grid{grid-template-columns:1fr 1fr}
 }
 @media(max-width:480px){
   .form-row-inline{grid-template-columns:1fr}
-  th:nth-child(5),td:nth-child(5){display:none} /* hide cost on small mobile */
+  th:nth-child(5),td:nth-child(5){display:none}
+  .worker-grid{grid-template-columns:1fr}
 }
 </style>
 </head>
@@ -200,14 +217,25 @@ small.dim{font-size:.85em}
   </div>
 </div>
 
+<!-- Active Workers -->
+<div id="workers-wrap">
+  <div class="panel">
+    <h2>🔧 Active Workers <span class="cnt" id="workers-cnt"></span></h2>
+    <div id="workers-grid" class="worker-grid"></div>
+    <div id="workers-empty" style="display:none">No agents currently running jobs</div>
+  </div>
+</div>
+
 <!-- Main Grid -->
 <div class="grid">
   <div class="panel">
     <h2>Queue <span class="cnt" id="queue-cnt"></span></h2>
+    <div style="max-height:420px;overflow-y:auto">
     <table id="jobs-tbl">
-      <thead><tr><th>P</th><th>kind/status</th><th>description</th><th>claimed</th><th>cost</th><th>actions</th></tr></thead>
+      <thead><tr><th>P</th><th>kind</th><th>description</th><th>cost</th><th>actions</th></tr></thead>
       <tbody></tbody>
     </table>
+    </div>
   </div>
 
   <div class="panel">
@@ -509,21 +537,22 @@ async function refreshAgents(){
 }
 
 async function refreshJobs(){
-  const [q,c]=await Promise.all([api('GET','/v1/jobs?status=queued&limit=25'),api('GET','/v1/jobs?status=claimed&limit=25')]);
-  const offered=await api('GET','/v1/jobs?status=offered&limit=10').catch(()=>({jobs:[]}));
-  const all=[...(c.jobs||[]),...(q.jobs||[]),...(offered.jobs||[])].sort((a,b)=>b.priority-a.priority);
+  const [q,offered]=await Promise.all([
+    api('GET','/v1/jobs?status=queued&limit=250'),
+    api('GET','/v1/jobs?status=offered&limit=25').catch(()=>({jobs:[]})),
+  ]);
+  const all=[...(q.jobs||[]),...(offered.jobs||[])].sort((a,b)=>b.priority-a.priority);
   const cnt=all.length;
   document.getElementById('queue-cnt').textContent=`(${cnt})`;
   document.getElementById('meta-queue').textContent=cnt?cnt+' queued':'queue clear';
   const tb=document.querySelector('#jobs-tbl tbody');tb.innerHTML='';
-  for(const j of all.slice(0,30)){
+  for(const j of all){
     const r=tb.insertRow();
     r.className='row-clickable';
     r.onclick=()=>showJobModal(j);
     r.appendChild(td(`${pbar(j.priority)} <b>${j.priority}</b>`));
     r.appendChild(td(`<span style="color:#a5d6ff">${esc(j.kind)}</span><br><span class="s-${esc(j.status)} dim" style="font-size:.78em">${esc(j.status)}</span>`));
     r.appendChild(td(`<small class="dim">${esc((j.description||'').slice(0,55))}</small>`));
-    r.appendChild(td(j.claimed_by?`<small class="dim">${esc(j.claimed_by.split(':').slice(2,4).join('@').slice(0,16))}</small>`:'-'));
     r.appendChild(td(j.estimated_cost_usd?'$'+j.estimated_cost_usd.toFixed(4):'-'));
     const actCell=td('');
     actCell.onclick=e=>e.stopPropagation();
@@ -540,6 +569,40 @@ async function refreshJobs(){
     }
     actCell.appendChild(acts);
     r.appendChild(actCell);
+  }
+}
+
+async function refreshRunning(){
+  const d=await api('GET','/v1/jobs?status=running&limit=50').catch(()=>({jobs:[]}));
+  const jobs=d.jobs||[];
+  const grid=document.getElementById('workers-grid');
+  const empty=document.getElementById('workers-empty');
+  document.getElementById('workers-cnt').textContent=jobs.length?`(${jobs.length} active)`:'';
+  grid.innerHTML='';
+  if(!jobs.length){empty.style.display='';return;}
+  empty.style.display='none';
+  for(const j of jobs){
+    const agentParts=(j.claimed_by||'unknown').split(':');
+    const agentKind=agentParts[2]||'?';
+    const agentHost=agentParts[3]||'?';
+    const elapsed=j.started_at?Math.round(Date.now()/1000-j.started_at):0;
+    const card=document.createElement('div');
+    card.className='worker-card';
+    card.onclick=()=>showJobModal(j);
+    card.innerHTML=`
+      <div class="wc-agent">
+        <span class="wc-dot"></span>
+        <span class="wc-kind-badge">${esc(agentKind)}</span>
+        ${esc(agentHost)}
+      </div>
+      <div class="wc-job">${esc(j.kind)}</div>
+      <div class="wc-desc">${esc((j.description||'').slice(0,120))}</div>
+      <div class="wc-meta">
+        <span>P${j.priority}</span>
+        <span>${elapsed}s</span>
+        <span>${esc(j.id.slice(0,8))}…</span>
+      </div>`;
+    grid.appendChild(card);
   }
 }
 
@@ -622,7 +685,7 @@ async function refreshAll(){
   document.getElementById('meta-time').textContent=`last refresh ${new Date().toLocaleTimeString()} · auto 5s`;
   try{
     await Promise.all([
-      refreshAgents(),refreshJobs(),refreshResults(),
+      refreshRunning(),refreshAgents(),refreshJobs(),refreshResults(),
       refreshCosts(),refreshWorkers(),refreshSchedules(),
     ]);
   }catch(e){document.getElementById('meta-time').textContent='error: '+e;}
@@ -650,6 +713,11 @@ function initSSE(){
         if(['job.done','job.failed','job.queued','job.cached'].includes(d.kind)){
           refreshJobs().catch(()=>{});
           refreshResults().catch(()=>{});
+          refreshRunning().catch(()=>{});
+        }
+        if(['job.claimed','job.running','job.started'].includes(d.kind)){
+          refreshRunning().catch(()=>{});
+          refreshJobs().catch(()=>{});
         }
       }catch(e){}
     };
