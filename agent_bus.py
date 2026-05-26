@@ -301,6 +301,7 @@ ORCHESTRATOR_RUNTIMES: set[str] = {
     "claude-code", "claude-cli", "claude",
     "human",
     "mnemos",
+    "doctor",   # PYTHIA triage authority — submits codex sub-jobs + auto-triage
     "unknown",
 }
 
