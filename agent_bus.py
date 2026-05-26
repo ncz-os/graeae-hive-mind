@@ -1364,6 +1364,21 @@ async def create_job(req: JobCreate):
     max_cost_tier = (req.max_cost_tier or "B").upper()
     if max_cost_tier not in COST_TIERS:
         raise HTTPException(422, f"max_cost_tier must be one of {COST_TIERS}, got {max_cost_tier!r}")
+    # 2026-05-26: codex-only eligibility auto-rewrite. codex is a CLI not an
+    # agent — zeroclaw workers shell out to it. eligible_kinds=['codex'] alone
+    # is unclaimable. Rewrite to ['zeroclaw'] (which routes through codex when
+    # kind matches CODEX_KINDS_PREFIXES on the worker side).
+    NON_CLAIMER_KINDS = {"codex", "review", "hermes-cli"}  # codex + future CLI tools
+    if req.eligible_kinds:
+        ek = list(req.eligible_kinds)
+        # Filter out non-claimer kinds
+        kept = [k for k in ek if k not in NON_CLAIMER_KINDS]
+        if not kept:
+            # All entries were non-claimer → rewrite to zeroclaw
+            req = req.model_copy(update={"eligible_kinds": ["zeroclaw"]})
+        elif kept != ek:
+            # Mixed (e.g. ["zeroclaw", "codex"]) → keep only the claimer kinds
+            req = req.model_copy(update={"eligible_kinds": kept})
     if req.mnemos_refs:
         bad = [r for r in req.mnemos_refs if not (isinstance(r, str) and r.startswith("mem_"))]
         if bad:
