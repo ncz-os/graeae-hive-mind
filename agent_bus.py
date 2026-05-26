@@ -269,6 +269,7 @@ RUNTIME_KIND_MAP: dict[str, set[str]] = {
     "human":         {"human"},
     "claude":        {"claude"},
     "system":        {"system"},                    # fleet hosts (ARGOS/TYPHON/HYDRA/MEDUSA/CERBERUS/PROTEUS/cixmini)
+    "doctor":        {"doctor"},  # PYTHIA zeroclaw doctor — triage authority + DB access
     "unknown":       {"unknown"},
 }
 AUTONOMY_LEVELS = {"autonomous", "confirm-risky", "interactive", "unknown"}
