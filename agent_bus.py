@@ -1071,6 +1071,12 @@ async def register(req: AgentRegister):
     provider = (req.provider or "unknown").lower()
     model = (req.model or "unknown").lower()
     tier = cost_tier_for(provider)
+    # User directive 2026-05-26: allow opencode + codex to claim work at ALL
+    # tiers (A/B/C) regardless of provider. They are flexible multi-provider
+    # agentic CLIs and the tier-ceiling is a routing aid, not a real cost gate
+    # for them.
+    if kind in {"opencode", "codex", "doctor"}:
+        tier = "A"
     session_id = str(uuid.uuid4())
     urn = make_urn(kind, req.host, session_id)
     now = time.time()
