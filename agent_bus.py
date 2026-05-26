@@ -1033,6 +1033,8 @@ async def dashboard():
 async def register(req: AgentRegister):
     # #5 FIX (review 2026-05-23): reject minimally-incomplete registrations with 422 so
     # callers see the error instead of getting a null URN that bricks their session.
+    if (req.host or "").lower().strip() in HOST_DENYLIST:
+        raise HTTPException(403, f"host {req.host!r} is in HIVE_HOST_DENYLIST")
     if not req.host or not req.host.strip():
         raise HTTPException(422, "host is required (e.g., 'studio' or hostname -s)")
     runtime = (req.runtime or "unknown").lower()
