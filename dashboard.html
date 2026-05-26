@@ -141,6 +141,12 @@ small.dim{font-size:.85em}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
 #workers-empty{color:#6e7681;font-size:.82em;padding:.3em}
 
+/* host resources */
+.host-row-stale td{opacity:.5}
+.load-bar{display:inline-block;width:50px;height:6px;background:#21262d;border-radius:3px;vertical-align:middle;margin-right:.3em}
+.load-bar-fill{height:100%;border-radius:3px}
+.load-ok{background:#238636}.load-warn{background:#9e6a03}.load-crit{background:#da3633}
+
 /* responsive */
 @media(max-width:700px){
   .grid{grid-template-columns:1fr}
@@ -252,6 +258,14 @@ small.dim{font-size:.85em}
     <h2>Online agents <span class="cnt" id="agent-count"></span></h2>
     <table id="agent-tbl">
       <thead><tr><th>kind</th><th>host</th><th>model</th><th>tier</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <div class="panel full-width" id="hosts-panel">
+    <h2>🖥️ Fleet Hosts <span class="cnt" id="hosts-cnt"></span></h2>
+    <table id="hosts-tbl">
+      <thead><tr><th>host</th><th>cpu</th><th>RAM</th><th>gpu</th><th>load avg</th><th>RAM%</th><th>disk free</th><th>caps</th><th>age</th></tr></thead>
       <tbody></tbody>
     </table>
   </div>
@@ -804,12 +818,59 @@ async function refreshSchedules(){
   }
 }
 
+function loadBar(pct){
+  if(pct==null)return '<span class="dim">-</span>';
+  const cls=pct<70?'load-ok':pct<90?'load-warn':'load-crit';
+  return `<span class="load-bar"><span class="load-bar-fill ${cls}" style="width:${Math.min(100,pct)}%"></span></span>${pct.toFixed(0)}%`;
+}
+
+async function refreshHosts(){
+  const d=await api('GET','/v1/hosts?include_stale=true').catch(()=>({hosts:[]}));
+  const hosts=d.hosts||[];
+  document.getElementById('hosts-cnt').textContent=`(${hosts.filter(h=>!h.stale).length} live · ${hosts.length} total)`;
+  const tb=document.querySelector('#hosts-tbl tbody');tb.innerHTML='';
+  for(const h of hosts){
+    const r=tb.insertRow();
+    if(h.stale)r.className='host-row-stale';
+    // host name + OS
+    const osTag=h.os==='Darwin'?'🍎':h.arch==='aarch64'||h.arch==='arm64'?'🦾':'🐧';
+    r.appendChild(td(`${osTag} <b>${esc(h.host)}</b>${h.stale?` <small class="dim">(stale ${h.age_s}s)</small>`:''}`));
+    // cpu
+    const cpuStr=h.cpu_model
+      ?(h.cpu_model.replace(/\s+/g,' ').replace(/Intel\(R\)|AMD |Apple /gi,'').slice(0,28)+(h.cpu_threads?` ×${h.cpu_threads}`:''))
+      :(h.cpu_threads?`${h.cpu_threads} threads`:'-');
+    r.appendChild(td(`<small class="dim">${esc(cpuStr)}</small>`));
+    // RAM
+    r.appendChild(td(h.ram_gb!=null?h.ram_gb+'GB':'-'));
+    // GPU
+    const gpus=(h.gpus||[]);
+    const gpuStr=gpus.length?gpus.map(g=>g.name||(g.vendor+' gpu')).join(', ').slice(0,30):'-';
+    r.appendChild(td(`<small class="dim">${esc(gpuStr)}</small>`));
+    // load avg
+    const load=h.load_1min;
+    const threads=h.cpu_threads||h.cpu_count||1;
+    const loadPct=load!=null?Math.round(100*load/threads):null;
+    r.appendChild(td(load!=null?`${load.toFixed(2)}${loadPct!=null?' ('+loadBar(loadPct)+')':''}`:'-'));
+    // RAM%
+    r.appendChild(td(loadBar(h.ram_used_pct)));
+    // disk free
+    r.appendChild(td(h.srv_free_gb!=null?h.srv_free_gb.toFixed(1)+'GB free':'-'));
+    // caps (brief)
+    const caps=(h.capabilities||[]).filter(c=>!['system','host'].includes(c)).slice(0,6);
+    r.appendChild(td(caps.map(c=>`<span class="dim" style="font-size:.72em;border:1px solid #30363d;border-radius:3px;padding:.05em .25em">${esc(c)}</span>`).join(' ')));
+    // heartbeat age
+    const ageClass=h.age_s>60?'s-failed':h.age_s>30?'s-claimed':'s-online';
+    r.appendChild(td(`<span class="${ageClass}">${h.age_s}s</span>`));
+  }
+}
+
 async function refreshAll(){
   document.getElementById('meta-time').textContent=`last refresh ${new Date().toLocaleTimeString()} · auto 5s`;
   try{
     await Promise.all([
       refreshRunning(),refreshAgents(),refreshJobs(),refreshResults(),
       refreshFailed(),refreshCosts(),refreshWorkers(),refreshSchedules(),
+      refreshHosts(),
     ]);
   }catch(e){document.getElementById('meta-time').textContent='error: '+e;}
 }

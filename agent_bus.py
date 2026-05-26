@@ -1209,6 +1209,64 @@ async def agent_stats():
     }
 
 
+@app.get("/v1/hosts")
+async def list_hosts(include_stale: bool = False):
+    """Aggregate view of all system-watcher agents: specs + current load.
+
+    Returns one entry per host (latest system agent wins if multiple).
+    Agents that last heartbeated > 60s ago are flagged as stale unless
+    include_stale=true, in which case all are returned.
+    Used by workers to make resource-aware routing decisions.
+    """
+    cutoff = time.time() - 60  # 60s stale threshold
+    sql = ("SELECT urn, host, status, last_heartbeat, capabilities, metadata "
+           "FROM agents WHERE kind='system'")
+    if not include_stale:
+        sql += " AND last_heartbeat >= ?"
+        args: list = [cutoff]
+    else:
+        args = []
+    sql += " ORDER BY last_heartbeat DESC"
+    seen_hosts: dict[str, dict] = {}
+    async with connect_db() as db:
+        async with db.execute(sql, args) as cur:
+            async for r in cur:
+                h = r[1]
+                if h in seen_hosts:
+                    continue  # already have a newer entry for this host
+                meta = json.loads(r[5]) if r[5] else {}
+                specs = meta.get("specs", {})
+                load  = meta.get("load", {})
+                age_s = time.time() - (r[3] or 0)
+                seen_hosts[h] = {
+                    "host":           h,
+                    "urn":            r[0],
+                    "status":         r[2],
+                    "last_heartbeat": r[3],
+                    "age_s":          round(age_s, 1),
+                    "stale":          age_s > 60,
+                    "capabilities":   json.loads(r[4]) if r[4] else [],
+                    # static specs (from registration)
+                    "cpu_model":      specs.get("cpu_model"),
+                    "cpu_threads":    specs.get("cpu_threads") or specs.get("cpu_count"),
+                    "ram_gb":         specs.get("ram_gb"),
+                    "os":             specs.get("os"),
+                    "arch":           specs.get("arch"),
+                    "gpus":           specs.get("gpus", []),
+                    "has_docker":     specs.get("has_docker"),
+                    "has_podman":     specs.get("has_podman"),
+                    "has_npu":        specs.get("has_npu", False),
+                    # dynamic load (updated each heartbeat)
+                    "load_1min":      load.get("load_1min"),
+                    "load_5min":      load.get("load_5min"),
+                    "ram_used_pct":   load.get("ram_used_pct"),
+                    "srv_free_gb":    load.get("srv_free_gb"),
+                    "uptime_sec":     load.get("uptime_sec"),
+                }
+    hosts = sorted(seen_hosts.values(), key=lambda x: x["host"])
+    return {"count": len(hosts), "hosts": hosts}
+
+
 @app.get("/v1/agents/{urn_path:path}/throttle")
 async def agent_throttle(urn_path: str):
     """Inspect an agent's plan-cap throttle state."""
