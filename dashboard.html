@@ -2,205 +2,666 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>GRAEAE Hive Mind</title>
 <style>
-  body { background:#0d1117; color:#c9d1d9; font-family:-apple-system,Menlo,monospace; margin:0; padding:1em; }
-  h1 { color:#58a6ff; margin:0 0 .3em 0; font-size:1.4em; }
-  .meta { color:#8b949e; font-size:.85em; margin-bottom:1em; }
-  .grid { display:grid; grid-template-columns:1fr 1fr; gap:1em; }
-  .panel { background:#161b22; border:1px solid #30363d; border-radius:6px; padding:.8em; overflow:auto; }
-  .panel h2 { color:#7ee787; font-size:1em; margin:0 0 .5em 0; border-bottom:1px solid #30363d; padding-bottom:.3em; }
-  table { width:100%; border-collapse:collapse; font-size:.85em; }
-  th { color:#8b949e; text-align:left; padding:.3em .5em; border-bottom:1px solid #30363d; }
-  td { padding:.25em .5em; border-bottom:1px solid #21262d; }
-  tr:hover { background:#21262d; }
-  .tag { display:inline-block; padding:.05em .4em; border-radius:3px; font-size:.75em; }
-  .t-A { background:#1a4d2e; color:#7ee787; }
-  .t-B { background:#3d2a00; color:#d29922; }
-  .t-C { background:#4d1f1f; color:#f85149; }
-  .s-online { color:#7ee787; }
-  .s-offline { color:#6e7681; }
-  .s-claimed { color:#d29922; }
-  .s-done { color:#58a6ff; }
-  .s-queued { color:#c9d1d9; }
-  .s-failed { color:#f85149; }
-  #events { font-size:.78em; max-height:30vh; overflow:auto; background:#010409; padding:.5em; border-radius:4px; }
-  .ev { color:#8b949e; }
-  .ev .kind { color:#a5d6ff; font-weight:bold; }
-  .stat { display:inline-block; margin-right:1em; }
-  .stat b { color:#7ee787; }
-  .savings { color:#7ee787; font-weight:bold; }
-  small.dim { color:#6e7681; }
+*{box-sizing:border-box}
+body{background:#0d1117;color:#c9d1d9;font-family:-apple-system,Menlo,monospace;margin:0;padding:.75em;font-size:14px}
+h1{color:#58a6ff;margin:0 0 .2em 0;font-size:1.3em}
+.meta{color:#8b949e;font-size:.8em;margin-bottom:.75em;display:flex;align-items:center;gap:.75em;flex-wrap:wrap}
+.pill{background:#1f2937;border:1px solid #30363d;border-radius:12px;padding:.1em .6em;font-size:.8em}
+.pill.online{border-color:#238636;color:#7ee787}
+.pill.warn{border-color:#9e6a03;color:#d29922}
+.pill.err{border-color:#f85149;color:#f85149}
+
+/* submit panel */
+#submit-wrap{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:.75em;margin-bottom:.75em}
+#submit-header{display:flex;align-items:center;gap:.5em;cursor:pointer;user-select:none}
+#submit-header h2{color:#58a6ff;font-size:.95em;margin:0;flex:1}
+#submit-toggle{color:#58a6ff;font-size:.9em;background:none;border:none;color:#58a6ff;cursor:pointer;padding:.2em .5em;border-radius:4px}
+#submit-toggle:hover{background:#21262d}
+#submit-body{display:none;margin-top:.75em}
+#submit-body.open{display:block}
+.form-row{margin-bottom:.6em}
+.form-row label{display:block;color:#8b949e;font-size:.8em;margin-bottom:.2em}
+.form-row input,.form-row textarea,.form-row select{width:100%;background:#0d1117;border:1px solid #30363d;border-radius:4px;color:#c9d1d9;padding:.4em .6em;font-family:inherit;font-size:.9em}
+.form-row textarea{resize:vertical;min-height:80px}
+.form-row input:focus,.form-row textarea:focus,.form-row select:focus{border-color:#58a6ff;outline:none}
+.form-row-inline{display:grid;grid-template-columns:1fr 1fr;gap:.5em}
+.form-row-3{display:grid;grid-template-columns:2fr 1fr 1fr;gap:.5em}
+.btn{padding:.4em .9em;border:none;border-radius:4px;cursor:pointer;font-family:inherit;font-size:.85em;font-weight:600}
+.btn-primary{background:#1f6feb;color:#fff}
+.btn-primary:hover{background:#388bfd}
+.btn-primary:disabled{background:#21262d;color:#6e7681;cursor:not-allowed}
+.btn-danger{background:#da3633;color:#fff}
+.btn-danger:hover{background:#f85149}
+.btn-ghost{background:#21262d;color:#c9d1d9;border:1px solid #30363d}
+.btn-ghost:hover{background:#30363d}
+.btn-sm{padding:.25em .6em;font-size:.78em}
+.form-actions{display:flex;gap:.5em;align-items:center;flex-wrap:wrap}
+#submit-status{font-size:.8em;color:#7ee787}
+#submit-status.err{color:#f85149}
+#edit-banner{display:none;background:#1a2d4d;border:1px solid #1f6feb;border-radius:4px;padding:.4em .7em;margin-bottom:.6em;font-size:.82em;display:flex;align-items:center;gap:.5em}
+#edit-banner.show{display:flex}
+#edit-cancel{background:none;border:none;color:#8b949e;cursor:pointer;padding:0;font-size:1em}
+#edit-cancel:hover{color:#f85149}
+
+/* grid */
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:.75em}
+.panel{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:.75em;overflow:auto}
+.panel h2{color:#7ee787;font-size:.9em;margin:0 0 .5em 0;border-bottom:1px solid #30363d;padding-bottom:.3em;display:flex;align-items:center;gap:.4em}
+.panel h2 .cnt{color:#8b949e;font-weight:normal;font-size:.85em}
+.full-width{grid-column:1/3}
+
+/* tables */
+table{width:100%;border-collapse:collapse;font-size:.82em}
+th{color:#8b949e;text-align:left;padding:.3em .4em;border-bottom:1px solid #30363d;white-space:nowrap}
+td{padding:.25em .4em;border-bottom:1px solid #21262d;vertical-align:middle}
+tr:hover{background:#21262d}
+.row-clickable{cursor:pointer}
+.tag{display:inline-block;padding:.05em .35em;border-radius:3px;font-size:.75em}
+.t-A{background:#1a4d2e;color:#7ee787}
+.t-B{background:#3d2a00;color:#d29922}
+.t-C{background:#4d1f1f;color:#f85149}
+.s-online,.s-done{color:#7ee787}
+.s-offline,.s-stale{color:#6e7681}
+.s-claimed,.s-running,.s-offered{color:#d29922}
+.s-queued{color:#c9d1d9}
+.s-failed,.s-cancelled{color:#f85149}
+.dim{color:#6e7681}
+small.dim{font-size:.85em}
+.savings{color:#7ee787;font-weight:bold}
+.stat{display:inline-block;margin-right:.75em}
+.stat b{color:#7ee787}
+.act-btns{display:flex;gap:.3em;white-space:nowrap}
+
+/* results panel */
+.result-card{border:1px solid #30363d;border-radius:4px;margin-bottom:.5em;padding:.5em .6em;cursor:pointer}
+.result-card:hover{border-color:#58a6ff;background:#21262d}
+.result-card.done{border-left:3px solid #7ee787}
+.result-card.failed{border-left:3px solid #f85149}
+.result-card .rc-head{display:flex;gap:.5em;align-items:center;margin-bottom:.25em;flex-wrap:wrap}
+.result-card .rc-kind{color:#a5d6ff;font-weight:bold;font-size:.82em}
+.result-card .rc-id{color:#6e7681;font-size:.75em;font-family:monospace}
+.result-card .rc-body{color:#8b949e;font-size:.8em;white-space:pre-wrap;word-break:break-word;max-height:60px;overflow:hidden}
+.result-card .rc-body.expanded{max-height:none}
+
+/* events */
+#events{font-size:.75em;max-height:25vh;overflow:auto;background:#010409;padding:.5em;border-radius:4px}
+.ev{color:#8b949e;margin-bottom:.15em}
+.ev .ek{color:#a5d6ff;font-weight:bold}
+
+/* modal */
+#modal-backdrop{display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:100;overflow-y:auto;padding:1em}
+#modal-backdrop.open{display:flex;align-items:flex-start;justify-content:center}
+#modal{background:#161b22;border:1px solid #30363d;border-radius:8px;max-width:700px;width:100%;padding:1em;position:relative}
+.modal-close{position:absolute;top:.75em;right:.75em;background:none;border:none;color:#8b949e;cursor:pointer;font-size:1.2em;line-height:1}
+.modal-close:hover{color:#c9d1d9}
+#modal h3{color:#58a6ff;margin:0 0 .5em 0;font-size:1em;padding-right:2em}
+.modal-meta{display:flex;flex-wrap:wrap;gap:.4em;margin-bottom:.75em;font-size:.8em}
+.modal-meta span{background:#21262d;padding:.15em .5em;border-radius:3px}
+.modal-section{margin-bottom:.75em}
+.modal-section h4{color:#7ee787;font-size:.82em;margin:0 0 .3em 0;text-transform:uppercase;letter-spacing:.05em}
+.modal-section pre{background:#010409;border-radius:4px;padding:.5em;overflow-x:auto;font-size:.78em;white-space:pre-wrap;word-break:break-word;max-height:300px;overflow-y:auto;margin:0;color:#c9d1d9}
+.modal-section .result-text{background:#010409;border-radius:4px;padding:.6em;font-size:.82em;line-height:1.5;white-space:pre-wrap;word-break:break-word;max-height:300px;overflow-y:auto;color:#c9d1d9}
+.modal-actions{display:flex;gap:.5em;flex-wrap:wrap;margin-top:.75em;padding-top:.75em;border-top:1px solid #30363d}
+.badge{display:inline-block;padding:.2em .6em;border-radius:12px;font-size:.78em;font-weight:600}
+.badge-done{background:#1a4d2e;color:#7ee787}
+.badge-failed{background:#4d1f1f;color:#f85149}
+.badge-queued{background:#1f2937;color:#c9d1d9}
+.badge-claimed,.badge-running{background:#3d2a00;color:#d29922}
+.badge-cancelled{background:#21262d;color:#6e7681}
+
+/* priority bar */
+.pbar{display:inline-block;width:30px;height:6px;background:#21262d;border-radius:3px;vertical-align:middle}
+.pbar-fill{height:100%;border-radius:3px;background:#1f6feb}
+
+/* responsive */
+@media(max-width:700px){
+  .grid{grid-template-columns:1fr}
+  .full-width{grid-column:1/2}
+  .form-row-3{grid-template-columns:1fr 1fr}
+  table{font-size:.78em}
+  .act-btns .btn-sm{padding:.2em .4em}
+  th:nth-child(4),td:nth-child(4){display:none} /* hide claimed_by on mobile */
+}
+@media(max-width:480px){
+  .form-row-inline{grid-template-columns:1fr}
+  th:nth-child(5),td:nth-child(5){display:none} /* hide cost on small mobile */
+}
 </style>
 </head>
 <body>
 <h1>🐝 GRAEAE Hive Mind</h1>
-<div class="meta" id="meta">connecting…</div>
+<div class="meta">
+  <span id="meta-time">connecting…</span>
+  <span class="pill" id="meta-reg">agent: registering…</span>
+  <span id="meta-queue"></span>
+</div>
+
+<!-- Submit / Edit Panel -->
+<div id="submit-wrap">
+  <div id="submit-header" onclick="toggleSubmit()">
+    <h2>📝 <span id="submit-title">New Job</span></h2>
+    <button id="submit-toggle">▼ expand</button>
+  </div>
+  <div id="submit-body">
+    <div id="edit-banner">
+      <span>✏️ Editing job — submitting will cancel the original and create a replacement</span>
+      <button id="edit-cancel" title="Discard edit" onclick="cancelEdit()">✕</button>
+    </div>
+    <div class="form-row">
+      <label>Description / Prompt</label>
+      <textarea id="f-desc" placeholder="Describe the task for the agent in plain language…" rows="4"></textarea>
+    </div>
+    <div class="form-row-3">
+      <div class="form-row" style="margin:0">
+        <label>Job kind</label>
+        <select id="f-kind">
+          <option value="investigation">investigation</option>
+          <option value="code-edit">code-edit</option>
+          <option value="review">review</option>
+          <option value="riskyeats:rdar-fix">riskyeats:rdar-fix</option>
+          <option value="riskyeats:pipeline">riskyeats:pipeline</option>
+          <option value="ncz-os:fix">ncz-os:fix</option>
+          <option value="mnemos:search">mnemos:search</option>
+          <option value="benchmark">benchmark</option>
+          <option value="orchestration">orchestration</option>
+          <option value="migration">migration</option>
+          <option value="general">general</option>
+        </select>
+      </div>
+      <div class="form-row" style="margin:0">
+        <label>Priority (0–100)</label>
+        <input type="number" id="f-priority" value="50" min="0" max="100">
+      </div>
+      <div class="form-row" style="margin:0">
+        <label>Max cost tier</label>
+        <select id="f-tier">
+          <option value="A">A (free)</option>
+          <option value="B" selected>B (cheap)</option>
+          <option value="C">C (reserve)</option>
+        </select>
+      </div>
+    </div>
+    <div class="form-row">
+      <label>Eligible kinds (comma-separated, blank = any)</label>
+      <input type="text" id="f-eligible" placeholder="opencode, codex, zeroclaw">
+    </div>
+    <div class="form-row">
+      <label>Project tag (optional)</label>
+      <input type="text" id="f-project" placeholder="e.g. riskyeats, mnemos-v6, ncz-os">
+    </div>
+    <div class="form-actions">
+      <button class="btn btn-primary" id="submit-btn" onclick="submitJob()" disabled>Submit Job</button>
+      <button class="btn btn-ghost" onclick="clearForm()">Clear</button>
+      <span id="submit-status"></span>
+    </div>
+  </div>
+</div>
+
+<!-- Main Grid -->
 <div class="grid">
   <div class="panel">
-    <h2>Online agents (<span id="agent-count">?</span>)</h2>
-    <table id="agent-tbl"><thead><tr><th>kind</th><th>host</th><th>runtime</th><th>model</th><th>tier</th><th>auth</th><th>caps</th></tr></thead><tbody></tbody></table>
+    <h2>Queue <span class="cnt" id="queue-cnt"></span></h2>
+    <table id="jobs-tbl">
+      <thead><tr><th>P</th><th>kind/status</th><th>description</th><th>claimed</th><th>cost</th><th>actions</th></tr></thead>
+      <tbody></tbody>
+    </table>
   </div>
+
   <div class="panel">
-    <h2>Queue (top 25 by priority)</h2>
-    <table id="jobs-tbl"><thead><tr><th>P</th><th>kind</th><th>status</th><th>claimed_by</th><th>cost</th><th>description</th></tr></thead><tbody></tbody></table>
+    <h2>Online agents <span class="cnt" id="agent-count"></span></h2>
+    <table id="agent-tbl">
+      <thead><tr><th>kind</th><th>host</th><th>model</th><th>tier</th></tr></thead>
+      <tbody></tbody>
+    </table>
   </div>
+
+  <div class="panel full-width">
+    <h2>Recent completions <span class="cnt" id="results-cnt"></span></h2>
+    <div id="results-list"></div>
+  </div>
+
   <div class="panel">
-    <h2>Cost stats (last 24h)</h2>
-    <div id="cost-totals"></div>
-    <table id="cost-tbl"><thead><tr><th>provider</th><th>jobs</th><th>tokens_in</th><th>tokens_out</th><th>$</th></tr></thead><tbody></tbody></table>
+    <h2>Cost stats (24h)</h2>
+    <div id="cost-totals" style="margin-bottom:.5em;font-size:.82em"></div>
+    <table id="cost-tbl">
+      <thead><tr><th>provider</th><th>jobs</th><th>tok in/out</th><th>$</th></tr></thead>
+      <tbody></tbody>
+    </table>
   </div>
+
   <div class="panel">
-    <h2>Result cache</h2>
-    <div id="cache-totals"></div>
-    <table id="cache-tbl"><thead><tr><th>cache_key</th><th>hits</th><th>saved $</th><th>model</th><th>source</th></tr></thead><tbody></tbody></table>
+    <h2>Worker scores</h2>
+    <table id="wstats-tbl">
+      <thead><tr><th>worker</th><th>kind</th><th>✓</th><th>✗</th><th>%</th><th>avg s</th></tr></thead>
+      <tbody></tbody>
+    </table>
   </div>
+
   <div class="panel">
-    <h2>Worker capability scores</h2>
-    <table id="wstats-tbl"><thead><tr><th>worker</th><th>kind</th><th>✓</th><th>✗</th><th>%</th><th>avg s</th><th>$</th></tr></thead><tbody></tbody></table>
+    <h2>Schedules</h2>
+    <table id="sched-tbl">
+      <thead><tr><th>name</th><th>interval</th><th>on</th><th>fires</th><th>next</th></tr></thead>
+      <tbody></tbody>
+    </table>
   </div>
-  <div class="panel">
-    <h2>Scheduled jobs</h2>
-    <table id="sched-tbl"><thead><tr><th>name</th><th>interval</th><th>enabled</th><th>fires</th><th>next</th></tr></thead><tbody></tbody></table>
-  </div>
-  <div class="panel" style="grid-column:1/3">
+
+  <div class="panel full-width">
     <h2>Live event stream</h2>
     <div id="events"></div>
   </div>
 </div>
+
+<!-- Job Detail Modal -->
+<div id="modal-backdrop" onclick="closeModal(event)">
+  <div id="modal" onclick="event.stopPropagation()">
+    <button class="modal-close" onclick="closeModalBtn()">✕</button>
+    <h3 id="modal-title"></h3>
+    <div class="modal-meta" id="modal-meta"></div>
+    <div class="modal-section">
+      <h4>Description / Prompt</h4>
+      <pre id="modal-desc"></pre>
+    </div>
+    <div class="modal-section" id="modal-result-sec" style="display:none">
+      <h4>Result</h4>
+      <div id="modal-result" class="result-text"></div>
+    </div>
+    <div class="modal-section" id="modal-raw-sec">
+      <h4>Raw result JSON</h4>
+      <pre id="modal-raw"></pre>
+    </div>
+    <div class="modal-actions" id="modal-actions"></div>
+  </div>
+</div>
+
 <script>
+'use strict';
 const BUS = location.origin;
-async function load(path) { return (await fetch(BUS+path)).json(); }
-function esc(v){return String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
-function tag(t,c){const s=document.createElement('span');s.className='tag '+c;s.textContent=t;return s;}
-function td(html){const t=document.createElement('td');if(html instanceof Node)t.appendChild(html);else t.innerHTML=html;return t;}
-async function refreshAgents(){
-  const d = await load('/v1/agents?status=online');
-  // Dedup display by (kind,host,runtime,model) and show instance count.
-  // Two `goose-worker@1/@2` units on the same host produce two URNs that
-  // are operationally one worker pool; rendering both rows visually
-  // double-counts the fleet and clutters the panel.
-  const groups = new Map();
-  for (const a of d.agents) {
-    const key = `${a.kind}|${a.host}|${a.runtime||''}|${a.model||''}`;
-    const g = groups.get(key);
-    if (g) {
-      g.count++;
-      if ((a.last_heartbeat||0) > (g.last_heartbeat||0)) g.last_heartbeat = a.last_heartbeat;
-    } else {
-      groups.set(key, {...a, count: 1});
-    }
+let _myUrn = null;
+let _editingJobId = null;
+let _submitOpen = false;
+
+// ── helpers ──────────────────────────────────────────────────────────
+function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function td(html,cls=''){const t=document.createElement('td');t.className=cls;if(html instanceof Node)t.appendChild(html);else t.innerHTML=html;return t;}
+async function api(method,path,body){
+  const opts={method,headers:{'Content-Type':'application/json'}};
+  if(body)opts.body=JSON.stringify(body);
+  const r=await fetch(BUS+path,opts);
+  const j=await r.json().catch(()=>({}));
+  if(!r.ok)throw new Error(j.detail||JSON.stringify(j));
+  return j;
+}
+function timeStr(ts){if(!ts)return '-';return new Date(ts*1000).toLocaleTimeString();}
+function relTime(ts){if(!ts)return '';const d=(Date.now()/1000-ts);if(d<60)return Math.round(d)+'s ago';if(d<3600)return Math.round(d/60)+'m ago';return Math.round(d/3600)+'h ago';}
+function pbar(p){return `<span class="pbar"><span class="pbar-fill" style="width:${Math.min(100,p)}%"></span></span>`;}
+function badgeCls(s){return 'badge badge-'+(s||'queued');}
+
+// ── registration & heartbeat ──────────────────────────────────────────
+async function registerAgent(){
+  try{
+    const r=await api('POST','/v1/agents/register',{
+      host:'dashboard-browser',runtime:'human',kind:'human',
+      autonomy_level:'interactive',auth_method:'unknown',
+      capabilities:['job-submit','triage','cancel'],
+      version:'dashboard-2026-05',
+    });
+    _myUrn=r.urn;
+    const el=document.getElementById('meta-reg');
+    el.textContent='agent: '+r.urn.split(':').slice(2,4).join('@');
+    el.className='pill online';
+    document.getElementById('submit-btn').disabled=false;
+    setInterval(()=>api('POST','/v1/agents/heartbeat',{urn:_myUrn,status:'online'}).catch(()=>{}),25000);
+  }catch(e){
+    const el=document.getElementById('meta-reg');
+    el.textContent='agent: reg failed — '+e.message.slice(0,40);
+    el.className='pill err';
   }
-  const rows = [...groups.values()].sort((a,b)=>(a.kind+a.host).localeCompare(b.kind+b.host));
-  document.getElementById('agent-count').textContent = `${rows.length} pools · ${d.count} instances`;
-  const tb = document.querySelector('#agent-tbl tbody'); tb.innerHTML='';
-  for (const a of rows) {
-    const r = tb.insertRow();
-    const kindCell = esc(a.kind) + (a.count > 1 ? ` <small class="dim">×${a.count}</small>` : '');
+}
+
+// ── submit form ───────────────────────────────────────────────────────
+function toggleSubmit(){
+  _submitOpen=!_submitOpen;
+  document.getElementById('submit-body').className=_submitOpen?'open':'';
+  document.getElementById('submit-toggle').textContent=_submitOpen?'▲ collapse':'▼ expand';
+}
+function setStatus(msg,isErr=false){
+  const el=document.getElementById('submit-status');
+  el.textContent=msg;el.className=isErr?'err':'';
+}
+function clearForm(){
+  ['f-desc','f-project'].forEach(id=>document.getElementById(id).value='');
+  document.getElementById('f-priority').value=50;
+  document.getElementById('f-kind').value='investigation';
+  document.getElementById('f-tier').value='B';
+  document.getElementById('f-eligible').value='';
+  cancelEdit();
+  setStatus('');
+}
+function cancelEdit(){
+  _editingJobId=null;
+  document.getElementById('edit-banner').className='';
+  document.getElementById('submit-title').textContent='New Job';
+}
+function fillFormForEdit(job){
+  _editingJobId=job.id;
+  document.getElementById('f-desc').value=job.description||'';
+  document.getElementById('f-priority').value=job.priority||50;
+  document.getElementById('f-project').value=job.project||'';
+  const kindEl=document.getElementById('f-kind');
+  kindEl.value=job.kind||'investigation';
+  if(!kindEl.value)kindEl.value='investigation';
+  document.getElementById('f-tier').value=(job.max_cost_tier||'B').toUpperCase();
+  const ek=(job.eligible_kinds||[]);
+  document.getElementById('f-eligible').value=ek.join(', ');
+  document.getElementById('edit-banner').className='show';
+  document.getElementById('submit-title').textContent='Edit Job';
+  if(!_submitOpen)toggleSubmit();
+  document.getElementById('f-desc').focus();
+  closeModalBtn();
+  setStatus('');
+}
+async function submitJob(){
+  if(!_myUrn){setStatus('Not registered yet — wait a moment',true);return;}
+  const desc=document.getElementById('f-desc').value.trim();
+  if(!desc){setStatus('Description required',true);return;}
+  const eligible=document.getElementById('f-eligible').value
+    .split(',').map(s=>s.trim()).filter(Boolean);
+  const body={
+    submitter_urn:_myUrn,
+    kind:document.getElementById('f-kind').value,
+    description:desc,
+    priority:parseInt(document.getElementById('f-priority').value,10)||50,
+    max_cost_tier:document.getElementById('f-tier').value,
+    eligible_kinds:eligible.length?eligible:undefined,
+    project:document.getElementById('f-project').value.trim()||undefined,
+  };
+  const btn=document.getElementById('submit-btn');
+  btn.disabled=true;
+  setStatus('Submitting…');
+  try{
+    const oldId=_editingJobId;
+    cancelEdit();
+    const r=await api('POST','/v1/jobs',body);
+    if(oldId){
+      try{await api('PATCH','/v1/jobs/'+oldId,{status:'cancelled'});}catch(_){}
+    }
+    const shortId=r.id.slice(0,8);
+    if(r.cache_hit){
+      setStatus(`✓ Cache hit — job ${shortId} done instantly`);
+    } else {
+      setStatus(`✓ Job ${shortId} queued — watching for agent pickup…`);
+    }
+    clearForm();
+    await refreshAll();
+  }catch(e){
+    setStatus('Error: '+e.message,true);
+    _editingJobId=_editingJobId; // restore if edit was set
+  }finally{
+    btn.disabled=false;
+  }
+}
+
+// ── cancel job ────────────────────────────────────────────────────────
+async function cancelJob(id,e){
+  if(e)e.stopPropagation();
+  if(!confirm('Cancel job '+id.slice(0,8)+'?'))return;
+  try{
+    await api('PATCH','/v1/jobs/'+id,{status:'cancelled'});
+    await refreshAll();
+  }catch(err){alert('Cancel failed: '+err.message);}
+}
+
+// ── job detail modal ──────────────────────────────────────────────────
+let _lastJobs={};
+function showJobModal(job){
+  _lastJobs[job.id]=job;
+  document.getElementById('modal-title').textContent=
+    `Job ${job.id.slice(0,12)}… · ${job.kind} · P${job.priority}`;
+  const meta=document.getElementById('modal-meta');
+  meta.innerHTML=[
+    `<span class="${badgeCls(job.status)}">${esc(job.status)}</span>`,
+    job.claimed_by?`<span>claimed by ${esc(job.claimed_by.split(':').slice(2,4).join('@'))}</span>`:'',
+    `<span>created ${relTime(job.started_at)}</span>`,
+    job.ended_at?`<span>ended ${relTime(job.ended_at)}</span>`:'',
+    job.estimated_cost_usd?`<span>$${job.estimated_cost_usd.toFixed(4)}</span>`:'',
+    (job.eligible_kinds||[]).length?`<span>eligible: ${esc((job.eligible_kinds).join(', '))}</span>`:'',
+  ].filter(Boolean).join('');
+  document.getElementById('modal-desc').textContent=job.description||'(no description)';
+  // result display
+  const resSec=document.getElementById('modal-result-sec');
+  const rawSec=document.getElementById('modal-raw-sec');
+  const resEl=document.getElementById('modal-result');
+  const rawEl=document.getElementById('modal-raw');
+  if(job.result){
+    const r=job.result;
+    const texts=[];
+    if(r.summary)texts.push('SUMMARY\n'+r.summary);
+    if(r.text)texts.push(r.text);
+    if(r.output)texts.push('OUTPUT\n'+r.output);
+    if(r.stdout)texts.push('STDOUT\n'+r.stdout);
+    if(r.stderr)texts.push('STDERR\n'+r.stderr);
+    if(r.files_changed&&r.files_changed.length)texts.push('FILES CHANGED\n'+r.files_changed.join('\n'));
+    if(r.commits&&r.commits.length)texts.push('COMMITS\n'+r.commits.join('\n'));
+    if(r.failure_reason)texts.push('FAILURE\n'+r.failure_reason);
+    if(r.exit_code!==undefined)texts.push('exit_code: '+r.exit_code);
+    if(texts.length){
+      resEl.textContent=texts.join('\n\n──────\n\n');
+      resSec.style.display='';
+    } else {
+      resSec.style.display='none';
+    }
+    rawEl.textContent=JSON.stringify(r,null,2);
+    rawSec.style.display='';
+  } else {
+    resSec.style.display='none';
+    rawSec.style.display='none';
+    rawEl.textContent='';
+  }
+  // modal actions
+  const acts=document.getElementById('modal-actions');
+  acts.innerHTML='';
+  if(job.status==='queued'||job.status==='offered'){
+    const editBtn=document.createElement('button');
+    editBtn.className='btn btn-ghost';
+    editBtn.textContent='✏️ Edit & Resubmit';
+    editBtn.onclick=()=>fillFormForEdit(job);
+    acts.appendChild(editBtn);
+    const cancelBtn=document.createElement('button');
+    cancelBtn.className='btn btn-danger';
+    cancelBtn.textContent='🗑 Cancel Job';
+    cancelBtn.onclick=()=>cancelJob(job.id).then(closeModalBtn);
+    acts.appendChild(cancelBtn);
+  }
+  const closeBtn=document.createElement('button');
+  closeBtn.className='btn btn-ghost';
+  closeBtn.textContent='Close';
+  closeBtn.onclick=closeModalBtn;
+  acts.appendChild(closeBtn);
+  document.getElementById('modal-backdrop').className='open';
+}
+function closeModal(e){if(e&&e.target===document.getElementById('modal-backdrop'))closeModalBtn();}
+function closeModalBtn(){document.getElementById('modal-backdrop').className='';}
+
+// ── refresh panels ────────────────────────────────────────────────────
+async function refreshAgents(){
+  const d=await api('GET','/v1/agents?status=online');
+  const groups=new Map();
+  for(const a of d.agents){
+    const k=`${a.kind}|${a.host}|${a.model||''}`;
+    const g=groups.get(k);
+    if(g){g.count++;if((a.last_heartbeat||0)>(g.last_heartbeat||0))g.last_heartbeat=a.last_heartbeat;}
+    else groups.set(k,{...a,count:1});
+  }
+  const rows=[...groups.values()].sort((a,b)=>(a.kind+a.host).localeCompare(b.kind+b.host));
+  document.getElementById('agent-count').textContent=`${rows.length} pools · ${d.count} instances`;
+  const tb=document.querySelector('#agent-tbl tbody');tb.innerHTML='';
+  for(const a of rows){
+    const r=tb.insertRow();
+    const kindCell=esc(a.kind)+(a.count>1?` <small class="dim">×${a.count}</small>`:'');
     r.appendChild(td(kindCell));
     r.appendChild(td(esc(a.host)));
-    r.appendChild(td(esc(a.runtime||'')));
-    r.appendChild(td(esc(a.model||'')));
-    const tt = td(''); tt.appendChild(tag(a.cost_tier||'?', 't-'+(a.cost_tier||'C'))); r.appendChild(tt);
-    r.appendChild(td(esc(a.auth_method||'')));
-    r.appendChild(td(`<small class="dim">${esc((a.capabilities||[]).slice(0,4).join(','))}</small>`));
+    r.appendChild(td(`<small class="dim">${esc(a.model||'')}</small>`));
+    const tt=td('');tt.appendChild(Object.assign(document.createElement('span'),{className:'tag t-'+(a.cost_tier||'C'),textContent:a.cost_tier||'?'}));r.appendChild(tt);
   }
 }
+
 async function refreshJobs(){
-  const [q,c] = await Promise.all([load('/v1/jobs?status=queued&limit=25'), load('/v1/jobs?status=claimed&limit=25')]);
-  const tb = document.querySelector('#jobs-tbl tbody'); tb.innerHTML='';
-  const all = [...c.jobs, ...q.jobs].sort((a,b)=>b.priority-a.priority);
-  for (const j of all.slice(0,25)) {
-    const r = tb.insertRow();
-    r.appendChild(td(`P${j.priority}`));
-    r.appendChild(td(esc(j.kind)));
-    const sd = td(''); sd.innerHTML = `<span class="s-${esc(j.status)}">${esc(j.status)}</span>`; r.appendChild(sd);
-    r.appendChild(td(j.claimed_by ? esc(j.claimed_by.split(':').slice(2).join(':').slice(0,18)) : '-'));
-    r.appendChild(td(j.estimated_cost_usd ? '$'+j.estimated_cost_usd.toFixed(4) : '-'));
-    r.appendChild(td(`<small class="dim">${esc((j.description||'').slice(0,60))}</small>`));
+  const [q,c]=await Promise.all([api('GET','/v1/jobs?status=queued&limit=25'),api('GET','/v1/jobs?status=claimed&limit=25')]);
+  const offered=await api('GET','/v1/jobs?status=offered&limit=10').catch(()=>({jobs:[]}));
+  const all=[...(c.jobs||[]),...(q.jobs||[]),...(offered.jobs||[])].sort((a,b)=>b.priority-a.priority);
+  const cnt=all.length;
+  document.getElementById('queue-cnt').textContent=`(${cnt})`;
+  document.getElementById('meta-queue').textContent=cnt?cnt+' queued':'queue clear';
+  const tb=document.querySelector('#jobs-tbl tbody');tb.innerHTML='';
+  for(const j of all.slice(0,30)){
+    const r=tb.insertRow();
+    r.className='row-clickable';
+    r.onclick=()=>showJobModal(j);
+    r.appendChild(td(`${pbar(j.priority)} <b>${j.priority}</b>`));
+    r.appendChild(td(`<span style="color:#a5d6ff">${esc(j.kind)}</span><br><span class="s-${esc(j.status)} dim" style="font-size:.78em">${esc(j.status)}</span>`));
+    r.appendChild(td(`<small class="dim">${esc((j.description||'').slice(0,55))}</small>`));
+    r.appendChild(td(j.claimed_by?`<small class="dim">${esc(j.claimed_by.split(':').slice(2,4).join('@').slice(0,16))}</small>`:'-'));
+    r.appendChild(td(j.estimated_cost_usd?'$'+j.estimated_cost_usd.toFixed(4):'-'));
+    const actCell=td('');
+    actCell.onclick=e=>e.stopPropagation();
+    const acts=document.createElement('div');acts.className='act-btns';
+    if(j.status==='queued'||j.status==='offered'){
+      const eb=document.createElement('button');
+      eb.className='btn btn-ghost btn-sm';eb.title='Edit & Resubmit';eb.textContent='✏️';
+      eb.onclick=()=>fillFormForEdit(j);
+      acts.appendChild(eb);
+      const cb=document.createElement('button');
+      cb.className='btn btn-danger btn-sm';cb.title='Cancel job';cb.textContent='✕';
+      cb.onclick=(e)=>cancelJob(j.id,e);
+      acts.appendChild(cb);
+    }
+    actCell.appendChild(acts);
+    r.appendChild(actCell);
   }
 }
+
+async function refreshResults(){
+  const [done,failed]=await Promise.all([
+    api('GET','/v1/jobs?status=done&limit=15'),
+    api('GET','/v1/jobs?status=failed&limit=5'),
+  ]);
+  const all=[...(done.jobs||[]),...(failed.jobs||[])].sort((a,b)=>(b.ended_at||0)-(a.ended_at||0));
+  document.getElementById('results-cnt').textContent=`(${all.length})`;
+  const el=document.getElementById('results-list');
+  el.innerHTML='';
+  if(!all.length){el.innerHTML='<div class="dim" style="font-size:.82em;padding:.3em">No completed jobs yet</div>';return;}
+  for(const j of all.slice(0,10)){
+    const card=document.createElement('div');
+    card.className='result-card '+(j.status==='done'?'done':'failed');
+    const r=j.result||{};
+    const preview=r.summary||r.text||r.output||r.failure_reason||'(no text result)';
+    card.innerHTML=`
+      <div class="rc-head">
+        <span class="rc-kind">${esc(j.kind)}</span>
+        <span class="${badgeCls(j.status)}">${esc(j.status)}</span>
+        <span class="rc-id">${esc(j.id.slice(0,10))}</span>
+        <span class="dim" style="font-size:.75em;margin-left:auto">${relTime(j.ended_at)}</span>
+      </div>
+      <div class="dim" style="font-size:.78em;margin-bottom:.3em">${esc((j.description||'').slice(0,80))}</div>
+      <div class="rc-body">${esc(String(preview).slice(0,200))}</div>
+    `;
+    card.onclick=()=>showJobModal(j);
+    el.appendChild(card);
+  }
+}
+
 async function refreshCosts(){
-  const d = await load('/v1/stats/costs?group_by=provider&since_hours=24');
-  const tot = d.totals;
-  document.getElementById('cost-totals').innerHTML =
-    `<span class="stat">jobs <b>${tot.job_count}</b></span>`+
-    `<span class="stat">tokens in/out <b>${(tot.tokens_in||0).toLocaleString()}/${(tot.tokens_out||0).toLocaleString()}</b></span>`+
+  const d=await api('GET','/v1/stats/costs?group_by=provider&since_hours=24');
+  const tot=d.totals||{};
+  document.getElementById('cost-totals').innerHTML=
+    `<span class="stat">jobs <b>${tot.job_count||0}</b></span>`+
     `<span class="stat">spent <b class="savings">$${(tot.estimated_cost_usd||0).toFixed(4)}</b></span>`;
-  const tb = document.querySelector('#cost-tbl tbody'); tb.innerHTML='';
-  for (const b of d.buckets.slice(0,8)) {
-    const r = tb.insertRow();
+  const tb=document.querySelector('#cost-tbl tbody');tb.innerHTML='';
+  for(const b of (d.buckets||[]).slice(0,8)){
+    const r=tb.insertRow();
     r.appendChild(td(esc(b.bucket)));
     r.appendChild(td(b.job_count));
-    r.appendChild(td((b.tokens_in||0).toLocaleString()));
-    r.appendChild(td((b.tokens_out||0).toLocaleString()));
+    r.appendChild(td(`<small class="dim">${(b.tokens_in||0).toLocaleString()}/${(b.tokens_out||0).toLocaleString()}</small>`));
     r.appendChild(td('$'+(b.estimated_cost_usd||0).toFixed(4)));
   }
 }
-async function refreshCache(){
-  const d = await load('/v1/stats/cache');
-  const tot = d.totals;
-  document.getElementById('cache-totals').innerHTML =
-    `<span class="stat">entries <b>${tot.cached_jobs}</b></span>`+
-    `<span class="stat">hits <b>${tot.total_hits}</b></span>`+
-    `<span class="stat">short-circuits <b>${tot.jobs_short_circuited}</b></span>`+
-    `<span class="stat">saved <b class="savings">$${tot.total_cost_saved_usd}</b></span>`;
-  const tb = document.querySelector('#cache-tbl tbody'); tb.innerHTML='';
-  for (const e of d.top_entries) {
-    const r = tb.insertRow();
-    r.appendChild(td(`<small class="dim">${e.cache_key}</small>`));
-    r.appendChild(td(e.hit_count));
-    r.appendChild(td('$'+(e.cost_saved_usd||0).toFixed(4)));
-    r.appendChild(td(esc(e.model||'?')));
-    r.appendChild(td(`<small class="dim">${esc((e.source_job_id||'').slice(0,8))}</small>`));
-  }
-}
+
 async function refreshWorkers(){
-  const d = await load('/v1/stats/workers?top_n=20');
-  const tb = document.querySelector('#wstats-tbl tbody'); tb.innerHTML='';
-  for (const w of d.workers.slice(0,15)) {
-    const parts = (w.urn||'').split(':');
-    const lab = parts.length>=4 ? `${parts[1]}@${parts[3].slice(-12)}` : w.urn;
-    const r = tb.insertRow();
+  const d=await api('GET','/v1/stats/workers?top_n=20');
+  const tb=document.querySelector('#wstats-tbl tbody');tb.innerHTML='';
+  for(const w of (d.workers||[]).slice(0,15)){
+    const parts=(w.urn||'').split(':');
+    const lab=parts.length>=4?`${parts[2]}@${parts[3].slice(-10)}`:w.urn;
+    const r=tb.insertRow();
     r.appendChild(td(`<small class="dim">${esc(lab)}</small>`));
     r.appendChild(td(esc(w.kind)));
     r.appendChild(td(`<span class="s-done">${w.success_count}</span>`));
     r.appendChild(td(`<span class="s-failed">${w.fail_count}</span>`));
     r.appendChild(td((w.success_pct||0)+'%'));
     r.appendChild(td(w.avg_duration_sec||0));
-    r.appendChild(td('$'+(w.total_cost_usd||0).toFixed(4)));
   }
 }
+
 async function refreshSchedules(){
-  const d = await load('/v1/schedules');
-  const tb = document.querySelector('#sched-tbl tbody'); tb.innerHTML='';
-  for (const s of d.schedules) {
-    const r = tb.insertRow();
+  const d=await api('GET','/v1/schedules');
+  const tb=document.querySelector('#sched-tbl tbody');tb.innerHTML='';
+  for(const s of (d.schedules||[])){
+    const r=tb.insertRow();
     r.appendChild(td(esc(s.name)));
     r.appendChild(td(s.interval_seconds+'s'));
-    r.appendChild(td(s.enabled ? '<span class="s-online">on</span>' : '<span class="s-offline">off</span>'));
+    r.appendChild(td(s.enabled?'<span class="s-online">on</span>':'<span class="s-offline">off</span>'));
     r.appendChild(td(s.fire_count));
-    r.appendChild(td(s.next_fire_at ? new Date(s.next_fire_at*1000).toLocaleTimeString() : '-'));
+    r.appendChild(td(s.next_fire_at?new Date(s.next_fire_at*1000).toLocaleTimeString():'-'));
   }
 }
+
 async function refreshAll(){
-  document.getElementById('meta').textContent = `last refresh ${new Date().toLocaleTimeString()} · auto-refresh 5s`;
-  try { await Promise.all([refreshAgents(), refreshJobs(), refreshCosts(), refreshCache(), refreshWorkers(), refreshSchedules()]); }
-  catch(e) { document.getElementById('meta').textContent = 'error: '+e; }
+  document.getElementById('meta-time').textContent=`last refresh ${new Date().toLocaleTimeString()} · auto 5s`;
+  try{
+    await Promise.all([
+      refreshAgents(),refreshJobs(),refreshResults(),
+      refreshCosts(),refreshWorkers(),refreshSchedules(),
+    ]);
+  }catch(e){document.getElementById('meta-time').textContent='error: '+e;}
 }
-// SSE live event tail
-const evDiv = document.getElementById('events');
-function evLine(s){ const d = document.createElement('div'); d.className='ev'; d.innerHTML = s; evDiv.insertBefore(d, evDiv.firstChild); while(evDiv.children.length > 30) evDiv.removeChild(evDiv.lastChild); }
-try {
-  const es = new EventSource(BUS+'/v1/events');
-  es.onmessage = ev => {
-    try { const d=JSON.parse(ev.data); evLine(`<span class="kind">${esc(d.kind)}</span> ${esc(JSON.stringify(d.payload).slice(0,180))}`); }
-    catch(e){}
-  };
-  es.onerror = () => evLine('<span style="color:#f85149">SSE disconnected — retrying</span>');
-} catch(e) {}
+
+// ── SSE live events ───────────────────────────────────────────────────
+const evDiv=document.getElementById('events');
+function evLine(s){
+  const d=document.createElement('div');d.className='ev';d.innerHTML=s;
+  evDiv.insertBefore(d,evDiv.firstChild);
+  while(evDiv.children.length>40)evDiv.removeChild(evDiv.lastChild);
+}
+function initSSE(){
+  try{
+    const es=new EventSource(BUS+'/v1/events');
+    es.onmessage=ev=>{
+      try{
+        const d=JSON.parse(ev.data);
+        const p=d.payload||{};
+        const short=(p.id||'').slice(0,8);
+        let detail='';
+        if(p.claimed_by)detail+=` by ${p.claimed_by.split(':').slice(2,4).join('@')}`;
+        if(p.cost_saved_usd)detail+=` (cache saved $${p.cost_saved_usd.toFixed(4)})`;
+        evLine(`<span class="ek">${esc(d.kind)}</span> ${short?esc(short)+'…':''} ${esc(detail)}`);
+        if(['job.done','job.failed','job.queued','job.cached'].includes(d.kind)){
+          refreshJobs().catch(()=>{});
+          refreshResults().catch(()=>{});
+        }
+      }catch(e){}
+    };
+    es.onerror=()=>evLine('<span style="color:#f85149">SSE disconnected — retrying</span>');
+  }catch(e){}
+}
+
+// ── init ──────────────────────────────────────────────────────────────
+registerAgent();
 refreshAll();
-setInterval(refreshAll, 5000);
+setInterval(refreshAll,5000);
+initSSE();
 </script>
 </body>
 </html>
