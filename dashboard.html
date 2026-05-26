@@ -86,6 +86,16 @@ small.dim{font-size:.85em}
 .result-card .rc-body{color:#8b949e;font-size:.8em;white-space:pre-wrap;word-break:break-word;max-height:60px;overflow:hidden}
 .result-card .rc-body.expanded{max-height:none}
 
+/* failed panel */
+.failed-card{background:#140a0a;border:1px solid #6e2020;border-left:3px solid #f85149;border-radius:4px;margin-bottom:.5em;padding:.5em .6em;cursor:pointer}
+.failed-card:hover{border-color:#f85149;background:#1e0e0e}
+.failed-card .fc-head{display:flex;gap:.5em;align-items:center;margin-bottom:.2em;flex-wrap:wrap}
+.failed-card .fc-kind{color:#f85149;font-weight:bold;font-size:.82em}
+.failed-card .fc-desc{color:#8b949e;font-size:.78em;margin-bottom:.3em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.failed-card .fc-reason{font-size:.76em;color:#ff9090;background:#200d0d;border-radius:3px;padding:.2em .5em;margin-bottom:.4em;max-height:3.5em;overflow:hidden;line-height:1.4;white-space:pre-wrap;word-break:break-word}
+.failed-card .fc-acts{display:flex;gap:.35em;flex-wrap:wrap}
+.failed-panel-empty{color:#6e7681;font-size:.82em;padding:.3em}
+
 /* events */
 #events{font-size:.75em;max-height:25vh;overflow:auto;background:#010409;padding:.5em;border-radius:4px}
 .ev{color:#8b949e;margin-bottom:.15em}
@@ -246,8 +256,13 @@ small.dim{font-size:.85em}
     </table>
   </div>
 
+  <div class="panel full-width" id="failed-panel">
+    <h2>❌ Failed Jobs <span class="cnt" id="failed-cnt"></span></h2>
+    <div id="failed-list"></div>
+  </div>
+
   <div class="panel full-width">
-    <h2>Recent completions <span class="cnt" id="results-cnt"></span></h2>
+    <h2>✅ Recent Completions <span class="cnt" id="results-cnt"></span></h2>
     <div id="results-list"></div>
   </div>
 
@@ -373,14 +388,23 @@ function cancelEdit(){
   document.getElementById('edit-banner').className='';
   document.getElementById('submit-title').textContent='New Job';
 }
+function setSelectOrAdd(selectEl, value){
+  if(!value)return;
+  let found=false;
+  for(const o of selectEl.options){if(o.value===value){found=true;break;}}
+  if(!found){
+    const o=document.createElement('option');
+    o.value=o.textContent=value;
+    selectEl.appendChild(o);
+  }
+  selectEl.value=value;
+}
 function fillFormForEdit(job){
   _editingJobId=job.id;
   document.getElementById('f-desc').value=job.description||'';
   document.getElementById('f-priority').value=job.priority||50;
   document.getElementById('f-project').value=job.project||'';
-  const kindEl=document.getElementById('f-kind');
-  kindEl.value=job.kind||'investigation';
-  if(!kindEl.value)kindEl.value='investigation';
+  setSelectOrAdd(document.getElementById('f-kind'),job.kind||'investigation');
   document.getElementById('f-tier').value=(job.max_cost_tier||'B').toUpperCase();
   const ek=(job.eligible_kinds||[]);
   document.getElementById('f-eligible').value=ek.join(', ');
@@ -607,20 +631,18 @@ async function refreshRunning(){
 }
 
 async function refreshResults(){
-  const [done,failed]=await Promise.all([
-    api('GET','/v1/jobs?status=done&limit=15'),
-    api('GET','/v1/jobs?status=failed&limit=5'),
-  ]);
-  const all=[...(done.jobs||[]),...(failed.jobs||[])].sort((a,b)=>(b.ended_at||0)-(a.ended_at||0));
-  document.getElementById('results-cnt').textContent=`(${all.length})`;
+  const d=await api('GET','/v1/jobs?status=done&limit=20');
+  const jobs=(d.jobs||[]).sort((a,b)=>(b.ended_at||0)-(a.ended_at||0));
+  document.getElementById('results-cnt').textContent=`(${jobs.length})`;
   const el=document.getElementById('results-list');
   el.innerHTML='';
-  if(!all.length){el.innerHTML='<div class="dim" style="font-size:.82em;padding:.3em">No completed jobs yet</div>';return;}
-  for(const j of all.slice(0,10)){
+  if(!jobs.length){el.innerHTML='<div class="dim" style="font-size:.82em;padding:.3em">No completed jobs yet</div>';return;}
+  for(const j of jobs.slice(0,15)){
     const card=document.createElement('div');
-    card.className='result-card '+(j.status==='done'?'done':'failed');
+    card.className='result-card done';
     const r=j.result||{};
-    const preview=r.summary||r.text||r.output||r.failure_reason||'(no text result)';
+    const preview=r.summary||r.text||r.output||'(no text result)';
+    const commits=r.commits&&r.commits.length?`<div style="font-size:.74em;color:#7ee787;margin-top:.2em">commits: ${esc(r.commits.slice(0,3).join(', '))}</div>`:'';
     card.innerHTML=`
       <div class="rc-head">
         <span class="rc-kind">${esc(j.kind)}</span>
@@ -628,12 +650,111 @@ async function refreshResults(){
         <span class="rc-id">${esc(j.id.slice(0,10))}</span>
         <span class="dim" style="font-size:.75em;margin-left:auto">${relTime(j.ended_at)}</span>
       </div>
-      <div class="dim" style="font-size:.78em;margin-bottom:.3em">${esc((j.description||'').slice(0,80))}</div>
+      <div class="dim" style="font-size:.78em;margin-bottom:.25em">${esc((j.description||'').slice(0,80))}</div>
       <div class="rc-body">${esc(String(preview).slice(0,200))}</div>
+      ${commits}
     `;
     card.onclick=()=>showJobModal(j);
     el.appendChild(card);
   }
+}
+
+let _failedJobs={};
+async function refreshFailed(){
+  const d=await api('GET','/v1/jobs?status=failed&limit=50').catch(()=>({jobs:[]}));
+  const jobs=(d.jobs||[]).sort((a,b)=>(b.ended_at||0)-(a.ended_at||0));
+  _failedJobs=Object.fromEntries(jobs.map(j=>[j.id,j]));
+  const cntEl=document.getElementById('failed-cnt');
+  if(cntEl)cntEl.textContent=jobs.length?`(${jobs.length})`:'';
+  const el=document.getElementById('failed-list');
+  if(!el)return;
+  el.innerHTML='';
+  if(!jobs.length){
+    el.innerHTML='<div class="failed-panel-empty">No failed jobs — queue is healthy ✓</div>';
+    return;
+  }
+  for(const j of jobs){
+    const r=j.result||{};
+    const reason=r.failure_reason||r.stderr||r.error||r.summary||'(no failure detail)';
+    const card=document.createElement('div');
+    card.className='failed-card';
+    card.onclick=()=>showJobModal(j);
+    const jid=j.id;
+    card.innerHTML=`
+      <div class="fc-head">
+        <span class="fc-kind">${esc(j.kind)}</span>
+        <span class="dim" style="font-size:.75em">P${j.priority}</span>
+        ${j.claimed_by?`<span class="dim" style="font-size:.75em">via ${esc(j.claimed_by.split(':').slice(2,4).join('@').slice(0,20))}</span>`:''}
+        <span class="dim" style="font-size:.75em;margin-left:auto">${relTime(j.ended_at)}</span>
+      </div>
+      <div class="fc-desc">${esc((j.description||'').slice(0,100))}</div>
+      <div class="fc-reason">${esc(String(reason).slice(0,300))}</div>
+      <div class="fc-acts" onclick="event.stopPropagation()">
+        <button class="btn btn-ghost btn-sm" onclick="resubmitFailed('${jid}')">🔁 Resubmit</button>
+        <button class="btn btn-primary btn-sm" onclick="triageAndResubmit('${jid}')">🔍 Triage &amp; Resubmit</button>
+        <button class="btn btn-danger btn-sm" title="Dismiss" onclick="dismissFailed('${jid}',event)">✕</button>
+      </div>`;
+    el.appendChild(card);
+  }
+}
+
+function resubmitFailed(id){
+  const j=_failedJobs[id];
+  if(!j)return;
+  // Pre-fill form but don't cancel the failed job on submit (it's already done)
+  _editingJobId=null;
+  document.getElementById('f-desc').value=j.description||'';
+  document.getElementById('f-priority').value=j.priority||50;
+  document.getElementById('f-project').value=j.project||'';
+  setSelectOrAdd(document.getElementById('f-kind'),j.kind||'investigation');
+  document.getElementById('f-tier').value=(j.max_cost_tier||'B').toUpperCase();
+  document.getElementById('f-eligible').value=(j.eligible_kinds||[]).join(', ');
+  document.getElementById('edit-banner').className='';
+  document.getElementById('submit-title').textContent='Resubmit Job';
+  if(!_submitOpen)toggleSubmit();
+  document.getElementById('f-desc').focus();
+  setStatus('Review and submit — failed job will NOT be cancelled (already in terminal state)');
+}
+
+async function triageAndResubmit(id){
+  const j=_failedJobs[id];
+  if(!j||!_myUrn){setStatus('Not registered or job not found',true);return;}
+  const r=j.result||{};
+  const reason=r.failure_reason||r.stderr||r.error||r.summary||'(no failure detail)';
+  const triageDesc=`Triage this failed Hive job and recommend a corrected resubmit.\n\nFailed kind: ${j.kind}\nPriority: ${j.priority}\nEligible: ${(j.eligible_kinds||[]).join(', ')}\n\nOriginal description:\n${j.description||''}\n\nFailure output:\n${String(reason).slice(0,800)}`;
+  try{
+    const tr=await api('POST','/v1/jobs',{
+      submitter_urn:_myUrn,
+      kind:'triage',
+      description:triageDesc,
+      priority:Math.min((j.priority||50)+10,100),
+      eligible_kinds:['codex','claude'],
+      project:j.project||undefined,
+    });
+    setStatus(`✓ Triage job ${tr.id.slice(0,8)} queued — review form below then submit corrected job`);
+    // Pre-fill form for the corrected resubmit
+    _editingJobId=null;
+    document.getElementById('f-desc').value=j.description||'';
+    document.getElementById('f-priority').value=j.priority||50;
+    document.getElementById('f-project').value=j.project||'';
+    setSelectOrAdd(document.getElementById('f-kind'),j.kind||'investigation');
+    document.getElementById('f-tier').value=(j.max_cost_tier||'B').toUpperCase();
+    document.getElementById('f-eligible').value=(j.eligible_kinds||[]).join(', ');
+    document.getElementById('edit-banner').className='';
+    document.getElementById('submit-title').textContent='Corrected Resubmit (after triage)';
+    if(!_submitOpen)toggleSubmit();
+    document.getElementById('f-desc').focus();
+    await refreshAll();
+  }catch(e){setStatus('Triage error: '+e.message,true);}
+}
+
+async function dismissFailed(id,e){
+  if(e)e.stopPropagation();
+  try{
+    await api('PATCH','/v1/jobs/'+id,{status:'cancelled'}).catch(()=>{});
+    delete _failedJobs[id];
+    await refreshFailed();
+  }catch(_){}
 }
 
 async function refreshCosts(){
@@ -686,7 +807,7 @@ async function refreshAll(){
   try{
     await Promise.all([
       refreshRunning(),refreshAgents(),refreshJobs(),refreshResults(),
-      refreshCosts(),refreshWorkers(),refreshSchedules(),
+      refreshFailed(),refreshCosts(),refreshWorkers(),refreshSchedules(),
     ]);
   }catch(e){document.getElementById('meta-time').textContent='error: '+e;}
 }
@@ -710,10 +831,18 @@ function initSSE(){
         if(p.claimed_by)detail+=` by ${p.claimed_by.split(':').slice(2,4).join('@')}`;
         if(p.cost_saved_usd)detail+=` (cache saved $${p.cost_saved_usd.toFixed(4)})`;
         evLine(`<span class="ek">${esc(d.kind)}</span> ${short?esc(short)+'…':''} ${esc(detail)}`);
-        if(['job.done','job.failed','job.queued','job.cached'].includes(d.kind)){
+        if(['job.done','job.cached'].includes(d.kind)){
           refreshJobs().catch(()=>{});
           refreshResults().catch(()=>{});
           refreshRunning().catch(()=>{});
+        }
+        if(d.kind==='job.failed'){
+          refreshFailed().catch(()=>{});
+          refreshRunning().catch(()=>{});
+          refreshJobs().catch(()=>{});
+        }
+        if(d.kind==='job.queued'){
+          refreshJobs().catch(()=>{});
         }
         if(['job.claimed','job.running','job.started'].includes(d.kind)){
           refreshRunning().catch(()=>{});
