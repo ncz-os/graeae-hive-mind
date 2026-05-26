@@ -1598,9 +1598,12 @@ async def dequeue_next_job(agent_urn: str):
             if not committed:
                 await db.execute("ROLLBACK")
             raise
-    return JSONResponse(
+    # HTTP 204 = No Content. By spec the response body must be EMPTY.
+    # JSONResponse(content=None) writes 'null' (4 bytes) which violates the
+    # contract and triggers h11 LocalProtocolError. Use Response (no body).
+    from fastapi.responses import Response as _Response
+    return _Response(
         status_code=204,
-        content=None,
         headers={
             "X-Hive-Claim-Result": "no_jobs_available",
             "X-Hive-Claim-Detail": "no queued jobs matched agent eligibility, dependencies, backoff, or cost tier",
