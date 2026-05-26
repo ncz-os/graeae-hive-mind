@@ -309,6 +309,16 @@ def dynamic_load() -> dict:
                 pass
         # Always include / explicitly
         _add_vol("/")
+        # Dedupe by (total_gb, free_gb) — bind-mounts and overlay views share
+        # the same underlying device size. Keep the shortest mount path as
+        # the canonical one (usually the actual mount, not a bind).
+        if volumes:
+            by_sig: dict = {}
+            for v in volumes:
+                sig = (v.get("total_gb"), v.get("free_gb"))
+                if sig not in by_sig or len(v.get("mount","")) < len(by_sig[sig].get("mount","")):
+                    by_sig[sig] = v
+            volumes = sorted(by_sig.values(), key=lambda x: x.get("mount") or "")
         out["volumes"] = volumes
     except Exception:
         pass

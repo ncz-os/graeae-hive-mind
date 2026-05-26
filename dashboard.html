@@ -922,14 +922,24 @@ async function refreshHosts(){
     if(vols.length){
       const cell=document.createElement('td');
       cell.style.fontSize='.78em';
-      cell.innerHTML=vols.slice(0,8).map(v=>{
-        const used=v.used_pct||0;
-        const free=v.free_gb||0;
-        const total=v.total_gb||0;
-        const barCls=used<70?'load-ok':used<90?'load-warn':'load-crit';
-        const dColor=free<10?'#da3633':free<25?'#9e6a03':'#7ee787';
-        return `<div style="margin-bottom:.15em;line-height:1.4"><span style="display:inline-block;width:180px"><span style="color:#a5d6ff">${esc(v.mount)}</span></span> <span class="load-bar" style="width:60px"><span class="load-bar-fill ${barCls}" style="width:${used}%"></span></span> ${used.toFixed(0)}% <span style="color:${dColor}">${free.toFixed(1)}/${total.toFixed(0)}GB</span></div>`;
+      // Horizontal chip rendering — eliminates vertical list jitter.
+      // Tightened color thresholds: red<5GB free, orange<10GB free, green≥10GB.
+      const CHIP_CAP = 4;
+      const shown = vols.slice(0, CHIP_CAP);
+      const overflow = vols.length - shown.length;
+      const chips = shown.map(v=>{
+        const used = v.used_pct || 0;
+        const free = v.free_gb || 0;
+        const total = v.total_gb || 0;
+        const barCls = used<70?'load-ok':used<90?'load-warn':'load-crit';
+        const dColor = free<5?'#da3633':free<10?'#9e6a03':'#7ee787';
+        const mount = (v.mount||'').length > 18 ? '…'+v.mount.slice(-17) : (v.mount||'');
+        return `<span title="${esc(v.mount)} — ${used.toFixed(0)}% used, ${free.toFixed(1)} GB free of ${total.toFixed(0)} GB" style="display:inline-block;border:1px solid #30363d;border-radius:3px;padding:.1em .35em;margin:.05em .15em .05em 0;background:#0d1117;white-space:nowrap"><span style="color:#a5d6ff">${esc(mount)}</span> <span style="color:${dColor}">${free.toFixed(1)}/${total.toFixed(0)}GB</span></span>`;
       }).join('');
+      const moreTag = overflow > 0 ? `<span title="${overflow} more mounts not shown" class="dim" style="font-size:.85em">+${overflow}</span>` : '';
+      cell.innerHTML = chips + moreTag;
+      cell.style.lineHeight = '1.8';
+      cell.style.whiteSpace = 'normal';
       r.appendChild(cell);
     } else {
       // Fallback to legacy single-volume field if volumes[] empty
@@ -946,7 +956,7 @@ async function refreshHosts(){
 }
 
 async function refreshAll(){
-  document.getElementById('meta-time').textContent=`last refresh ${new Date().toLocaleTimeString()} · auto 5s`;
+  document.getElementById('meta-time').textContent=`last refresh ${new Date().toLocaleTimeString()} · auto 8s`;
   try{
     await Promise.all([
       refreshRunning(),refreshAgents(),refreshJobs(),refreshResults(),
@@ -1004,7 +1014,7 @@ function initSSE(){
 // ── init ──────────────────────────────────────────────────────────────
 registerAgent();
 refreshAll();
-setInterval(refreshAll,5000);
+setInterval(refreshAll, 8000);
 initSSE();
 </script>
 </body>

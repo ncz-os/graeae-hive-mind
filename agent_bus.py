@@ -371,6 +371,15 @@ STATUS_TRANSITIONS: dict[str, set[str]] = {
     "cancelled": {"cancelled"},
 }
 CLAIM_LEASE_SECONDS = float(os.environ.get("CLAIM_LEASE_SECONDS", "1800"))
+# Hosts the bus refuses to offer jobs to — typically because their workers
+# have a broken config (e.g. enc2 secret-key mismatch) and would fail any
+# claim immediately. User directive 2026-05-26: pegasus (.79) is flooding
+# the failed queue with 241/243 recent fails — denylist it until config-fix.
+# Format: lowercase short hostname. Updated via env or admin endpoint.
+HOST_DENYLIST: set[str] = {
+    h.strip().lower() for h in os.environ.get("HIVE_HOST_DENYLIST", "pegasus").split(",")
+    if h.strip()
+}
 
 
 def cost_tier_for(provider: str) -> str:
@@ -1014,7 +1023,7 @@ async def dashboard():
     p = "/srv/agent-bus/dashboard.html"
     try:
         with open(p) as f:
-            return HTMLResponse(f.read())
+            return HTMLResponse(f.read(), headers={"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"})
     except FileNotFoundError:
         return HTMLResponse(f"<h1>dashboard.html missing</h1><p>Expected at {p}</p>", status_code=404)
 
@@ -1489,6 +1498,21 @@ async def dequeue_next_job(agent_urn: str):
         agent_kind, caps_json, a_runtime, a_model, a_provider, a_tier, a_auth, a_cap, a_used, agent_status = row
         if agent_status not in ACTIVE_AGENT_STATUSES:
             raise HTTPException(409, f"claim failed: agent status is {agent_status!r}, not online/idle: {agent_urn}")
+        # Host denylist — refuse to offer jobs to known-broken hosts.
+        # Extracts host short-name from urn:agent:<kind>:<host>:<sid>.
+        try:
+            urn_parts = agent_urn.split(":")
+            urn_host = (urn_parts[3] if len(urn_parts) >= 4 else "").lower()
+        except Exception:
+            urn_host = ""
+        if urn_host in HOST_DENYLIST:
+            # Don't return 404 (worker would retry frantically) — return 204
+            # so the worker treats it as 'no work, idle wait' and stops flooding.
+            from fastapi.responses import Response as _DRsp
+            return _DRsp(status_code=204, headers={
+                "X-Hive-Claim-Result": "host_denylisted",
+                "X-Hive-Claim-Detail": f"host {urn_host} is in HIVE_HOST_DENYLIST",
+            })
         agent_caps = set(json.loads(caps_json)) if caps_json else set()
         eligible_aliases = agent_kind_aliases(agent_kind, a_runtime)
         a_tier = a_tier or "C"
