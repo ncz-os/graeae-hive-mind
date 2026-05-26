@@ -2332,7 +2332,11 @@ async def list_jobs(
         cnt_sql += " AND started_at >= ?"
         args.append(since)
         cnt_args.append(since)
-    sql += " ORDER BY priority DESC, started_at DESC LIMIT ?"
+    # For terminal statuses (done/failed/cancelled), sort by ended_at DESC so 'recent' actually means recently-finished.
+    if status in ("done", "failed", "cancelled"):
+        sql += " ORDER BY COALESCE(ended_at, started_at) DESC LIMIT ?"
+    else:
+        sql += " ORDER BY priority DESC, started_at DESC LIMIT ?"
     args.append(limit)
     rows = []
     total = 0
