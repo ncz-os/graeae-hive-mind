@@ -916,7 +916,7 @@ async function refreshHosts(){
     // RAM%
     r.appendChild(td(loadBar(h.ram_used_pct)));
     // disk free
-    r.appendChild(td(h.srv_free_gb!=null?h.srv_free_gb.toFixed(1)+'GB free':'-'));
+    var dfg=h.srv_free_gb; var dColor=dfg==null?"#8b949e":dfg<10?"#da3633":dfg<25?"#9e6a03":"#7ee787"; r.appendChild(td(dfg!=null?"<span style=\"color:"+dColor+"\">"+dfg.toFixed(1)+"GB free</span>":"-"));
     // caps (brief)
     const caps=(h.capabilities||[]).filter(c=>!['system','host'].includes(c)).slice(0,6);
     r.appendChild(td(caps.map(c=>`<span class="dim" style="font-size:.72em;border:1px solid #30363d;border-radius:3px;padding:.05em .25em">${esc(c)}</span>`).join(' ')));
