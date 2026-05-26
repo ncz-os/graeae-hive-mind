@@ -302,6 +302,7 @@ ORCHESTRATOR_RUNTIMES: set[str] = {
     "human",
     "mnemos",
     "doctor",   # PYTHIA triage authority — submits codex sub-jobs + auto-triage
+    "dream-walker",  # zeropi Dream Walker — dispatches hourly analysis jobs
     "unknown",
 }
 

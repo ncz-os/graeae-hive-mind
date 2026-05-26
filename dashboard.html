@@ -932,7 +932,12 @@ async function refreshHosts(){
         const free = v.free_gb || 0;
         const total = v.total_gb || 0;
         const barCls = used<70?'load-ok':used<90?'load-warn':'load-crit';
-        const dColor = free<5?'#da3633':free<10?'#9e6a03':'#7ee787';
+        // Smart color: small system partitions (/boot, /boot/efi, /efi) are 1-2GB
+        // total — never trigger "low free GB" alerts on them. Use percentage instead.
+        const isSysMount = /^\/boot(\/efi)?$|^\/efi$|^\/sys|^\/run/.test(v.mount||'');
+        const dColor = isSysMount
+          ? (used>90?'#da3633':used>75?'#9e6a03':'#7ee787')
+          : (free<5?'#da3633':free<10?'#9e6a03':'#7ee787');
         const mount = (v.mount||'').length > 18 ? '…'+v.mount.slice(-17) : (v.mount||'');
         return `<span title="${esc(v.mount)} — ${used.toFixed(0)}% used, ${free.toFixed(1)} GB free of ${total.toFixed(0)} GB" style="display:inline-block;border:1px solid #30363d;border-radius:3px;padding:.1em .35em;margin:.05em .15em .05em 0;background:#0d1117;white-space:nowrap"><span style="color:#a5d6ff">${esc(mount)}</span> <span style="color:${dColor}">${free.toFixed(1)}/${total.toFixed(0)}GB</span></span>`;
       }).join('');
