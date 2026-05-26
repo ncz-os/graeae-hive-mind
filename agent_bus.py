@@ -1286,6 +1286,7 @@ async def list_hosts(include_stale: bool = False):
                     # Multi-volume + cpu utilization (added 2026-05-26)
                     "volumes":        load.get("volumes") or [],
                     "cpu_used_pct":   load.get("cpu_used_pct"),
+                    "gpus_runtime":   load.get("gpus_runtime") or [],
                 }
     hosts = sorted(seen_hosts.values(), key=lambda x: x["host"])
     return {"count": len(hosts), "hosts": hosts}

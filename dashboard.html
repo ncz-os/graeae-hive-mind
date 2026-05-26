@@ -262,6 +262,14 @@ small.dim{font-size:.85em}
     </table>
   </div>
 
+  <div class="panel full-width" id="gpu-panel">
+    <h2>🎮 GPU Status <span class="cnt" id="gpu-cnt"></span></h2>
+    <table id="gpu-tbl">
+      <thead><tr><th>host</th><th>GPU</th><th>util%</th><th>VRAM</th><th>temp</th><th>power</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
   <div class="panel full-width" id="hosts-panel">
     <h2>🖥️ Fleet Hosts <span class="cnt" id="hosts-cnt"></span></h2>
     <table id="hosts-tbl">
@@ -886,6 +894,42 @@ function loadBar(pct){
   return `<span class="load-bar"><span class="load-bar-fill ${cls}" style="width:${Math.min(100,pct)}%"></span></span>${pct.toFixed(0)}%`;
 }
 
+async function refreshGPU(){
+  const d = await api('GET','/v1/hosts?include_stale=false').catch(()=>({hosts:[]}));
+  const hosts = d.hosts || [];
+  const rows = [];
+  for (const h of hosts) {
+    const gpus = h.gpus_runtime || [];
+    if (!gpus.length) continue;
+    for (const g of gpus) {
+      rows.push({host: h.host, gpu: g});
+    }
+  }
+  document.getElementById('gpu-cnt').textContent = `(${rows.length} GPU${rows.length===1?'':'s'} reporting)`;
+  const tb = document.querySelector('#gpu-tbl tbody'); tb.innerHTML = '';
+  for (const r of rows) {
+    const tr = tb.insertRow();
+    const g = r.gpu;
+    const util = g.util_pct;
+    const utilCls = util==null?'load-ok':util<70?'load-ok':util<90?'load-warn':'load-crit';
+    const utilCell = `<span class="load-bar" style="width:60px"><span class="load-bar-fill ${utilCls}" style="width:${util||0}%"></span></span> ${util==null?'-':util.toFixed(0)+'%'}`;
+    const mu = g.mem_used_mib, mt = g.mem_total_mib;
+    const memPct = (mu!=null && mt && mt>0) ? (100*mu/mt) : null;
+    const memCls = memPct==null?'load-ok':memPct<70?'load-ok':memPct<90?'load-warn':'load-crit';
+    const memCell = (mu!=null && mt!=null) ? `<span class="load-bar" style="width:60px"><span class="load-bar-fill ${memCls}" style="width:${memPct||0}%"></span></span> ${(mu/1024).toFixed(1)}/${(mt/1024).toFixed(1)} GiB` : '-';
+    const temp = g.temp_c, tempColor = temp==null?'#8b949e':temp<70?'#7ee787':temp<85?'#9e6a03':'#da3633';
+    const tempCell = temp==null ? '-' : `<span style="color:${tempColor}">${temp.toFixed(0)}°C</span>`;
+    const power = g.power_w, powerCell = power==null||power===0 ? '-' : `${power.toFixed(0)}W`;
+    const vendorIcon = g.vendor==='nvidia'?'🟢':g.vendor==='amd'?'🔴':'⚪';
+    tr.appendChild(td(`<b>${esc(r.host)}</b>`));
+    tr.appendChild(td(`${vendorIcon} <small class="dim">${esc(g.name||g.vendor||'?')}</small>`));
+    tr.appendChild(td(utilCell));
+    tr.appendChild(td(memCell));
+    tr.appendChild(td(tempCell));
+    tr.appendChild(td(powerCell));
+  }
+}
+
 async function refreshHosts(){
   const d=await api('GET','/v1/hosts?include_stale=true').catch(()=>({hosts:[]}));
   const hosts=d.hosts||[];
@@ -966,7 +1010,7 @@ async function refreshAll(){
     await Promise.all([
       refreshRunning(),refreshAgents(),refreshJobs(),refreshResults(),
       refreshFailed(),refreshCosts(),refreshWorkers(),refreshSchedules(),
-      refreshHosts(),refreshDoctor(),
+      refreshHosts(),refreshDoctor(),refreshGPU(),
     ]);
   }catch(e){document.getElementById('meta-time').textContent='error: '+e;}
 }

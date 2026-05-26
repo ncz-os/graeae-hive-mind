@@ -370,6 +370,70 @@ def dynamic_load() -> dict:
                 out["uptime_sec"] = float(f.read().split()[0])
         except Exception:
             pass
+    # Runtime GPU metrics (added 2026-05-26 for dashboard GPU status panel).
+    # nvidia-smi → name, util%, mem MiB, temp C; same shape for rocm-smi (AMD).
+    try:
+        gpus_rt = []
+        if shutil.which("nvidia-smi"):
+            try:
+                r = subprocess.run(
+                    ["nvidia-smi", "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw",
+                     "--format=csv,noheader,nounits"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                for line in r.stdout.strip().splitlines():
+                    parts = [p.strip() for p in line.split(",")]
+                    if len(parts) >= 5:
+                        try:
+                            gpus_rt.append({
+                                "vendor": "nvidia",
+                                "name": parts[0],
+                                "util_pct": float(parts[1]) if parts[1] else None,
+                                "mem_used_mib": int(parts[2]) if parts[2] else None,
+                                "mem_total_mib": int(parts[3]) if parts[3] else None,
+                                "temp_c": float(parts[4]) if parts[4] else None,
+                                "power_w": float(parts[5]) if len(parts) > 5 and parts[5] not in ("", "[Not Supported]") else None,
+                            })
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+        if shutil.which("rocm-smi"):
+            try:
+                r = subprocess.run(["rocm-smi", "--showproductname", "--showuse", "--showmemuse",
+                                    "--showtemp", "--showpower", "--json"],
+                                   capture_output=True, text=True, timeout=5)
+                data = json.loads(r.stdout) if r.stdout.strip() else {}
+                for k, v in data.items():
+                    if not isinstance(v, dict): continue
+                    name = v.get("Card SKU") or v.get("Card series") or v.get("Card model") or k
+                    try:
+                        util = float((v.get("GPU use (%)") or "0").replace("%",""))
+                    except: util = None
+                    try:
+                        mem_used = int(float(v.get("VRAM Total Used Memory (B)") or 0) / (1024*1024))
+                    except: mem_used = None
+                    try:
+                        mem_total = int(float(v.get("VRAM Total Memory (B)") or 0) / (1024*1024))
+                    except: mem_total = None
+                    temp = None
+                    for tk in v:
+                        if "temperature" in tk.lower() and "edge" in tk.lower():
+                            try: temp = float(v[tk]); break
+                            except: pass
+                    try:
+                        power = float((v.get("Average Graphics Package Power (W)") or "").replace("W","").strip() or 0)
+                    except: power = None
+                    gpus_rt.append({
+                        "vendor": "amd", "name": name, "util_pct": util,
+                        "mem_used_mib": mem_used, "mem_total_mib": mem_total,
+                        "temp_c": temp, "power_w": power,
+                    })
+            except Exception:
+                pass
+        out["gpus_runtime"] = gpus_rt
+    except Exception:
+        pass
     return out
 
 
