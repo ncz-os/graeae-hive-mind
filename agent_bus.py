@@ -1608,6 +1608,7 @@ async def dequeue_next_job(agent_urn: str):
                     return {
                         "id": job_id, "kind": j_kind, "description": j_desc,
                         "priority": j_prio, "deadline": j_dead,
+                        "max_cost_tier": j_max_tier,
                         "submitter_urn": j_sub, "parent_job_id": j_par,
                         "claimed_at": now, "queued_at": j_started,
                         "mnemos_refs": json.loads(j_mnemos_refs) if j_mnemos_refs else [],
