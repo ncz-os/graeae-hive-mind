@@ -313,8 +313,9 @@ KIND_HOST_AFFINITY: dict[str, list[str]] = {
     # Argonaut DBPR work requires the florida-licenses workspace. Route to
     # a verified zeroclaw host with the Argonaut workspace map installed.
     "argonaut:":      ["TYPHON"],
-    # RiskyBiz uses florida-licenses raw data and parquet staging on PROTEUS.
-    "riskybiz:":      ["PROTEUS"],
+    # RiskyBiz uses the florida-licenses workspace map; route only to
+    # zeroclaw hosts that advertise workspace-riskybiz and have that map installed.
+    "riskybiz:":      ["PYTHIA", "TYPHON"],
     # Hardware-bound: needs physical CIX Sky1 NPU — zeroclaw cannot substitute with SSH
     "cixmini-os:":    ["cixmini"],
     "ncz-os:":        ["cixmini"],
