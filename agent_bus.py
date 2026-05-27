@@ -270,6 +270,7 @@ RUNTIME_KIND_MAP: dict[str, set[str]] = {
     "claude":        {"claude"},
     "system":        {"system"},                    # fleet hosts (ARGOS/TYPHON/HYDRA/MEDUSA/CERBERUS/PROTEUS/cixmini)
     "doctor":        {"doctor"},  # PYTHIA zeroclaw doctor — triage authority + DB access
+    "dream-walker":  {"dream-walker"},
     "unknown":       {"unknown"},
 }
 AUTONOMY_LEVELS = {"autonomous", "confirm-risky", "interactive", "unknown"}
@@ -1443,6 +1444,8 @@ async def create_job(req: JobCreate):
     kind_affinity = kind_affinity_for_kind(req.kind)
     if kind_affinity:
         req = req.model_copy(update={"eligible_kinds": kind_affinity})
+        if req.kind.startswith("dream-walker:"):
+            max_cost_tier = "C"
     workspace_capability = workspace_capability_for_kind(req.kind)
     if workspace_capability:
         required = list(req.required_capabilities or [])
@@ -2282,6 +2285,13 @@ async def claim_job(job_id: str, by: str):
             raise HTTPException(
                 409,
                 f"job is in retry backoff until {j_retry_backoff_until} (now={now})",
+            )
+
+        kind_affinity = kind_affinity_for_kind(j_kind)
+        if kind_affinity and not set(kind_affinity).intersection(eligible_aliases):
+            raise HTTPException(
+                403,
+                f"agent kind aliases={sorted(eligible_aliases)!r} do not satisfy kind affinity={kind_affinity!r}",
             )
 
         # DAG gate: all depends_on must be status='done'
