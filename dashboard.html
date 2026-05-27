@@ -591,9 +591,10 @@ async function refreshAgents(){
   const rows=[...groups.values()].sort((a,b)=>(a.kind+a.host).localeCompare(b.kind+b.host));
   document.getElementById('agent-count').textContent=`${rows.length} pools · ${d.count} instances`;
   const tb=document.querySelector('#agent-tbl tbody');tb.innerHTML='';
+  const AKC={claude:'#ffa657',zeroclaw:'#79c0ff',openclaw:'#d2a8ff',opencode:'#7ee787',codex:'#e3b341',doctor:'#f85149','dream-walker':'#ff7bd5',system:'#8b949e',human:'#c9d1d9',hermes:'#56d4dd'};
   for(const a of rows){
     const r=tb.insertRow();
-    const kindCell=esc(a.kind)+(a.count>1?` <small class="dim">×${a.count}</small>`:'');
+    const _kc=AKC[a.kind]||'#8b949e';const kindCell=`<span style="color:${_kc}">●</span> <b style="color:${_kc}">${esc(a.kind)}</b>`+(a.count>1?` <small class="dim">×${a.count}</small>`:'');
     r.appendChild(td(kindCell));
     r.appendChild(td(esc(a.host)));
     r.appendChild(td(`<small class="dim">${esc(a.model||'')}</small>`));
