@@ -313,9 +313,6 @@ KIND_HOST_AFFINITY: dict[str, list[str]] = {
     # Argonaut DBPR work requires the florida-licenses workspace. Route to
     # a verified zeroclaw host with the Argonaut workspace map installed.
     "argonaut:":      ["TYPHON"],
-    # RiskyBiz uses the florida-licenses workspace map; route only to
-    # zeroclaw hosts that advertise workspace-riskybiz and have that map installed.
-    "riskybiz:":      ["PYTHIA", "TYPHON"],
     # Hardware-bound: needs physical CIX Sky1 NPU — zeroclaw cannot substitute with SSH
     "cixmini-os:":    ["cixmini"],
     "ncz-os:":        ["cixmini"],
@@ -324,6 +321,19 @@ KIND_HOST_AFFINITY: dict[str, list[str]] = {
     "arm64-test:":    ["bigpi", "clawpi", "zeropi", "cixmini"],
     # Note: investorclaw/investorclaude are NOT here — any zeroclaw can execute
     # those by SSHing to the appropriate host. Host affinity would over-restrict.
+}
+
+# WORKSPACE AFFINITY — automatic required_capabilities injection + claim guard.
+# Workspace-scoped jobs must only be offered to workers that explicitly
+# advertise the matching workspace capability. This protects both newly
+# submitted jobs and older queued rows that were created before the mapping.
+KIND_WORKSPACE_CAPABILITY: dict[str, str] = {
+    "test:provider-bench-1-readme-fix-deepseek-pro": "workspace-riskybiz",
+    "test:provider-bench-2-typo-deepseek-pro": "workspace-riskybiz",
+    "test:provider-bench-": "workspace-riskybiz",
+    "triage:test:provider-bench-": "workspace-riskybiz",
+    "riskybiz:p2-per-page-last-updated-and-sitemap": "workspace-riskybiz",
+    "riskybiz:": "workspace-riskybiz",
 }
 
 # COST-TIER MAP (per ~/.claude/rules/llm-usage-policy-2026-05-22.md):
@@ -421,6 +431,13 @@ def agent_kind_aliases(kind: str, runtime: Optional[str]) -> set[str]:
             aliases.update(kinds)
     aliases.discard("")
     return aliases
+
+
+def workspace_capability_for_kind(kind: str) -> Optional[str]:
+    for prefix, capability in KIND_WORKSPACE_CAPABILITY.items():
+        if kind.startswith(prefix):
+            return capability
+    return None
 
 
 def field_was_set(model: BaseModel, name: str) -> bool:
@@ -1409,6 +1426,12 @@ async def create_job(req: JobCreate):
             if req.kind.startswith(prefix):
                 req = req.model_copy(update={"eligible_hosts": hosts})
                 break
+    workspace_capability = workspace_capability_for_kind(req.kind)
+    if workspace_capability:
+        required = list(req.required_capabilities or [])
+        if "*" not in required and workspace_capability not in required:
+            required.append(workspace_capability)
+            req = req.model_copy(update={"required_capabilities": required})
     # ROLE ENFORCEMENT: check submitter runtime BEFORE the cache lookup so
     # worker-only runtimes get a 403 consistently for both cache hits and
     # cache misses. Unregistered submitter_urn values are rejected too; the
@@ -1592,6 +1615,13 @@ async def dequeue_next_job(agent_urn: str):
                         need = set(json_list(j_caps_json))
                         if not need.issubset(agent_caps):
                             continue
+                    workspace_capability = workspace_capability_for_kind(j_kind)
+                    if (
+                        workspace_capability
+                        and "*" not in agent_caps
+                        and workspace_capability not in agent_caps
+                    ):
+                        continue
                     # filter: cost-tier cap (token-miser default: A=free only)
                     job_max_tier = (j_max_tier or "B").upper()
                     if job_max_tier not in COST_TIERS:
@@ -2268,6 +2298,17 @@ async def claim_job(job_id: str, by: str):
                     403,
                     f"agent missing required_capabilities: {missing}",
                 )
+
+        workspace_capability = workspace_capability_for_kind(j_kind)
+        if (
+            workspace_capability
+            and "*" not in agent_caps
+            and workspace_capability not in agent_caps
+        ):
+            raise HTTPException(
+                403,
+                f"agent missing workspace capability for {j_kind!r}: {workspace_capability!r}",
+            )
 
         # cost-tier ceiling
         job_max_tier = (j_max_tier or "B").upper()
