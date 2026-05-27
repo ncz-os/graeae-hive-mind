@@ -310,6 +310,9 @@ ORCHESTRATOR_RUNTIMES: set[str] = {
 # When a job kind matches a prefix, the server adds eligible_hosts if not already set.
 # This ensures e.g. cixmini-os: jobs only run on cixmini hardware without callers needing to specify.
 KIND_HOST_AFFINITY: dict[str, list[str]] = {
+    # Argonaut DBPR work requires the florida-licenses workspace. Route to
+    # a verified zeroclaw host with the Argonaut workspace map installed.
+    "argonaut:":      ["TYPHON"],
     # Hardware-bound: needs physical CIX Sky1 NPU — zeroclaw cannot substitute with SSH
     "cixmini-os:":    ["cixmini"],
     "ncz-os:":        ["cixmini"],
