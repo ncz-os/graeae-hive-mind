@@ -327,6 +327,13 @@ KIND_HOST_AFFINITY: dict[str, list[str]] = {
 # Workspace-scoped jobs must only be offered to workers that explicitly
 # advertise the matching workspace capability. This protects both newly
 # submitted jobs and older queued rows that were created before the mapping.
+KIND_KIND_AFFINITY: dict[str, list[str]] = {
+    # Dream-walker analytics jobs are handled by the zeropi dream-walker
+    # runtime. They do not need a git workspace and must not be claimed by
+    # generic code workers that fail preflight with no_workspace_for_kind.
+    "dream-walker:": ["dream-walker"],
+}
+
 KIND_WORKSPACE_CAPABILITY: dict[str, str] = {
     "test:provider-bench-1-readme-fix-deepseek-pro": "workspace-riskybiz",
     "test:provider-bench-2-typo-deepseek-pro": "workspace-riskybiz",
@@ -437,6 +444,13 @@ def workspace_capability_for_kind(kind: str) -> Optional[str]:
     for prefix, capability in KIND_WORKSPACE_CAPABILITY.items():
         if kind.startswith(prefix):
             return capability
+    return None
+
+
+def kind_affinity_for_kind(kind: str) -> Optional[list[str]]:
+    for prefix, kinds in KIND_KIND_AFFINITY.items():
+        if kind.startswith(prefix):
+            return kinds
     return None
 
 
@@ -1426,6 +1440,9 @@ async def create_job(req: JobCreate):
             if req.kind.startswith(prefix):
                 req = req.model_copy(update={"eligible_hosts": hosts})
                 break
+    kind_affinity = kind_affinity_for_kind(req.kind)
+    if kind_affinity:
+        req = req.model_copy(update={"eligible_kinds": kind_affinity})
     workspace_capability = workspace_capability_for_kind(req.kind)
     if workspace_capability:
         required = list(req.required_capabilities or [])
@@ -1600,6 +1617,10 @@ async def dequeue_next_job(agent_urn: str):
                                 done_count = (await dc.fetchone())[0]
                             if done_count < len(deps):
                                 continue  # parent not yet done; skip
+                    # filter: kind affinity guard
+                    kind_affinity = kind_affinity_for_kind(j_kind)
+                    if kind_affinity and not set(kind_affinity).intersection(eligible_aliases):
+                        continue
                     # filter: eligible_kinds
                     if j_kinds_json:
                         kinds = set(json_list(j_kinds_json))
