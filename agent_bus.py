@@ -148,13 +148,13 @@ def _rewrite_sqlite_time_funcs(sql: str) -> str:
 def _translate_upsert(sql: str) -> Optional[str]:
     normalized = " ".join(sql.split())
     cache_pattern = (
-        r"INSERT INTO memory_hive_cache \(cache_key, result_json, source_job_id, result_mnemos_id, "
+        r"INSERT INTO hive_cache \(cache_key, result_json, source_job_id, result_mnemos_id, "
         r"hit_count, cost_saved_usd, model, provider, cached_at, last_hit_at\) VALUES "
         r"\(:1, :2, :3, :4, 0, 0, :5, :6, :7, NULL\) ON CONFLICT\(cache_key\) DO UPDATE SET"
     )
     if re.search(cache_pattern, normalized, flags=re.IGNORECASE):
         return (
-            "MERGE INTO memory_hive_cache t "
+            "MERGE INTO hive_cache t "
             "USING (SELECT :1 cache_key, :2 result_json, :3 source_job_id, :4 result_mnemos_id, "
             ":5 model, :6 provider, :7 cached_at FROM dual) s "
             "ON (t.cache_key = s.cache_key) "
@@ -167,7 +167,7 @@ def _translate_upsert(sql: str) -> Optional[str]:
             "VALUES (s.cache_key, s.result_json, s.source_job_id, s.result_mnemos_id, 0, 0, s.model, s.provider, s.cached_at, NULL)"
         )
     stats_match = re.search(
-        r"INSERT INTO memory_worker_kind_stats \(urn, kind, (success_count|fail_count|cancelled_count), "
+        r"INSERT INTO hive_worker_kind_stats \(urn, kind, (success_count|fail_count|cancelled_count), "
         r"total_tokens_in, total_tokens_out, total_cost_usd, total_duration_sec, last_run\) "
         r"VALUES \(:1, :2, 1, :3, :4, :5, :6, :7\) ON CONFLICT\(urn, kind\) DO UPDATE SET",
         normalized,
@@ -176,7 +176,7 @@ def _translate_upsert(sql: str) -> Optional[str]:
     if stats_match:
         col = stats_match.group(1)
         return (
-            "MERGE INTO memory_worker_kind_stats t "
+            "MERGE INTO hive_worker_kind_stats t "
             "USING (SELECT :1 urn, :2 kind, :3 ins_tokens_in, :4 ins_tokens_out, :5 ins_cost, "
             ":6 ins_duration, :7 ins_last_run, :8 upd_tokens_in, :9 upd_tokens_out, "
             ":10 upd_cost, :11 upd_duration, :12 upd_last_run FROM dual) s "
@@ -2058,7 +2058,11 @@ async def dequeue_next_job(agent_urn: str):
                         if models and a_model not in models:
                             continue
                     # match — claim + record dispatch resources
-                    await db.execute(
+                    # P0-1 fix (2026-05-28): capture cursor + check rowcount.
+                    # Oracle adapter drops BEGIN IMMEDIATE so concurrent claimers can
+                    # both pass the queue filter; the UPDATE WHERE status='queued' is
+                    # the race-guard. rowcount==0 means another claimer beat us → skip.
+                    claim_cur = await db.execute(
                         "UPDATE jobs SET status='claimed', claimed_by=?, claimed_at=?, "
                         "claimed_runtime=?, claimed_model=?, claimed_provider=?, claimed_cost_tier=?, "
                         "claim_lease_expires_at=? "
@@ -2066,6 +2070,9 @@ async def dequeue_next_job(agent_urn: str):
                         (agent_urn, now, a_runtime, a_model, a_provider, a_tier,
                          now + CLAIM_LEASE_SECONDS, job_id),
                     )
+                    if (getattr(claim_cur, "rowcount", 0) or 0) < 1:
+                        # Lost race to another claimer. Continue to next candidate.
+                        continue
                     await db.execute("COMMIT")
                     committed = True
                     await emit_event(db, "job.claimed", {
