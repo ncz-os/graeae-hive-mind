@@ -508,7 +508,8 @@ CREATE TABLE IF NOT EXISTS agents (
   current_load TEXT,
   auth_method TEXT,
   plan_cap_usd REAL,
-  plan_period_used_usd REAL DEFAULT 0
+  plan_period_used_usd REAL DEFAULT 0,
+  subscription_pools TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_agents_status      ON agents(status);
 CREATE INDEX IF NOT EXISTS idx_agents_kind        ON agents(kind);
@@ -1081,6 +1082,7 @@ class AgentRegister(BaseModel):
     capabilities: Optional[list[str]] = None
     version: Optional[str] = None
     metadata: Optional[dict] = None
+    subscription_pools: Optional[list[str]] = Field(default_factory=list)
 
 
 class AgentHeartbeat(BaseModel):
@@ -1333,6 +1335,7 @@ async def lifespan(app: FastAPI):
                 "version", "started_at", "last_heartbeat", "status", "metadata",
                 "runtime", "model", "provider", "autonomy_level", "cost_tier",
                 "current_load", "auth_method", "plan_cap_usd", "plan_period_used_usd",
+                "subscription_pools",
             )
             col_list = ", ".join(cols)
             await conn.execute("ALTER TABLE agents RENAME TO agents__pre_stale_migration")
@@ -1357,7 +1360,8 @@ async def lifespan(app: FastAPI):
                 "current_load TEXT, "
                 "auth_method TEXT, "
                 "plan_cap_usd REAL, "
-                "plan_period_used_usd REAL DEFAULT 0)"
+                "plan_period_used_usd REAL DEFAULT 0, "
+                "subscription_pools TEXT)"
             )
             await conn.execute(
                 f"INSERT INTO agents ({col_list}) SELECT {col_list} FROM agents__pre_stale_migration"
@@ -1375,6 +1379,7 @@ async def lifespan(app: FastAPI):
             ("agents", "auth_method", "auth_method TEXT"),
             ("agents", "plan_cap_usd", "plan_cap_usd REAL"),
             ("agents", "plan_period_used_usd", "plan_period_used_usd REAL DEFAULT 0"),
+            ("agents", "subscription_pools", "subscription_pools TEXT"),
             # jobs — project tag + v0.2 cost/autonomy/retry columns
             ("jobs", "project", "project TEXT"),
             ("jobs", "eligible_hosts", "eligible_hosts TEXT"),
@@ -1526,12 +1531,13 @@ async def register(req: AgentRegister):
     async with connect_db() as db:
         await db.execute(
             "INSERT INTO agents (urn, kind, runtime, model, provider, cost_tier, autonomy_level, "
-            "auth_method, plan_cap_usd, plan_period_used_usd, "
+            "auth_method, plan_cap_usd, plan_period_used_usd, subscription_pools, "
             "host, session_id, pid, capabilities, version, started_at, last_heartbeat, status, metadata) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, 'online', ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, 'online', ?)",
             (
                 urn, kind, runtime, model, provider, tier, autonomy,
                 auth_method, plan_cap_usd,
+                json.dumps(req.subscription_pools or []),
                 req.host, session_id, req.pid,
                 json.dumps(req.capabilities) if req.capabilities else None,
                 req.version, now, now,
@@ -1543,12 +1549,14 @@ async def register(req: AgentRegister):
             "urn": urn, "kind": kind, "runtime": runtime,
             "model": model, "provider": provider, "cost_tier": tier,
             "host": req.host, "autonomy_level": autonomy,
+            "subscription_pools": req.subscription_pools or [],
         })
     return {
         "urn": urn, "session_id": session_id, "registered_at": now,
         "kind": kind, "runtime": runtime, "model": model,
         "provider": provider, "cost_tier": tier, "autonomy_level": autonomy,
         "auth_method": auth_method, "plan_cap_usd": plan_cap_usd,
+        "subscription_pools": req.subscription_pools or [],
     }
 
 
@@ -1673,7 +1681,7 @@ async def list_hosts(include_stale: bool = False):
     Used by workers to make resource-aware routing decisions.
     """
     cutoff = time.time() - 60  # 60s stale threshold
-    sql = ("SELECT urn, host, status, last_heartbeat, capabilities, metadata "
+    sql = ("SELECT urn, host, status, last_heartbeat, capabilities, metadata, subscription_pools "
            "FROM agents WHERE kind='system'")
     if not include_stale:
         sql += " AND last_heartbeat >= ?"
@@ -1700,6 +1708,7 @@ async def list_hosts(include_stale: bool = False):
                     "age_s":          round(age_s, 1),
                     "stale":          age_s > 60,
                     "capabilities":   json.loads(r[4]) if r[4] else [],
+                    "subscription_pools": json.loads(r[6]) if len(r) > 6 and r[6] else [],
                     # static specs (from registration)
                     "cpu_model":      specs.get("cpu_model"),
                     "cpu_threads":    specs.get("cpu_threads") or specs.get("cpu_count"),
