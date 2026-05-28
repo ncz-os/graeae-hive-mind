@@ -744,15 +744,16 @@ KIND_WORKSPACE_CAPABILITY: dict[str, str] = {
 #   C = RESERVE — Anthropic Opus/Sonnet, OpenAI GPT-5.5/Pro, Gemini Pro, Together DeepSeek-Pro
 #                 (Together DeepSeek-V4-Pro = anti-pattern — use DeepSeek direct instead)
 PROVIDER_COST_TIER: dict[str, str] = {
-    # Tier A = PREMIUM (highest quality, expensive) - operator authorizes top budget
-    "anthropic":       "A",
-    "claude":          "A",
-    "openai":          "A",
-    "openai-pro":      "A",
-    "openai-gpt55":    "A",
-    "gemini":          "A",
-    "gemini-pro":      "A",
-    "together-pro":    "A",
+    # Tier A = FREE / local / on-prem NGC (claim-anything; no spend)
+    "ngc":             "A",
+    "nvidia":          "A",
+    "nvidia-ngc":      "A",
+    "local-llamacpp":  "A",
+    "local-vllm":      "A",
+    "ollama":          "A",
+    "ollama-cerberus": "A",
+    "local":           "A",
+    "pantheon":        "A",
 
     # Tier B = MID (cheap paid commercial)
     "groq":            "B",
@@ -764,21 +765,20 @@ PROVIDER_COST_TIER: dict[str, str] = {
     "openai-mini":     "B",
     "perplexity":      "B",
 
-    # Tier C = ROUTINE (local / free NGC / Nvidia inference)
-    "ngc":             "C",
-    "nvidia":          "C",
-    "nvidia-ngc":      "C",
-    "local-llamacpp":  "C",
-    "local-vllm":      "C",
-    "ollama":          "C",
-    "ollama-cerberus": "C",
-    "local":           "C",
-    "pantheon":        "C",  # fleet PANTHEON router routes to free/cheap providers
+    # Tier C = PREMIUM (expensive, reserve)
+    "anthropic":       "C",
+    "claude":          "C",
+    "openai":          "C",
+    "openai-pro":      "C",
+    "openai-gpt55":    "C",
+    "gemini":          "C",
+    "gemini-pro":      "C",
+    "together-pro":    "C",
 
-    "unknown":         "C",  # treat as routine when classification missing
+    "unknown":         "A",
 }
 COST_TIERS = ["A", "B", "C"]
-VALID_JOB_STATUSES = {"queued", "offered", "claimed", "running", "done", "failed", "cancelled"}
+VALID_JOB_STATUSES = {"queued", "offered", "claimed", "running", "done", "failed", "failed_completion", "cancelled"}
 TERMINAL_JOB_STATUSES = {"done", "failed", "cancelled"}
 STATUS_TRANSITIONS: dict[str, set[str]] = {
     "queued": {"queued", "offered", "claimed", "cancelled"},
@@ -1523,7 +1523,7 @@ async def register(req: AgentRegister):
     # tiers (A/B/C) regardless of provider. They are flexible multi-provider
     # agentic CLIs and the tier-ceiling is a routing aid, not a real cost gate
     # for them.
-    if kind in {"opencode", "codex", "doctor"}:
+    if kind in {"opencode", "codex", "doctor", "zeroclaw"}:
         tier = "A"
     session_id = str(uuid.uuid4())
     urn = make_urn(kind, req.host, session_id)
