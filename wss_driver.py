@@ -26,7 +26,7 @@ log = logging.getLogger("wss_driver")
 
 # Per-host gateway tokens. Loaded lazily from /home/jasonperlow/.zeroclaw/gateway-tokens.json
 # Format: {"PYTHIA": "zc_xxx", "TYPHON": "zc_yyy", ...}
-TOKENS_FILE = Path("/home/jasonperlow/.zeroclaw/gateway-tokens.json")
+TOKENS_FILE = Path(os.path.expanduser("~/.zeroclaw/gateway-tokens.json"))
 HOST_PORT = 42617
 SESSION_TIMEOUT_SEC = 600
 AUTO_APPROVE_TOOLS = {"shell", "edit", "read", "list_files", "git", "write", "apply_patch"}
