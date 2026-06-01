@@ -122,11 +122,17 @@ TIER_CHAINS = {
 # fleet-side they fall back to codex (hive_groq_1 -> openai.codex); the
 # classification is correct now and real savings activate as cheap providers
 # and the Spark come online.
+# NOTE 2026-06-01: open-weight provider keys are BROKEN fleet-side (deepseek/
+# groq/nvidia/etc fall back to gpt-4o, rate-limited). Until they are re-keyed,
+# every registry LEADS with codex (hive_groq_1 -> openai.codex, gpt-5.3-codex
+# OAuth $0) so jobs run on the one working high-quality model instead of
+# falling to gpt-4o. The cheap aliases stay as later escalation slots and will
+# activate (real cost savings) once their keys are validated.
 MODEL_REGISTRIES = {
-    "cheapo": ["hive_deepseek_2", "hive_groq_2", "hive_nvidia_2", "hive_groq_1"],
-    "medium": ["hive_deepseek_2", "hive_nvidia_2", "hive_groq_3", "hive_groq_1"],
+    "cheapo": ["hive_groq_1", "hive_deepseek_2", "hive_groq_2", "hive_nvidia_2"],
+    "medium": ["hive_groq_1", "hive_deepseek_2", "hive_nvidia_2", "hive_groq_3"],
     "pro":    ["hive_groq_1", "hive_deepseek_pro_1"],
-    "nvidia": ["hive_nvidia_2", "hive_nvidia_3", "hive_nvidia_4", "hive_groq_1"],
+    "nvidia": ["hive_groq_1", "hive_nvidia_2", "hive_nvidia_3", "hive_nvidia_4"],
 }
 # Task-type -> registry (the doctor's classification dictionary). Longest-prefix
 # match wins. Complex code/reasoning -> pro; standard code/ops -> medium;
@@ -602,9 +608,17 @@ def process_job(urn, job):
         rr = _git(Path(workspace), "remote", "get-url", "origin", timeout=10)
         has_remote = (rr.returncode == 0 and bool(rr.stdout.strip()))
     if commits and has_remote:
-        pr = _git(Path(workspace), "push", "origin", "HEAD", timeout=180)
+        # Push to a UNIQUE per-job branch, never the shared/protected default —
+        # pushing HEAD to a shared branch fails non-fast-forward when the remote
+        # moved (observed 2026-06-01 on feat/knemon-mvp). A fresh hive/<jobid>
+        # branch is always conflict-free, so the commit is provably landed and
+        # reviewable/mergeable later.
+        branch = "hive/" + re.sub(r"[^0-9a-zA-Z_-]", "", jid)[:24]
+        _git(Path(workspace), "branch", "-f", branch, "HEAD", timeout=10)
+        pr = _git(Path(workspace), "push", "-u", "origin", branch, timeout=180)
         pushed = (pr.returncode == 0)
         result["pushed"] = pushed
+        result["pushed_branch"] = branch
         if not pushed:
             result["worker_error"] = "push_failed:" + pr.stderr.strip()[:200]
     requires_commit = has_remote and not kind.startswith("review:")  # review jobs emit a report, not a commit
