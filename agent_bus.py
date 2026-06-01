@@ -707,7 +707,7 @@ ORCHESTRATOR_RUNTIMES: set[str] = {
 KIND_HOST_AFFINITY: dict[str, list[str]] = {
     # Argonaut DBPR work requires the florida-licenses workspace. Route to
     # a verified zeroclaw host with the Argonaut workspace map installed.
-    "argonaut:":      ["TYPHON"],
+    "argonaut:":      ["ULTRA", "HYDRA"],  # TYPHON offline 2026-06-01; retargeted to live zeroclaw hosts w/ florida-licenses workspace
     # Hardware-bound: needs physical CIX Sky1 NPU — zeroclaw cannot substitute with SSH
     "cixmini-os:":    ["cixmini"],
     "ncz-os:":        ["cixmini"],
