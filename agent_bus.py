@@ -785,7 +785,7 @@ STATUS_TRANSITIONS: dict[str, set[str]] = {
     "offered": {"queued", "claimed", "cancelled"},
     "claimed": {"queued", "claimed", "running", "done", "failed", "cancelled"},
     "running": {"queued", "running", "done", "failed", "cancelled"},
-    "done": {"done"},
+    "done": {"done", "cancelled"},  # allow cancelling fake/duplicate completions out of done
     "failed": {"failed"},
     "cancelled": {"cancelled"},
 }
@@ -831,6 +831,14 @@ def agent_kind_aliases(kind: str, runtime: Optional[str]) -> set[str]:
         if kind in kinds:
             aliases.add(rt)
             aliases.update(kinds)
+    # Eligibility hierarchy (operator 2026-06-01): claude-eligible is
+    # codex-eligible is zeroclaw-claimable. doctor/codex/review and claude
+    # jobs all run through the same WSS gateway agent now, so a zeroclaw
+    # worker can claim codex + claude work, and a codex worker claude work.
+    if "zeroclaw" in aliases:
+        aliases.update({"codex", "claude"})
+    if "codex" in aliases:
+        aliases.add("claude")
     aliases.discard("")
     return aliases
 
@@ -2181,7 +2189,8 @@ async def update_job(job_id: str, req: JobUpdate):
                     f"invalid status transition {old_status!r} -> {req.status!r}",
                 )
 
-            if old_status in TERMINAL_JOB_STATUSES and req.status != old_status:
+            if (old_status in TERMINAL_JOB_STATUSES and req.status != old_status
+                    and not (old_status == "done" and req.status == "cancelled")):  # allow cancelling fake/dup completions
                 await db.execute("ROLLBACK")
                 raise HTTPException(409, f"terminal job status {old_status!r} cannot be reopened by PATCH")
 
