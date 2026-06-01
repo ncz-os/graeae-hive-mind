@@ -376,7 +376,11 @@ def process_job(urn, job):
                 result.setdefault("error", "fake_prevented:exit0_but_zero_verified_commits")
             elif not pushed:
                 result.setdefault("error", "commit_made_but_push_failed")
-    elif result.get("exit_code") == 0 and not result.get("worker_error"):
+    elif result.get("exit_code") == 0 and result.get("worker_error") in (None, "", "no_code_output"):
+        # Non-repo job (no remote to commit to): a clean agent run is success
+        # even with no code output — analysis/answer/triage jobs legitimately
+        # produce text, not commits. Real failures (no_workspace_for_kind,
+        # driver_crash, push_failed, ...) still fall through to 'failed'.
         status = "done"
     else:
         status = "failed"
