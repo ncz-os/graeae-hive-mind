@@ -73,6 +73,14 @@ KIND_WORKSPACE_MAP = {
     "argonaut:dbpr-discovery-sweep-35-categories": ("florida-licenses", None),
     "argonaut:":        ("florida-licenses", None),
     "fix:codex-pro-oauth-verify": ("mnemos",         "https://gitlab.com/mnemos-os/mnemos.git"),
+    # knemon (router), oracle-backend, provider-model sync all live in the mnemos
+    # codebase — route feat:/fix: variants there so they run+commit instead of
+    # being cancelled for no workspace (operator 2026-06-01: high-value backlog).
+    "feat:knemon":      ("mnemos",         "https://gitlab.com/mnemos-os/mnemos.git"),
+    "fix:knemon":       ("mnemos",         "https://gitlab.com/mnemos-os/mnemos.git"),
+    "feat:oracle-backend": ("mnemos",      "https://gitlab.com/mnemos-os/mnemos.git"),
+    "fix:sync-provider-models": ("mnemos", "https://gitlab.com/mnemos-os/mnemos.git"),
+    "fix:knemon-cost":  ("mnemos",         "https://gitlab.com/mnemos-os/mnemos.git"),
     "mnemos:":          ("mnemos",         "https://gitlab.com/mnemos-os/mnemos.git"),
     "riskybiz:p1-sunbiz-entity-resolver": ("florida-licenses", None),
     "riskybiz:":        ("florida-licenses", None),
