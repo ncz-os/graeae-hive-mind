@@ -131,7 +131,7 @@ TIER_CHAINS = {
 MODEL_REGISTRIES = {
     "cheapo": ["hive_groq_1", "hive_deepseek_2", "hive_groq_2", "hive_nvidia_2"],
     "medium": ["hive_groq_1", "hive_deepseek_2", "hive_nvidia_2", "hive_groq_3"],
-    "pro":    ["hive_groq_1", "hive_deepseek_pro_1"],
+    "pro":    ["hive_groq_1", "hive_deepseek_2", "hive_deepseek_pro_1"],
     "nvidia": ["hive_groq_1", "hive_nvidia_2", "hive_nvidia_3", "hive_nvidia_4"],
 }
 # Task-type -> registry (the doctor's classification dictionary). Longest-prefix
@@ -580,17 +580,26 @@ def process_job(urn, job):
                 log.info("  → WSS alias=%s (%d/%d) workspace=%s",
                          alias, idx + 1, len(chain), workspace)
                 result = wss_run(desc, kind, workspace, alias, jid, JOB_TIMEOUT)
-                err = str(result.get("error") or result.get("worker_error") or "").lower()
-                retryable = any(s in err for s in (
-                    "timeout", "429", "rate", "throttle", "quota",
-                    "usage", "overload", "unavailable", "provider",
-                    "all model_providers", "max tool iterations",
-                    "no_code_output", "connection", "5xx", "500", "502", "503"))
-                if (result.get("exit_code") == 0 or result.get("commits")
-                        or not retryable or idx == len(chain) - 1):
+                # Detect throttle/failure from error+worker_error AND the agent's
+                # full_response — codex reports its OAuth action rate-limit
+                # ("Rate limit exceeded: too many actions") only in the response
+                # body with exit_code=0, which previously LOOKED like success and
+                # broke the chain instead of escalating to the next (working)
+                # model. Escalate when throttled/hard-failed AND no commit landed.
+                blob = (str(result.get("error") or "") + " "
+                        + str(result.get("worker_error") or "") + " "
+                        + str(result.get("full_response") or "")[:600]).lower()
+                throttled = any(s in blob for s in (
+                    "rate limit", "rate_limit", "too many actions", "429",
+                    "throttle", "quota", "overloaded", "overload"))
+                hard_fail = any(s in blob for s in (
+                    "timeout", "unavailable", "all model_providers", "driver_crash",
+                    "max tool iterations", "connection refused", "502", "503", "500"))
+                escalate = (throttled or hard_fail) and not result.get("commits")
+                if result.get("commits") or not escalate or idx == len(chain) - 1:
                     break
-                log.info("  alias %s retryable-fail (%s) — dispatching next LLM",
-                         alias, err[:60])
+                log.info("  alias %s throttled/failed (%s) — escalating to next model",
+                         alias, blob[:70])
             result["alias_tried"] = chain[:idx + 1]
     except Exception as e:
         log.exception("dispatch failed")
