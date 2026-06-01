@@ -27,6 +27,14 @@ sys.path.insert(0, str(Path(__file__).parent))
 import wss_driver  # noqa: E402
 
 HIVE_URL = os.environ.get("HIVE_URL", "http://192.168.207.67:5005")
+# MNEMOS — the commit-DAG store. The worker records every meaningful completed
+# job + its commits here so OTHER agents can cross-reference prior work and
+# link future work (GRAEAE-blessed arch 2026-06-01). On the Spark this is the
+# tunnelled fleet MNEMOS at localhost:5012; on fleet hosts it's PYTHIA:5002.
+MNEMOS_URL = os.environ.get("MNEMOS_URL", "http://192.168.207.67:5002")
+MNEMOS_TOKEN = os.environ.get(
+    "MNEMOS_TOKEN",
+    "d3a3bc609583005f4a077b6ffd00154b4f03f70104d0cdbfbb019fceb28daca9")
 AGENT_HOST = os.environ.get("AGENT_HOST") or socket.gethostname().split(".")[0]
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "30"))
 HEARTBEAT_INTERVAL = float(os.environ.get("HEARTBEAT_INTERVAL", "15"))
@@ -170,6 +178,83 @@ def patch_job(jid, urn, status, result=None):
     if code not in (200, 201, 204):
         log.warning("patch %s -> %s: %s", jid, code, str(resp)[:200])
     return code in (200, 201, 204)
+
+
+def _mnemos_http(method, path, body=None, timeout=15):
+    url = MNEMOS_URL + path
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(
+        url, data=data, method=method,
+        headers={"content-type": "application/json",
+                 "authorization": f"Bearer {MNEMOS_TOKEN}"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            txt = r.read()
+            return r.status, (json.loads(txt) if txt else {})
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read())
+        except Exception:
+            return e.code, {"error": str(e)}
+    except Exception as e:
+        return 0, {"error": str(e)}
+
+
+def _record_job_to_mnemos(job, result, status):
+    """Land a referenceable commit-DAG node in MNEMOS so other agents see this
+    work (prior) and new jobs can link their lineage (future). Per GRAEAE arch
+    2026-06-01: memory node ALWAYS (authoritative), KG triples BEST-EFFORT
+    (the /v1/kg/triples pool is intermittently unavailable — never block on it).
+    Records only meaningful outcomes: a real commit, or a 'done' deliverable.
+    Junk cancels are skipped to keep the graph clean."""
+    try:
+        commits = result.get("commits") or []
+        if status != "done" and not commits:
+            return
+        jid = job.get("id", "")
+        kind = job.get("kind", "") or ""
+        parent = job.get("parent_job_id") or ""
+        files = (result.get("files_changed") or [])[:25]
+        ws = result.get("workspace")
+        repo = Path(ws).name if ws else "no-repo"
+        alias = (result.get("alias_tried") or [result.get("gateway_model", "")])[-1]
+        summary = (result.get("full_response") or result.get("stdout_preview")
+                   or result.get("error") or "")[:700]
+        content = (
+            f"HIVE JOB {jid} [{kind}] -> {status} on {AGENT_HOST}\n"
+            f"repo={repo} alias={alias} commits={commits or 'none'}\n"
+            f"files={files}\n"
+            + (f"derives_from job {parent}\n" if parent else "")
+            + f"\n{summary}"
+        )
+        meta = {
+            "type": "project",
+            "tags": ["hive-job", "commit-dag", (kind.split(':', 1)[0] or "job"), repo],
+            "job_id": jid, "parent_job_id": parent, "kind": kind,
+            "status": status, "repo": repo, "host": AGENT_HOST,
+            "commits": commits, "files_changed": files,
+        }
+        code, resp = _mnemos_http("POST", "/v1/memories",
+                                  {"content": content, "metadata": meta}, timeout=12)
+        if code in (200, 201):
+            log.info("  recorded commit-DAG node %s -> mnemos %s",
+                     jid[:12], resp.get("id", ""))
+        else:
+            log.warning("  mnemos memory write %s: %s", code, str(resp)[:120])
+        # DAG edges — best-effort. Skip silently on pool-down / any error.
+        triples = [(f"job:{jid}", "has_kind", kind)]
+        for c in commits:
+            triples += [(f"job:{jid}", "produced", f"commit:{c}"),
+                        (f"commit:{c}", "in_repo", repo)]
+            for f in files:
+                triples.append((f"commit:{c}", "touches", f))
+        if parent:
+            triples.append((f"job:{jid}", "derives_from", f"job:{parent}"))
+        for s, p, o in triples:
+            _mnemos_http("POST", "/v1/kg/triples",
+                         {"subject": s, "predicate": p, "object": o}, timeout=6)
+    except Exception as e:
+        log.warning("  mnemos record skipped: %s", e)
 
 
 def pick_agent_alias(tier, kind):
@@ -484,6 +569,7 @@ def process_job(urn, job):
     else:
         status = "failed"
     patch_job(jid, urn, status, result)
+    _record_job_to_mnemos(job, result, status)  # commit-DAG node (best-effort)
     commits = result.get("commits") or []
     log.info("→ %s %s commits=%d dur=%.1fs %s",
              status, jid[:12], len(commits), result["duration_sec"],
