@@ -79,6 +79,17 @@ TIER_CHAINS = {
           "hive_together_1", "hive_nvidia_1"],
 }
 
+# Per-host provider lock. When HIVE_PROVIDER_LOCK is set (e.g. "nvidia" on the
+# NVIDIA Spark, which must use NGC keys only), every tier chain is restricted
+# to that provider's aliases — no fallback to other LLMs. Empty (default) keeps
+# the full cross-provider fallback above.
+_PROVIDER_LOCK = os.environ.get("HIVE_PROVIDER_LOCK", "").strip().lower()
+if _PROVIDER_LOCK:
+    TIER_CHAINS = {
+        _t: ([a for a in _chain if _PROVIDER_LOCK in a] or [f"hive_{_PROVIDER_LOCK}_1"])
+        for _t, _chain in TIER_CHAINS.items()
+    }
+
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [zc-wss-worker@%(process)d] %(message)s")
 log = logging.getLogger("wss-worker")
