@@ -128,11 +128,19 @@ TIER_CHAINS = {
 # OAuth $0) so jobs run on the one working high-quality model instead of
 # falling to gpt-4o. The cheap aliases stay as later escalation slots and will
 # activate (real cost savings) once their keys are validated.
+# 2026-06-01: open-weight provider keys are BROKEN fleet-side. Escalating into
+# those aliases makes the gateway fall back to an EMBEDDING model (bge-small) or
+# return empty -> code jobs fail. Until the cheap providers are re-keyed, every
+# registry uses ONLY the two WORKING models: hive_groq_1 -> openai.codex
+# (gpt-5.3-codex OAuth $0) and hive_deepseek_2 -> openai.gpt5_2_pro (gpt-5-pro).
+# The cost-savings classification framework stays; the model list collapses to
+# what actually serves. Re-expand the cheap tiers once their keys validate.
+_WORKING = ["hive_groq_1", "hive_deepseek_2"]
 MODEL_REGISTRIES = {
-    "cheapo": ["hive_groq_1", "hive_deepseek_2", "hive_groq_2", "hive_nvidia_2"],
-    "medium": ["hive_groq_1", "hive_deepseek_2", "hive_nvidia_2", "hive_groq_3"],
-    "pro":    ["hive_groq_1", "hive_deepseek_2", "hive_deepseek_pro_1"],
-    "nvidia": ["hive_groq_1", "hive_nvidia_2", "hive_nvidia_3", "hive_nvidia_4"],
+    "cheapo": list(_WORKING),
+    "medium": list(_WORKING),
+    "pro":    list(_WORKING),
+    "nvidia": list(_WORKING),
 }
 # Task-type -> registry (the doctor's classification dictionary). Longest-prefix
 # match wins. Complex code/reasoning -> pro; standard code/ops -> medium;
