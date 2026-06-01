@@ -149,6 +149,20 @@ TASK_REGISTRY_MAP = {
 }
 
 
+# KEY HEALTH MONITOR (operator 2026-06-01): aliases whose provider HARD-fails
+# (bad key/endpoint/connection — not a transient throttle) get a cooldown so the
+# escalation chain skips them instead of wasting a dispatch on a known-dead
+# model. alias -> unix-ts the cooldown expires. Throttles do NOT cooldown (they
+# are expected + transient, e.g. codex's hourly OAuth action limit).
+_ALIAS_COOLDOWN: dict[str, float] = {}
+ALIAS_COOLDOWN_SEC = float(os.environ.get("ALIAS_COOLDOWN_SEC", "600"))
+
+
+def _alias_cooled(alias: str) -> bool:
+    exp = _ALIAS_COOLDOWN.get(alias)
+    return bool(exp and time.time() < exp)
+
+
 def classify_registry(kind: str) -> str:
     """Doctor classification: job kind -> cost-tiered model registry name."""
     best = None
@@ -577,6 +591,11 @@ def process_job(urn, job):
             # Stop on success (commit or clean answer) or a non-retryable fail.
             result = None
             for idx, alias in enumerate(chain):
+                # KHM: skip a cooled-down (known-dead) alias unless it is the
+                # last option left (always keep a fallback to dispatch *something*).
+                if _alias_cooled(alias) and idx < len(chain) - 1:
+                    log.info("  skip alias=%s (cooldown) — KHM", alias)
+                    continue
                 log.info("  → WSS alias=%s (%d/%d) workspace=%s",
                          alias, idx + 1, len(chain), workspace)
                 result = wss_run(desc, kind, workspace, alias, jid, JOB_TIMEOUT)
@@ -595,6 +614,13 @@ def process_job(urn, job):
                 hard_fail = any(s in blob for s in (
                     "timeout", "unavailable", "all model_providers", "driver_crash",
                     "max tool iterations", "connection refused", "502", "503", "500"))
+                # KHM: hard-fail (bad key/endpoint, NOT throttle) cools the alias
+                # so future jobs skip it; success clears any cooldown.
+                if hard_fail and not throttled and not result.get("commits"):
+                    _ALIAS_COOLDOWN[alias] = time.time() + ALIAS_COOLDOWN_SEC
+                    log.info("  KHM: cooling alias=%s for %ds (hard-fail)", alias, int(ALIAS_COOLDOWN_SEC))
+                elif result.get("commits") or result.get("exit_code") == 0:
+                    _ALIAS_COOLDOWN.pop(alias, None)
                 escalate = (throttled or hard_fail) and not result.get("commits")
                 if result.get("commits") or not escalate or idx == len(chain) - 1:
                     break
