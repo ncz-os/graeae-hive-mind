@@ -333,10 +333,10 @@ def process_job(urn, job):
             result = {"exit_code": 2, "via": "preflight",
                       "commits": [], "files_changed": [],
                       "worker_error": werr, "error": werr}
-        elif any(kind.startswith(p) for p in CODEX_KINDS_PREFIXES):
-            log.info("  → codex-cli (scarce path) workspace=%s", workspace)
-            result = codex_cli_run(desc, kind, workspace, timeout_sec=JOB_TIMEOUT)
         else:
+            # ALL kinds (incl doctor:/codex/review:) run through the same WSS
+            # gateway agent path — no special codex-CLI snowflake. Uniform
+            # agent type + uniform commit-verify/push gating for every kind.
             log.info("  → WSS open-weight (default) alias=%s workspace=%s",
                      alias, workspace)
             result = wss_run(desc, kind, workspace, alias, jid, JOB_TIMEOUT)
