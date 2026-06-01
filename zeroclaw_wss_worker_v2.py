@@ -361,13 +361,24 @@ def process_job(urn, job):
         if not pushed:
             result["worker_error"] = "push_failed:" + pr.stderr.strip()[:200]
     requires_commit = has_remote and not kind.startswith("review:")  # review jobs emit a report, not a commit
-    if (result.get("exit_code") == 0 and not result.get("worker_error")
-            and (not requires_commit or (commits and pushed))):
+    if requires_commit:
+        # For a repo job the VERIFIED, PUSHED commit is the authoritative
+        # success signal — honor it even when the agent returns non-zero
+        # because it hit a soft cap (e.g. "max tool iterations"). The work
+        # landed in the remote, so the job is done. No pushed commit =>
+        # failed (prevents the fake "completed but no commit" class).
+        if commits and pushed:
+            status = "done"
+        else:
+            status = "failed"
+            if not commits:
+                result.setdefault("error", "fake_prevented:exit0_but_zero_verified_commits")
+            elif not pushed:
+                result.setdefault("error", "commit_made_but_push_failed")
+    elif result.get("exit_code") == 0 and not result.get("worker_error"):
         status = "done"
     else:
         status = "failed"
-        if requires_commit and not commits:
-            result.setdefault("error", "fake_prevented:exit0_but_zero_verified_commits")
     patch_job(jid, urn, status, result)
     commits = result.get("commits") or []
     log.info("→ %s %s commits=%d dur=%.1fs %s",
