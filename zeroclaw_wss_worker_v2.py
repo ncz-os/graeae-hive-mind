@@ -111,6 +111,46 @@ TIER_CHAINS = {
           "hive_together_1", "hive_nvidia_1"],
 }
 
+# ── COST-SAVINGS ARCHITECTURE (operator 2026-06-01) ──────────────────────────
+# The doctor classifies each job by task-type/complexity into a cost-tiered
+# model REGISTRY; the worker dispatches to the cheapest-adequate model first and
+# escalates on failure. Each alias' actual model is configured gateway-side
+# (model_provider). Cheap models (deepseek-flash/nova/groq) carry high-volume
+# simple work; PRO (codex gpt-5.3-codex OAuth $0, gpt-5-pro, deepseek-pro)
+# handles complex code; NVIDIA (NGC + GB10 local) runs on the Spark.
+# Registries are cheapest-first. Until open-weight provider keys are revalidated
+# fleet-side they fall back to codex (hive_groq_1 -> openai.codex); the
+# classification is correct now and real savings activate as cheap providers
+# and the Spark come online.
+MODEL_REGISTRIES = {
+    "cheapo": ["hive_deepseek_2", "hive_groq_2", "hive_nvidia_2", "hive_groq_1"],
+    "medium": ["hive_deepseek_2", "hive_nvidia_2", "hive_groq_3", "hive_groq_1"],
+    "pro":    ["hive_groq_1", "hive_deepseek_pro_1"],
+    "nvidia": ["hive_nvidia_2", "hive_nvidia_3", "hive_nvidia_4", "hive_groq_1"],
+}
+# Task-type -> registry (the doctor's classification dictionary). Longest-prefix
+# match wins. Complex code/reasoning -> pro; standard code/ops -> medium;
+# simple/high-volume/triage -> cheapo; data/nvidia-class -> nvidia (Spark).
+TASK_REGISTRY_MAP = {
+    "review": "pro", "architecture": "pro", "design": "pro",
+    "feat:": "pro", "mnemos:": "pro", "riskyeats:": "pro", "doctor:": "pro",
+    "ncz-os-zeroclaw:": "pro",
+    "fix:": "medium", "fleet-infra:": "medium", "ncz-os": "medium",
+    "cixmini-os:": "medium",
+    "argonaut:": "cheapo", "riskybiz:": "cheapo", "triage": "cheapo",
+    "diag:": "cheapo", "ping:": "cheapo", "research": "cheapo",
+    "track:": "cheapo", "ops:": "cheapo", "hive-stats": "cheapo",
+}
+
+
+def classify_registry(kind: str) -> str:
+    """Doctor classification: job kind -> cost-tiered model registry name."""
+    best = None
+    for prefix, reg in TASK_REGISTRY_MAP.items():
+        if (kind or "").startswith(prefix) and (best is None or len(prefix) > len(best[0])):
+            best = (prefix, reg)
+    return best[1] if best else "medium"
+
 # Per-host provider lock. When HIVE_PROVIDER_LOCK is set (e.g. "nvidia" on the
 # NVIDIA Spark, which must use NGC keys only), every tier chain is restricted
 # to that provider's aliases — no fallback to other LLMs. Empty (default) keeps
@@ -492,8 +532,13 @@ def process_job(urn, job):
     kind = job.get("kind", "") or ""
     desc = job.get("description", "") or ""
     tier = job.get("max_cost_tier", "C")
-    chain = TIER_CHAINS.get((tier or "C").upper(), TIER_CHAINS["C"])
-    log.info("claimed %s kind=%s tier=%s", jid[:12], kind[:60], tier)
+    # COST-SAVINGS: doctor classifies the job -> cost-tiered registry; dispatch
+    # cheapest-adequate model first, escalate on failure (the chain rotation in
+    # the loop below). Falls back to the legacy tier chain if classification is
+    # somehow empty.
+    registry = classify_registry(kind)
+    chain = MODEL_REGISTRIES.get(registry) or TIER_CHAINS.get((tier or "C").upper(), TIER_CHAINS["C"])
+    log.info("claimed %s kind=%s tier=%s -> registry=%s", jid[:12], kind[:50], tier, registry)
     patch_job(jid, urn, "running")
     started = time.time()
     try:
