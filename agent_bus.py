@@ -831,14 +831,14 @@ def agent_kind_aliases(kind: str, runtime: Optional[str]) -> set[str]:
         if kind in kinds:
             aliases.add(rt)
             aliases.update(kinds)
-    # Eligibility hierarchy (operator 2026-06-01): claude-eligible is
-    # codex-eligible is zeroclaw-claimable. doctor/codex/review and claude
-    # jobs all run through the same WSS gateway agent now, so a zeroclaw
-    # worker can claim codex + claude work, and a codex worker claude work.
-    if "zeroclaw" in aliases:
-        aliases.update({"codex", "claude"})
-    if "codex" in aliases:
-        aliases.add("claude")
+    # ALL-EXECUTORS-ELIGIBLE (operator 2026-06-01): claude, opencode, codex and
+    # zeroclaw are MUTUALLY eligible for every executor job. They differ only at
+    # DISPATCH — zeroclaw routes per-model by complexity (KNEMON); the others are
+    # single-agent. No tier or cross-kind gating between executors. A job marked
+    # for any one of them is claimable by all of them.
+    EXECUTOR_KINDS = {"claude", "codex", "zeroclaw", "opencode"}
+    if aliases & EXECUTOR_KINDS:
+        aliases |= EXECUTOR_KINDS
     aliases.discard("")
     return aliases
 
@@ -2056,15 +2056,11 @@ async def dequeue_next_job(agent_urn: str):
                         and workspace_capability not in agent_caps
                     ):
                         continue
-                    # filter: cost-tier cap (token-miser default: A=free only)
-                    job_max_tier = (j_max_tier or "B").upper()
-                    if job_max_tier not in COST_TIERS:
-                        continue
-                    if COST_TIERS.index(a_tier) > COST_TIERS.index(job_max_tier):
-                        continue
-                    # throttle: subscription claude past 85% MTD limited to tier-A only
-                    if sub_throttled and job_max_tier != "A":
-                        continue
+                    # NO TIER GATING (operator 2026-06-01): all executor agents
+                    # may claim any job regardless of cost tier. Cost/model
+                    # selection is a DISPATCH concern — zeroclaw routes per-model
+                    # by complexity via KNEMON; it is not a claim-time gate.
+                    # (cost-tier + subscription-throttle filters removed here.)
                     # filter: preferred_providers (if set, agent must match one)
                     if j_pref_providers:
                         provs = json.loads(j_pref_providers)
