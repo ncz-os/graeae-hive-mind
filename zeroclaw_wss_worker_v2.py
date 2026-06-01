@@ -365,10 +365,16 @@ def process_job(urn, job):
     if requires_commit:
         # For a repo job the VERIFIED, PUSHED commit is the authoritative
         # success signal — honor it even when the agent returns non-zero
-        # because it hit a soft cap (e.g. "max tool iterations"). The work
-        # landed in the remote, so the job is done. No pushed commit =>
-        # failed (prevents the fake "completed but no commit" class).
+        # because it hit a soft cap (e.g. "max tool iterations").
         if commits and pushed:
+            status = "done"
+        elif result.get("exit_code") == 0 and result.get("worker_error") == "no_code_output":
+            # Agent ran cleanly and returned a text answer with no code change
+            # (a question, analysis, or "already fixed — nothing to do"). Not
+            # every repo-scoped job is a code modification, so accept the
+            # answer as done rather than fake-failing it. The fake class this
+            # still catches: a crash / no-workspace / non-zero exit with no
+            # commit -> failed below.
             status = "done"
         else:
             status = "failed"
