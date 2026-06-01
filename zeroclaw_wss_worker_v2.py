@@ -65,11 +65,18 @@ NARROW_HOSTS = {"cixmini", "bigpi", "clawpi", "zeropi"}
 NARROW_ALLOWLIST = ("cixmini-os:", "ncz-os-", "fleet-infra:")
 _HOST_LOWER = (AGENT_HOST or "").lower()
 
-# Open-weight tier chains via WSS gateway
+# Provider fallback chains by job class + cost. On a retryable failure
+# (timeout / throttle / rate-limit / quota / provider-error), the worker
+# dispatches the job to the NEXT LLM in the chain. Spans xai, deepseek,
+# together, groq, siliconflow, nvidia (NGC). (gemini omitted — no
+# hive_gemini agent alias exists yet; add one to include it.)
 TIER_CHAINS = {
-    "A": ["hive_deepseek_pro_1", "hive_nvidia_1", "hive_deepseek_1"],
-    "B": ["hive_deepseek_pro_1", "hive_nvidia_1", "hive_deepseek_1", "hive_groq_8b"],
-    "C": ["hive_deepseek_1", "hive_groq_8b", "hive_nvidia_2"],
+    "A": ["hive_deepseek_pro_1", "hive_xai_1", "hive_together_1",
+          "hive_siliconflow_1", "hive_groq_1", "hive_nvidia_1"],
+    "B": ["hive_deepseek_1", "hive_groq_1", "hive_siliconflow_1",
+          "hive_together_1", "hive_xai_1", "hive_nvidia_1"],
+    "C": ["hive_groq_1", "hive_deepseek_1", "hive_siliconflow_1",
+          "hive_together_1", "hive_nvidia_1"],
 }
 
 logging.basicConfig(level=logging.INFO,
@@ -323,7 +330,7 @@ def process_job(urn, job):
     kind = job.get("kind", "") or ""
     desc = job.get("description", "") or ""
     tier = job.get("max_cost_tier", "C")
-    alias = pick_agent_alias(tier, kind)
+    chain = TIER_CHAINS.get((tier or "C").upper(), TIER_CHAINS["C"])
     log.info("claimed %s kind=%s tier=%s", jid[:12], kind[:60], tier)
     patch_job(jid, urn, "running")
     started = time.time()
@@ -335,11 +342,27 @@ def process_job(urn, job):
                       "worker_error": werr, "error": werr}
         else:
             # ALL kinds (incl doctor:/codex/review:) run through the same WSS
-            # gateway agent path — no special codex-CLI snowflake. Uniform
-            # agent type + uniform commit-verify/push gating for every kind.
-            log.info("  → WSS open-weight (default) alias=%s workspace=%s",
-                     alias, workspace)
-            result = wss_run(desc, kind, workspace, alias, jid, JOB_TIMEOUT)
+            # gateway agent. Try the tier's provider chain in order: if a
+            # provider times out / is throttled (rate-limit, quota, session
+            # usage) / errors, fall through to the NEXT LLM in the chain.
+            # Stop on success (commit or clean answer) or a non-retryable fail.
+            result = None
+            for idx, alias in enumerate(chain):
+                log.info("  → WSS alias=%s (%d/%d) workspace=%s",
+                         alias, idx + 1, len(chain), workspace)
+                result = wss_run(desc, kind, workspace, alias, jid, JOB_TIMEOUT)
+                err = str(result.get("error") or result.get("worker_error") or "").lower()
+                retryable = any(s in err for s in (
+                    "timeout", "429", "rate", "throttle", "quota",
+                    "usage", "overload", "unavailable", "provider",
+                    "all model_providers", "max tool iterations",
+                    "no_code_output", "connection", "5xx", "500", "502", "503"))
+                if (result.get("exit_code") == 0 or result.get("commits")
+                        or not retryable or idx == len(chain) - 1):
+                    break
+                log.info("  alias %s retryable-fail (%s) — dispatching next LLM",
+                         alias, err[:60])
+            result["alias_tried"] = chain[:idx + 1]
     except Exception as e:
         log.exception("dispatch failed")
         result = {"exit_code": 1, "via": "worker",
