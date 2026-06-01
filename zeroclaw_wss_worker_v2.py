@@ -17,6 +17,7 @@ import re
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -393,12 +394,21 @@ def main():
     urn = register()
     if not urn:
         sys.exit(1)
-    last_hb = time.time()
+
+    # Background heartbeat: keep the agent visibly ONLINE in the dashboard
+    # even while the main loop is blocked for ~20s on a real agent job
+    # (inline heartbeat used to lapse during work -> worker flickered offline).
+    def _heartbeat_loop():
+        while True:
+            try:
+                heartbeat(urn)
+            except Exception:
+                pass
+            time.sleep(HEARTBEAT_INTERVAL)
+
+    threading.Thread(target=_heartbeat_loop, daemon=True).start()
+
     while True:
-        now = time.time()
-        if now - last_hb >= HEARTBEAT_INTERVAL:
-            heartbeat(urn)
-            last_hb = now
         try:
             job = claim_next(urn)
         except Exception as e:
