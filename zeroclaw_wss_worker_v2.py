@@ -34,6 +34,22 @@ GATEWAY_HOST = os.environ.get("GATEWAY_HOST", "127.0.0.1")
 GATEWAY_PORT = int(os.environ.get("GATEWAY_PORT", "42617"))
 JOB_TIMEOUT = float(os.environ.get("JOB_TIMEOUT", "900"))
 INSTANCE = os.environ.get("ZEROCLAW_INSTANCE_ID") or os.environ.get("INSTANCE", "1")
+# Gateway agent loop cap. Default 10 is too low — real repo jobs (read+grep+
+# edit+test+commit) routinely exceed it and die "max tool iterations". 40 lets
+# them finish; the JOB_TIMEOUT wall still bounds runaway loops.
+MAX_TOOL_ITERS = int(os.environ.get("MAX_TOOL_ITERS", "40"))
+
+# Non-commit kinds: analysis/answer/review work that produces TEXT, not a repo
+# change. When such a kind has no workspace mapping, run it workspace-less
+# (dispatch to the gateway, accept the text answer as done) instead of
+# fail-looping on no_workspace_for_kind. Anything NOT in this set that lacks a
+# mapping is assumed to need a repo -> cancelled terminal (needs a mapping),
+# never silently "done" (which would fake-complete a code job).
+NONCOMMIT_KIND_PREFIXES = (
+    "review", "architecture", "triage", "docs:", "investigation",
+    "track:", "ops:", "diag:", "ping:", "hive-stats", "dream-walker",
+    "research", "analysis", "design",
+)
 
 WORKSPACE_ROOT = Path(os.path.expanduser("~/codex-workspace"))
 WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
@@ -228,6 +244,11 @@ def _resolve_workspace(kind, description):
         if kind.startswith(prefix) and (best is None or len(prefix) > len(best[0])):
             best = (prefix, val)
     if best is None:
+        # Non-commit kind with no mapping -> run workspace-less (text answer).
+        # Sentinel werr "noncommit_workspaceless" tells process_job to dispatch
+        # with workspace=None rather than treat it as a hard failure.
+        if any(kind.startswith(p) for p in NONCOMMIT_KIND_PREFIXES):
+            return None, "noncommit_workspaceless"
         return None, "no_workspace_for_kind"
     prefix, (subdir, git_url) = best
     return _ensure_workspace(subdir, git_url, kind)
@@ -239,6 +260,16 @@ def _augment_task_for_wss(task, workspace, kind):
         "PYTHIA=192.168.207.67 TYPHON=192.168.207.61 "
         "CERBERUS=192.168.207.96 ARGONAS=192.168.207.101"
     )
+    if workspace is None:
+        # Workspace-less (non-commit) job: produce a written answer, no repo.
+        return (
+            f"[WORKER CONTEXT]\n"
+            f"You are operating on host {AGENT_HOST} as user jasonperlow.\n"
+            f"This is a NON-CODE job (kind: {kind}) — produce a written "
+            f"answer/analysis/review. There is no git repository to modify.\n"
+            f"Fleet hosts available via passwordless SSH: {fleet_ips}\n"
+            f"[END WORKER CONTEXT]\n\n[TASK]\n{task}\n[END TASK]"
+        )
     preamble = (
         f"[WORKER CONTEXT]\n"
         f"You are operating on host {AGENT_HOST} as user jasonperlow.\n"
@@ -304,16 +335,28 @@ def codex_cli_run(task, kind, workspace, timeout_sec=900.0):
 def wss_run(task, kind, workspace, alias, job_id, timeout_sec):
     """DEFAULT path — open-weight via local zeroclaw gateway."""
     started = time.time()
-    pre_head = _git(workspace, "rev-parse", "HEAD", timeout=10).stdout.strip()
+    # Capture HEAD BEFORE the agent runs so post-run diff finds real commits.
+    pre_head = (_git(workspace, "rev-parse", "HEAD", timeout=10).stdout.strip()
+                if workspace is not None else "")
     augmented = _augment_task_for_wss(task, workspace, kind)
     try:
         raw_result = wss_driver.drive_agent_via_wss(
             host=GATEWAY_HOST, agent_alias=alias, task=augmented,
             job_id=job_id, timeout_sec=timeout_sec,
+            max_tool_iterations=MAX_TOOL_ITERS,
         )
     except Exception as e:
         raw_result = {"exit_code": 1, "via": "wss_driver",
                       "error": f"driver_crash: {type(e).__name__}: {e}"}
+    if workspace is None:
+        # Non-commit job: no repo to harvest commits from. The text answer IS
+        # the deliverable; mark no_code_output so the gate accepts a clean run.
+        raw_result["commits"] = []
+        raw_result["files_changed"] = []
+        raw_result["workspace"] = None
+        raw_result.setdefault("worker_error", "no_code_output")
+        raw_result["duration_sec"] = round(time.time() - started, 2)
+        return raw_result
     # Recompute commits authoritatively from the workspace (ignore regex harvest)
     post_head = _git(workspace, "rev-parse", "HEAD", timeout=10).stdout.strip()
     commits, files = [], []
@@ -347,11 +390,27 @@ def process_job(urn, job):
     started = time.time()
     try:
         workspace, werr = _resolve_workspace(kind, desc)
-        if werr:
-            result = {"exit_code": 2, "via": "preflight",
-                      "commits": [], "files_changed": [],
-                      "worker_error": werr, "error": werr}
-        else:
+        # Permanent preflight failures: do NOT fail-loop (the hive re-serves
+        # failed jobs forever). Terminate them so the queue drains.
+        #  - host_declines_kind: this host shouldn't run it -> release to queued
+        #    so a capable host claims it.
+        #  - no_workspace_for_kind / _for_repo / doctor_fix_missing_repo_hint:
+        #    no host has a mapping -> cancelled (resubmit once a mapping exists).
+        if werr and werr != "noncommit_workspaceless":
+            if werr.startswith("host_declines_kind"):
+                patch_job(jid, urn, "queued",
+                          {"worker_error": werr, "note": "released_by_host"})
+                log.info("→ released %s (%s)", jid[:12], werr)
+                return
+            patch_job(jid, urn, "cancelled",
+                      {"exit_code": 2, "via": "preflight", "commits": [],
+                       "worker_error": werr,
+                       "error": f"terminal_preflight:{werr}"})
+            log.info("→ cancelled %s (%s) — no retry", jid[:12], werr)
+            return
+        if werr == "noncommit_workspaceless":
+            workspace = None  # run the chain workspace-less (text answer)
+        if True:
             # ALL kinds (incl doctor:/codex/review:) run through the same WSS
             # gateway agent. Try the tier's provider chain in order: if a
             # provider times out / is throttled (rate-limit, quota, session
