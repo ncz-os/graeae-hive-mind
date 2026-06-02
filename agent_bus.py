@@ -526,7 +526,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   eligible_kinds TEXT,                          -- json array; agent kinds eligible (null = any)
   eligible_hosts TEXT,                          -- json array; agent hosts eligible (null = any); e.g. ["cixmini"]
   project TEXT,                                 -- #10 FIX: separate project tag from capabilities (riskyeats/investorclaw/etc)
-  status TEXT NOT NULL CHECK(status IN ('queued','offered','claimed','running','done','failed','cancelled')),
+  status TEXT NOT NULL CHECK(status IN ('queued','offered','claimed','running','done','failed','failed_completion','cancelled','dead-letter')),
   claimed_by TEXT,                              -- worker urn (set on claim/dequeue)
   claimed_at REAL,
   started_at REAL NOT NULL,                     -- when job ENTERED queue
@@ -778,8 +778,16 @@ PROVIDER_COST_TIER: dict[str, str] = {
     "unknown":         "A",
 }
 COST_TIERS = ["A", "B", "C"]
-VALID_JOB_STATUSES = {"queued", "offered", "claimed", "running", "done", "failed", "failed_completion", "cancelled"}
-TERMINAL_JOB_STATUSES = {"done", "failed", "cancelled"}
+VALID_JOB_STATUSES = {"queued", "offered", "claimed", "running", "done", "failed", "failed_completion", "cancelled", "dead-letter"}
+TERMINAL_JOB_STATUSES = {"done", "failed", "cancelled", "dead-letter"}
+# Thrash fix (2026-06-02): a host-pinned job whose only eligible host declines
+# its kind would requeue forever (claim→decline→requeue→claim...). After this
+# many worker-decline requeues we divert the job to the terminal 'dead-letter'
+# status instead of 'queued', so the dequeue loop (WHERE status='queued') stops
+# re-serving it. Worker declines are PATCH status=queued carrying a worker_error
+# of host_declines_kind / no_workspace_for_kind in the result payload.
+MAX_DECLINE_REQUEUES = 3
+DECLINE_REASON_PREFIXES = ("host_declines_kind", "no_workspace_for_kind")
 STATUS_TRANSITIONS: dict[str, set[str]] = {
     "queued": {"queued", "offered", "claimed", "cancelled"},
     "offered": {"queued", "claimed", "cancelled"},
@@ -788,6 +796,7 @@ STATUS_TRANSITIONS: dict[str, set[str]] = {
     "done": {"done", "cancelled"},  # allow cancelling fake/duplicate completions out of done
     "failed": {"failed"},
     "cancelled": {"cancelled"},
+    "dead-letter": {"dead-letter"},  # terminal; idempotent same-status PATCH only
 }
 CLAIM_LEASE_SECONDS = float(os.environ.get("CLAIM_LEASE_SECONDS", "1800"))
 # Hosts the bus refuses to offer jobs to — typically because their workers
@@ -1376,6 +1385,38 @@ async def lifespan(app: FastAPI):
             )
             await conn.execute("DROP TABLE agents__pre_stale_migration")
 
+        async def _ensure_jobs_status_allows_dead_letter(conn) -> None:
+            # Thrash fix (2026-06-02): older live jobs tables have a CHECK(status
+            # IN (...)) that predates 'dead-letter'/'failed_completion'. SQLite
+            # cannot ALTER a CHECK in place, so rebuild the table preserving its
+            # (possibly drifted) columns + data. No-op when the constraint is
+            # already permissive or absent (fresh DBs are created from SCHEMA,
+            # which already lists dead-letter).
+            async with conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='jobs'"
+            ) as cur:
+                row = await cur.fetchone()
+            table_sql = row[0] if row else ""
+            if not table_sql:
+                return  # no jobs table yet (e.g. 0-byte/mid-recovery DB) — SCHEMA will create it
+            if "CHECK" not in table_sql.upper() or "dead-letter" in table_sql:
+                return  # no status CHECK, or already permissive — nothing to do
+            async with conn.execute("PRAGMA table_info(jobs)") as cur:
+                old_cols = [r[1] for r in await cur.fetchall()]
+            await conn.execute("ALTER TABLE jobs RENAME TO jobs__pre_deadletter_migration")
+            await conn.executescript(SCHEMA)  # recreate jobs (+others, all IF NOT EXISTS) with new CHECK
+            # Copy only columns common to old + recreated table — guards against
+            # drift columns the recreated SCHEMA lacks (the live_columns ALTERs
+            # below re-add any expected-but-missing ones afterwards).
+            async with conn.execute("PRAGMA table_info(jobs)") as cur:
+                new_cols = {r[1] for r in await cur.fetchall()}
+            common = [c for c in old_cols if c in new_cols]
+            col_list = ", ".join(common)
+            await conn.execute(
+                f"INSERT INTO jobs ({col_list}) SELECT {col_list} FROM jobs__pre_deadletter_migration"
+            )
+            await conn.execute("DROP TABLE jobs__pre_deadletter_migration")
+
         live_columns = (
             # agents — v0.2 cost/runtime/autonomy columns
             ("agents", "runtime", "runtime TEXT"),
@@ -1413,10 +1454,64 @@ async def lifespan(app: FastAPI):
             ("jobs", "retry_backoff_until", "retry_backoff_until REAL"),
             ("jobs", "last_update_at", "last_update_at REAL"),
             ("jobs", "claim_lease_expires_at", "claim_lease_expires_at REAL"),
+            # Thrash fix (2026-06-02): per-job count of worker-decline requeues.
+            ("jobs", "decline_count", "decline_count INTEGER NOT NULL DEFAULT 0"),
         )
+        # Run CHECK-constraint rebuilds BEFORE additive column ALTERs: the
+        # rebuild recreates the table from SCHEMA (sans drift columns), then the
+        # loop re-adds any missing columns (incl. decline_count) to the new table.
+        # SQLite only — the mocked sqlite_master on the Oracle adapter makes this
+        # unsafe there; Oracle gets its own migration below.
+        if HIVE_BACKEND == "sqlite":
+            await _ensure_jobs_status_allows_dead_letter(db)
         for table, col, ddl_fragment in live_columns:
             await _ensure_column(db, table, col, ddl_fragment)
         await _ensure_agents_status_allows_stale(db)
+
+        # Thrash fix (2026-06-02) — Oracle backend equivalents. The live hive
+        # runs HIVE_BACKEND=oracle; the SQLite executescript/ALTER paths above
+        # are no-ops there, so add decline_count + relax CK_HIVE_JOBS_STATUS to
+        # include 'dead-letter' (and 'failed_completion') directly via the Oracle
+        # connection. Both steps are idempotent and guarded by existence checks.
+        # DDL on the Oracle adapter is intentionally a no-op (translate returns
+        # None for ALTER/CREATE/DROP), so run these on the RAW oracledb connection
+        # (db._conn) to actually apply them. Idempotent + existence-guarded.
+        if HIVE_BACKEND == "oracle" and getattr(db, "_conn", None) is not None:
+            try:
+                raw = db._conn
+                rcur = raw.cursor()
+                await rcur.execute(
+                    "SELECT COUNT(*) FROM user_tab_columns "
+                    "WHERE table_name = 'HIVE_JOBS' AND column_name = 'DECLINE_COUNT'"
+                )
+                has_col = (await rcur.fetchone())[0]
+                if not has_col:
+                    await rcur.execute(
+                        "ALTER TABLE HIVE_JOBS ADD (decline_count NUMBER DEFAULT 0 NOT NULL)"
+                    )
+                await rcur.execute(
+                    "SELECT search_condition_vc FROM user_constraints "
+                    "WHERE table_name = 'HIVE_JOBS' AND constraint_name = 'CK_HIVE_JOBS_STATUS'"
+                )
+                crow = await rcur.fetchone()
+                cond = str(crow[0]) if crow and crow[0] is not None else ""
+                if crow is not None and "dead-letter" not in cond:
+                    await rcur.execute("ALTER TABLE HIVE_JOBS DROP CONSTRAINT CK_HIVE_JOBS_STATUS")
+                    await rcur.execute(
+                        "ALTER TABLE HIVE_JOBS ADD CONSTRAINT CK_HIVE_JOBS_STATUS "
+                        "CHECK (status IN ('queued','offered','claimed','running',"
+                        "'done','failed','failed_completion','cancelled','dead-letter'))"
+                    )
+                await rcur.close()
+                await db.commit()
+            except Exception as e:
+                # FATAL: the runtime decline/dead-letter path REQUIRES both the
+                # decline_count column and the relaxed status CHECK. If this DDL
+                # fails, every subsequent decline PATCH would error (invalid
+                # identifier / CHECK violation), so refuse to start rather than
+                # serve a half-migrated bus.
+                print(f"oracle dead-letter migration FAILED (fatal): {e}", flush=True)
+                raise
         # Idempotent index re-creates (in case live DB pre-dates an index).
         live_indexes = (
             "CREATE INDEX IF NOT EXISTS idx_agents_status      ON agents(status)",
@@ -2164,19 +2259,35 @@ async def update_job(job_id: str, req: JobUpdate):
     )
     cost_estimate = None
 
+    # Thrash fix (2026-06-02): is this a worker DECLINE (release to queued with a
+    # host_declines_kind / no_workspace_for_kind worker_error)? If so we count it,
+    # and after MAX_DECLINE_REQUEUES divert the job to terminal 'dead-letter'
+    # instead of re-queueing it forever.
+    decline_reason = None
+    dead_lettered = False
+    if req.status == "queued" and isinstance(req.result, dict):
+        _werr = str(req.result.get("worker_error") or "")
+        # Match exact reasons or the documented separator form
+        # (host_declines_kind:<host>) — avoid matching an unrelated reason that
+        # merely shares a prefix.
+        if _werr in DECLINE_REASON_PREFIXES or any(
+            _werr.startswith(p + ":") for p in DECLINE_REASON_PREFIXES
+        ):
+            decline_reason = _werr
+
     async with connect_db() as db:
         await db.execute("BEGIN IMMEDIATE")
         try:
             async with db.execute(
                 "SELECT status, claimed_by, claimed_provider, claimed_model, retry_count, "
-                "max_retries FROM jobs WHERE id=?",
+                "max_retries, COALESCE(decline_count, 0) FROM jobs WHERE id=?",
                 (job_id,),
             ) as cur:
                 current = await cur.fetchone()
             if not current:
                 await db.execute("ROLLBACK")
                 raise HTTPException(404, f"job not found: {job_id}")
-            old_status, old_claimed_by, prov, mod, retry_count, max_retries = current
+            old_status, old_claimed_by, prov, mod, retry_count, max_retries, decline_count = current
 
             if req.status not in STATUS_TRANSITIONS.get(old_status, set()):
                 await db.execute("ROLLBACK")
@@ -2272,12 +2383,56 @@ async def update_job(job_id: str, req: JobUpdate):
                 fields.append("eligible_hosts=?")
                 args.append(json.dumps(req.eligible_hosts))
 
+            # Thrash fix (2026-06-02): compare-and-set on the observed status.
+            # On the Oracle backend BEGIN IMMEDIATE is a no-op, so two concurrent
+            # PATCHes can both read old_status='claimed'; without this guard a
+            # stale release (status='queued') could land AFTER a sibling PATCH
+            # already dead-lettered/terminated the job and reopen it. Gating the
+            # UPDATE on `status=old_status` makes the second writer a no-op
+            # (rowcount==0 → 409). SQLite already serialises via BEGIN IMMEDIATE;
+            # the guard is harmless there.
             args.append(job_id)
-            sql = f"UPDATE jobs SET {', '.join(fields)} WHERE id=?"
+            args.append(old_status)
+            sql = f"UPDATE jobs SET {', '.join(fields)} WHERE id=? AND status=?"
             cur = await db.execute(sql, args)
             if cur.rowcount == 0:
                 await db.execute("ROLLBACK")
-                raise HTTPException(404, f"job not found: {job_id}")
+                raise HTTPException(
+                    409,
+                    f"job {job_id} status changed concurrently (expected {old_status!r}); retry",
+                )
+
+            # Thrash fix (2026-06-02): worker-decline requeue counting. The main
+            # UPDATE above already set status='queued'. Now bump decline_count; if
+            # it reaches MAX_DECLINE_REQUEUES, divert to terminal 'dead-letter' so
+            # the claim→decline→requeue loop terminates. (Only declines via
+            # host_declines_kind / no_workspace_for_kind count — genuine releases
+            # without a decline worker_error do not.)
+            if decline_reason is not None and release_to_queue:
+                new_decline_count = (decline_count or 0) + 1
+                if new_decline_count >= MAX_DECLINE_REQUEUES:
+                    # Preserve the worker's original decline payload for diagnostics.
+                    dl_result = {
+                        "dead_letter": True,
+                        "decline_count": new_decline_count,
+                        "last_decline_reason": decline_reason,
+                        "note": "thrash_guard:max_decline_requeues_exceeded",
+                        "last_decline_result": req.result,
+                    }
+                    # CAS on status='queued' (the state the main UPDATE just set)
+                    # so a concurrent claim can't be clobbered.
+                    dl_cur = await db.execute(
+                        "UPDATE jobs SET status='dead-letter', decline_count=?, "
+                        "ended_at=?, claim_lease_expires_at=NULL, result=? "
+                        "WHERE id=? AND status='queued'",
+                        (new_decline_count, now, json.dumps(dl_result), job_id),
+                    )
+                    dead_lettered = (getattr(dl_cur, "rowcount", 0) or 0) >= 1
+                else:
+                    await db.execute(
+                        "UPDATE jobs SET decline_count=? WHERE id=? AND status='queued'",
+                        (new_decline_count, job_id),
+                    )
 
             # Roll MTD spend onto claimer (subscription throttle requires this)
             if cost_estimate and cost_estimate > 0 and effective_claimed_by:
@@ -2348,7 +2503,7 @@ async def update_job(job_id: str, req: JobUpdate):
                 "old_claimed_by, new_claimed_by, patch) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     job_id, now, req.claimed_by or old_claimed_by, old_status,
-                    "queued" if retried else req.status,
+                    "dead-letter" if dead_lettered else ("queued" if retried else req.status),
                     old_claimed_by,
                     None if release_to_queue else effective_claimed_by,
                     json.dumps(patch_payload, default=str),
@@ -2367,12 +2522,22 @@ async def update_job(job_id: str, req: JobUpdate):
                 "id": job_id, "retry_count": retry_count + 1,
                 "max_retries": max_retries,
             })
-        await emit_event(event_db, f"job.{req.status}", {
-            "id": job_id, "claimed_by": req.claimed_by or old_claimed_by,
-            "tokens_in": req.tokens_in, "tokens_out": req.tokens_out,
-            "estimated_cost_usd": cost_estimate,
-        })
-    return {"ok": True, "ts": now, "estimated_cost_usd": cost_estimate}
+        if dead_lettered:
+            # Emit ONLY the effective terminal event; suppress the misleading
+            # job.queued (the inbound PATCH was queued but the job was diverted).
+            await emit_event(event_db, "job.dead-letter", {
+                "id": job_id, "claimed_by": req.claimed_by or old_claimed_by,
+                "last_decline_reason": decline_reason,
+                "decline_threshold": MAX_DECLINE_REQUEUES,
+            })
+        else:
+            await emit_event(event_db, f"job.{req.status}", {
+                "id": job_id, "claimed_by": req.claimed_by or old_claimed_by,
+                "tokens_in": req.tokens_in, "tokens_out": req.tokens_out,
+                "estimated_cost_usd": cost_estimate,
+            })
+    return {"ok": True, "ts": now, "estimated_cost_usd": cost_estimate,
+            "dead_lettered": dead_lettered}
 
 
 
