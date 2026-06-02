@@ -128,11 +128,26 @@ TIER_CHAINS = {
 # OAuth $0) so jobs run on the one working high-quality model instead of
 # falling to gpt-4o. The cheap aliases stay as later escalation slots and will
 # activate (real cost savings) once their keys are validated.
+# 2026-06-01: open-weight provider keys are BROKEN fleet-side. Escalating into
+# those aliases makes the gateway fall back to an EMBEDDING model (bge-small) or
+# return empty -> code jobs fail. Until the cheap providers are re-keyed, every
+# registry uses ONLY the two WORKING models: hive_groq_1 -> openai.codex
+# (gpt-5.3-codex OAuth $0) and hive_deepseek_2 -> openai.gpt5_2_pro (gpt-5-pro).
+# The cost-savings classification framework stays; the model list collapses to
+# what actually serves. Re-expand the cheap tiers once their keys validate.
+_WORKING = ["hive_groq_1", "hive_deepseek_2"]
 MODEL_REGISTRIES = {
-    "cheapo": ["hive_groq_1", "hive_deepseek_2", "hive_groq_2", "hive_nvidia_2"],
-    "medium": ["hive_groq_1", "hive_deepseek_2", "hive_nvidia_2", "hive_groq_3"],
-    "pro":    ["hive_groq_1", "hive_deepseek_2", "hive_deepseek_pro_1"],
-    "nvidia": ["hive_groq_1", "hive_nvidia_2", "hive_nvidia_3", "hive_nvidia_4"],
+    # WEAK + NON-LOCAL MODELS REMOVED (operator 2026-06-01). Removed: groq 8B/17B/32B/
+    # 70B-llama (weak + rate-limited), siliconflow (invalid key), and NVIDIA/NGC
+    # (Spark-ONLY per directive; the GB10 Spark is not yet integrated/tested with the
+    # current mnemos+hive fixes). codex stays OUT of the general chain (scarce $100 OAuth
+    # pool; reached only via kind=codex/review/doctor). Capable, validated, allowed coder
+    # for non-Spark workers = deepseek-direct ONLY: v4-pro for code, v4-flash for triage.
+    # Multiple aliases per tier spread load across the deepseek-direct account.
+    "cheapo": ["hive_deepseek_3", "hive_deepseek_4", "hive_deepseek_pro_2"],
+    "medium": ["hive_deepseek_pro_2", "hive_deepseek_pro_3", "hive_deepseek_pro_4"],
+    "pro":    ["hive_deepseek_pro_2", "hive_deepseek_pro_3", "hive_deepseek_pro_4", "hive_deepseek_pro_5"],
+    "nvidia": ["hive_deepseek_pro_2"],
 }
 # Task-type -> registry (the doctor's classification dictionary). Longest-prefix
 # match wins. Complex code/reasoning -> pro; standard code/ops -> medium;
@@ -143,10 +158,46 @@ TASK_REGISTRY_MAP = {
     "ncz-os-zeroclaw:": "pro",
     "fix:": "medium", "fleet-infra:": "medium", "ncz-os": "medium",
     "cixmini-os:": "medium",
-    "argonaut:": "cheapo", "riskybiz:": "cheapo", "triage": "cheapo",
+    "argonaut:": "pro", "riskybiz:": "cheapo", "triage": "cheapo",
     "diag:": "cheapo", "ping:": "cheapo", "research": "cheapo",
     "track:": "cheapo", "ops:": "cheapo", "hive-stats": "cheapo",
 }
+
+
+# KEY HEALTH MONITOR (operator 2026-06-01): aliases whose provider HARD-fails
+# (bad key/endpoint/connection — not a transient throttle) get a cooldown so the
+# escalation chain skips them instead of wasting a dispatch on a known-dead
+# model. alias -> unix-ts the cooldown expires. Throttles do NOT cooldown (they
+# are expected + transient, e.g. codex's hourly OAuth action limit).
+_ALIAS_COOLDOWN: dict[str, float] = {}
+ALIAS_COOLDOWN_SEC = float(os.environ.get("ALIAS_COOLDOWN_SEC", "600"))
+
+
+def _alias_cooled(alias: str) -> bool:
+    exp = _ALIAS_COOLDOWN.get(alias)
+    return bool(exp and time.time() < exp)
+
+
+# --- WORKAROUND for zeroclaw #7066 (gateway WS frame reports the FIRST configured
+# provider, not the actual routed model). Resolve the alias we dispatched to its
+# REAL model_provider + model from config so usage_ledger/dashboard attribute
+# cost to the true provider, not openai. Remove once a build with #7066 ships.
+_ALIAS_REAL_CACHE = {}
+def _alias_real_provider(alias):
+    if not _ALIAS_REAL_CACHE:
+        try:
+            cfg = open(os.path.expanduser("~/.zeroclaw/config.toml")).read()
+            prov_model = {}
+            for m in re.finditer(r"\[providers\.models\.([a-z0-9_.]+)\]\n((?:(?!\[).*\n)*)", cfg):
+                mm = re.search(r"^model = \"([^\"]+)\"", m.group(2), re.M)
+                prov_model[m.group(1)] = mm.group(1) if mm else m.group(1)
+            for m in re.finditer(r"\[agents\.([a-z0-9_]+)\]\n((?:(?!\[).*\n)*)", cfg):
+                mp = re.search(r"model_provider = \"([^\"]+)\"", m.group(2))
+                if mp:
+                    _ALIAS_REAL_CACHE[m.group(1)] = (mp.group(1), prov_model.get(mp.group(1), mp.group(1)))
+        except Exception:
+            _ALIAS_REAL_CACHE["__err__"] = (None, None)
+    return _ALIAS_REAL_CACHE.get(alias, (None, None))
 
 
 def classify_registry(kind: str) -> str:
@@ -336,11 +387,33 @@ def _verify_commit(workspace, sha):
     return r.returncode == 0
 
 
+COMMIT_MANDATORY_PREFIXES = ("feat:", "fix:", "argonaut:", "riskyeats:", "riskybiz:")
+
+
+def _ensure_origin(path, subdir):
+    """Set origin from ~/.zeroclaw/workspace_remotes.json {subdir:url} (untracked,
+    token-bearing) so worker commits can push. No token in code (directive 14)."""
+    try:
+        import json as _json
+        _remotes = _json.load(open(os.path.expanduser("~/.zeroclaw/workspace_remotes.json")))
+    except Exception:
+        return
+    _url = _remotes.get(subdir)
+    if not _url:
+        return
+    _cur = _git(path, "remote", "get-url", "origin", timeout=5)
+    if _cur.returncode != 0:
+        _git(path, "remote", "add", "origin", _url, timeout=5)
+    elif _cur.stdout.strip() != _url:
+        _git(path, "remote", "set-url", "origin", _url, timeout=5)
+
+
 def _ensure_workspace(subdir, git_url, kind):
     path = WORKSPACE_ROOT / subdir
     git_dir = path / ".git"
     if git_dir.is_dir():
         _git(path, "fetch", "--quiet", "--all", timeout=60)
+        _ensure_origin(path, subdir)
         return path, None
     if git_url is None:
         path.mkdir(parents=True, exist_ok=True)
@@ -352,6 +425,7 @@ def _ensure_workspace(subdir, git_url, kind):
             return None, f"git_init_failed:{r.stderr[:200]}"
         _git(path, "config", "user.name",  "Jason Perlow", timeout=5)
         _git(path, "config", "user.email", "jperlow@gmail.com", timeout=5)
+        _ensure_origin(path, subdir)
         log.info("created local git workspace: kind=%s path=%s", kind, path)
         return path, None
     log.info("first-use clone: kind=%s url=%s → %s", kind, git_url, path)
@@ -577,6 +651,11 @@ def process_job(urn, job):
             # Stop on success (commit or clean answer) or a non-retryable fail.
             result = None
             for idx, alias in enumerate(chain):
+                # KHM: skip a cooled-down (known-dead) alias unless it is the
+                # last option left (always keep a fallback to dispatch *something*).
+                if _alias_cooled(alias) and idx < len(chain) - 1:
+                    log.info("  skip alias=%s (cooldown) — KHM", alias)
+                    continue
                 log.info("  → WSS alias=%s (%d/%d) workspace=%s",
                          alias, idx + 1, len(chain), workspace)
                 result = wss_run(desc, kind, workspace, alias, jid, JOB_TIMEOUT)
@@ -595,6 +674,13 @@ def process_job(urn, job):
                 hard_fail = any(s in blob for s in (
                     "timeout", "unavailable", "all model_providers", "driver_crash",
                     "max tool iterations", "connection refused", "502", "503", "500"))
+                # KHM: hard-fail (bad key/endpoint, NOT throttle) cools the alias
+                # so future jobs skip it; success clears any cooldown.
+                if hard_fail and not throttled and not result.get("commits"):
+                    _ALIAS_COOLDOWN[alias] = time.time() + ALIAS_COOLDOWN_SEC
+                    log.info("  KHM: cooling alias=%s for %ds (hard-fail)", alias, int(ALIAS_COOLDOWN_SEC))
+                elif result.get("commits") or result.get("exit_code") == 0:
+                    _ALIAS_COOLDOWN.pop(alias, None)
                 escalate = (throttled or hard_fail) and not result.get("commits")
                 if result.get("commits") or not escalate or idx == len(chain) - 1:
                     break
@@ -608,6 +694,15 @@ def process_job(urn, job):
                   "commits": [], "files_changed": []}
     result["duration_sec"] = round(time.time() - started, 2)
     result["kind"] = kind
+    # #7066 workaround: stamp TRUE provider/model from the dispatched alias
+    _tried = result.get("alias_tried") or []
+    if _tried:
+        _rp, _rm = _alias_real_provider(_tried[-1])
+        if _rp:
+            result["gateway_provider_reported"] = result.get("gateway_provider")
+            result["gateway_model_reported"] = result.get("gateway_model")
+            result["gateway_provider"] = _rp
+            result["gateway_model"] = _rm
     # --- anti-fake-completion gate: verify real commit + push to remote ---
     commits = result.get("commits") or []
     workspace = result.get("workspace")
@@ -638,13 +733,15 @@ def process_job(urn, job):
         if commits and pushed:
             status = "done"
         elif result.get("exit_code") == 0 and result.get("worker_error") == "no_code_output":
-            # Agent ran cleanly and returned a text answer with no code change
-            # (a question, analysis, or "already fixed — nothing to do"). Not
-            # every repo-scoped job is a code modification, so accept the
-            # answer as done rather than fake-failing it. The fake class this
-            # still catches: a crash / no-workspace / non-zero exit with no
-            # commit -> failed below.
-            status = "done"
+            # Bug-2 fix (2026-06-02): a COMMIT-MANDATORY kind that produced no code
+            # is a FAILURE, not a clean "nothing to do" — fail it so it retries/
+            # escalates instead of minting a fake completion. Other repo kinds
+            # (analysis / already-fixed) still legitimately accept no-commit.
+            if any(kind.startswith(p) for p in COMMIT_MANDATORY_PREFIXES):
+                status = "failed"
+                result.setdefault("error", "no_code_output_on_commit_mandatory_kind")
+            else:
+                status = "done"
         else:
             status = "failed"
             if not commits:
