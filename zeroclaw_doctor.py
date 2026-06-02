@@ -69,7 +69,7 @@ LOOP_WINDOW_SEC = float(os.environ.get("LOOP_WINDOW_SEC", "1800"))   # 30 min
 LOOP_ESCALATE_THRESHOLD = int(os.environ.get("LOOP_ESCALATE_THRESHOLD", "3"))
 # Self-triage scanner config
 SCAN_INTERVAL = float(os.environ.get("SCAN_INTERVAL", "300"))   # seconds between failed-cluster scans
-CLUSTER_THRESHOLD = int(os.environ.get("CLUSTER_THRESHOLD", "3"))  # min failures of same base_kind to trigger a triage
+CLUSTER_THRESHOLD = int(os.environ.get('CLUSTER_THRESHOLD', '1'))  # min failures of same base_kind to trigger a triage
 CLUSTER_WINDOW_SEC = float(os.environ.get("CLUSTER_WINDOW_SEC", "21600"))  # only look at failures in last 6h
 # To avoid re-triaging the same cluster repeatedly, we remember kinds we've already
 # auto-triaged within this rolling window:
@@ -639,7 +639,9 @@ def action_dispatch_codex_fix(codex_task: str | None, parent_job_id: str) -> str
         "description": codex_task,
         "submitter_urn": _urn,
         "parent_job_id": parent_job_id,
-        "eligible_kinds": ["codex"],
+        # gpt-5.3-codex 400s "not supported with ChatGPT account" + codex burns the
+        # scarce $100 OAuth pool -> route the FIX to zeroclaw (open-weight deepseek).
+        "eligible_kinds": ["zeroclaw"],
         "max_cost_tier": "C",
         "priority": 80,
         "required_capabilities": ["code-edit"],
@@ -835,6 +837,16 @@ def _match_known_signature(job: dict, base_kind: str,
             except Exception:
                 result = str(result)
         search_text += " " + str(result)[:3000]
+
+    # Transient gateway/session error (ws-400 / ConnectionClosed) — e.g. a worker
+    # restart severed the WSS mid-job. Release to queue WITHOUT burning codex-cli.
+    _transient = ("ws_exception" in search_text or "ConnectionClosed" in search_text
+                  or "reason_phrase='Bad Request'" in search_text)
+    _structural = any(x in search_text for x in ("Traceback", "SyntaxError",
+                      "no_workspace", "clone_failed", "no_zeroclaw_handler"))
+    if _transient and not _structural:
+        return {"action_type": "release_to_queue", "confidence": 0.9,
+                "reason": "transient ws/gateway error (ws-400/ConnectionClosed) — retry; no LLM"}
 
     for pattern, sig_name in KNOWN_FAILURE_SIGNATURES:
         if not pattern.search(search_text):
@@ -1065,6 +1077,9 @@ def process_triage_job(job: dict) -> dict:
             # (now fixed) or any other worker can reclaim it
             parts.append(action_release_to_queue(
                 job_id, known_action.get("release_eligible_kinds")))
+        elif a == "release_to_queue":
+            parts.append(action_release_to_queue(
+                job_id, known_action.get("release_eligible_kinds")))
         elif a == "escalate":
             parts.append("escalated to human")
             broadcast_doctor_message("doctor.escalate.token_mismatch", {
@@ -1082,7 +1097,7 @@ def process_triage_job(job: dict) -> dict:
             "base_kind": base_kind,
             "failed_count_seen": len(failed),
             "auto_detected": True,
-            "released_to_queue": (a == "dispatch_codex_fix"),
+            "released_to_queue": (a in ("dispatch_codex_fix", "release_to_queue")),
         }
 
     prompt = build_doctor_prompt(job, base_kind, failed, registry, failure_count)
