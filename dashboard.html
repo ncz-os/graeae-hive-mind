@@ -778,7 +778,7 @@ async function refreshResults(){
     card.className='result-card done '+(hasCode?'rc-code':'rc-text');
     const preview=r.summary||r.text||r.output||'(no text result)';
     const prov=r.gateway_model||MODEL_NAMES[r.agent_alias]||r.agent_alias||'';
-    const isCodex=/^codex[:\-]/i.test(j.kind||'')||/codex/i.test(prov)||r.runtime==='codex'||r.via==='codex-cli';
+    const isCodex=/codex/i.test(j.kind||'')||/codex/i.test(prov)||/codex/i.test(r.via||'')||/codex/i.test(r.gateway_provider||'')||r.runtime==='codex';
     let agentType=r.runtime||String(j.kind||'').split(':')[0]||'agent';
     const wkHost=(String(j.claimed_by||'').match(/:zeroclaw:([^:]+):/)||[])[1]||(String(j.claimed_by||'').split(':')[3])||'';
     if(isCodex)agentType='codex';
