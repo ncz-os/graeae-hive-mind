@@ -62,8 +62,18 @@ NONCOMMIT_KIND_PREFIXES = (
 WORKSPACE_ROOT = Path(os.path.expanduser("~/codex-workspace"))
 WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
 
-# Kinds that MUST use codex (scarce resource — opt-in only).
-CODEX_KINDS_PREFIXES = ("codex", "review:", "doctor:codex-fix")
+# Codex = ADVERSARIAL/REVIEW stage only — NOT the implementer (operator
+# 2026-06-02). Implementation/coding runs on the open-weight WSS chains
+# (deepseek/groq/together/xai/gemini); codex is reached only for the
+# review/verify step. These prefixes are the ONLY kinds that may resolve to a
+# codex-led registry: explicit `codex`, adversarial `review:`, and the doctor's
+# `doctor:codex-fix` verify escalation. Coding-ish kinds (fix:/refactor:/perf:/
+# security:/audit:) are DELIBERATELY excluded here so they implement on
+# open-weight and only their review phase touches codex. `codex` itself stays
+# OUT of TIER_CHAINS / MODEL_REGISTRIES general chains (see TIER_CHAINS notes).
+CODEX_REVIEW_KINDS_PREFIXES = ("codex", "review:", "doctor:codex-fix")
+# Back-compat alias (older name); same value — codex is review-only either way.
+CODEX_KINDS_PREFIXES = CODEX_REVIEW_KINDS_PREFIXES
 
 # kind-prefix → (subdir under ~/codex-workspace, git_url-or-None)
 KIND_WORKSPACE_MAP = {

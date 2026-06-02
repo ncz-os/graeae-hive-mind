@@ -32,6 +32,13 @@ Env:
   MAX_SSH_PER_HOUR           3
   MIN_HOST_COOLDOWN          1800 seconds
   DRY_RUN                    "1" to disable real actions (default 0)
+  DOCTOR_TRIAGE_MODEL        diagnose/classify phase model (default deepseek)
+  DOCTOR_REVIEW_MODEL        adversarial-review phase model (default codex)
+  DOCTOR_FIX_MODEL           in-doctor fix phase model (default codex)
+  DOCTOR_OPENWEIGHT_BASE_URL OpenAI-compatible base for non-codex phases
+                             (default https://api.deepseek.com/v1)
+  DOCTOR_OPENWEIGHT_MODEL    model id for the open-weight path (default deepseek-chat)
+  DOCTOR_OPENWEIGHT_API_KEY  key for open-weight path (falls back to config.toml deepseek)
 """
 from __future__ import annotations
 
@@ -67,6 +74,33 @@ SUBMITTER_RUNTIME = "doctor"
 _seen_job_attempts: dict[str, list[float]] = {}
 LOOP_WINDOW_SEC = float(os.environ.get("LOOP_WINDOW_SEC", "1800"))   # 30 min
 LOOP_ESCALATE_THRESHOLD = int(os.environ.get("LOOP_ESCALATE_THRESHOLD", "3"))
+
+# ── Per-phase model selection (2026-06-02) ──
+# The doctor runs in phases; each phase picks its model independently.
+#   triage  = diagnose/classify a failure cluster -> cheap open-weight (deepseek)
+#   review  = adversarial review/verify of a fix  -> codex (its strength)
+#   fix     = implement a code fix                -> codex by default, but the
+#             implementation is normally DISPATCHED to open-weight workers via
+#             action_dispatch_codex_fix(eligible_kinds=["zeroclaw"]); this knob
+#             only governs any in-doctor model call labelled "fix".
+# Value is a model alias: "codex" -> local codex CLI; anything else -> the
+# open-weight OpenAI-compatible path (DOCTOR_OPENWEIGHT_*).
+DOCTOR_TRIAGE_MODEL = os.environ.get("DOCTOR_TRIAGE_MODEL", "deepseek").strip().lower()
+DOCTOR_REVIEW_MODEL = os.environ.get("DOCTOR_REVIEW_MODEL", "codex").strip().lower()
+DOCTOR_FIX_MODEL = os.environ.get("DOCTOR_FIX_MODEL", "codex").strip().lower()
+_PHASE_MODELS = {
+    "triage": DOCTOR_TRIAGE_MODEL,
+    "review": DOCTOR_REVIEW_MODEL,
+    "fix": DOCTOR_FIX_MODEL,
+}
+# Open-weight OpenAI-compatible endpoint used for any non-codex phase model.
+# Defaults to DeepSeek direct (cheap, already keyed in ~/.zeroclaw/config.toml).
+DOCTOR_OPENWEIGHT_BASE_URL = os.environ.get(
+    "DOCTOR_OPENWEIGHT_BASE_URL", "https://api.deepseek.com/v1").rstrip("/")
+DOCTOR_OPENWEIGHT_MODEL = os.environ.get("DOCTOR_OPENWEIGHT_MODEL", "deepseek-chat")
+DOCTOR_OPENWEIGHT_API_KEY = os.environ.get("DOCTOR_OPENWEIGHT_API_KEY", "")
+DOCTOR_OPENWEIGHT_TIMEOUT = int(os.environ.get("DOCTOR_OPENWEIGHT_TIMEOUT", "120"))
+
 # Self-triage scanner config
 SCAN_INTERVAL = float(os.environ.get("SCAN_INTERVAL", "300"))   # seconds between failed-cluster scans
 CLUSTER_THRESHOLD = int(os.environ.get('CLUSTER_THRESHOLD', '1'))  # min failures of same base_kind to trigger a triage
@@ -181,8 +215,10 @@ def register() -> str:
         "host": AGENT_HOST,
         "kind": "doctor",
         "runtime": "doctor",
-        "model": "codex-cli",
-        "provider": "codex",
+        # Per-phase models (2026-06-02): triage model is the doctor's primary
+        # diagnose model; review/fix models surfaced in metadata.phase_models.
+        "model": DOCTOR_TRIAGE_MODEL,
+        "provider": ("codex" if DOCTOR_TRIAGE_MODEL == "codex" else "openai-compatible"),
         "autonomy_level": "autonomous",
         "auth_method": "subscription",
         "capabilities": [
@@ -196,6 +232,7 @@ def register() -> str:
             "session_id": _session_id,
             "dry_run": DRY_RUN,
             "daemon": "zeroclaw_doctor.py",
+            "phase_models": dict(_PHASE_MODELS),
         },
     }
     for attempt in range(1, 11):
@@ -410,18 +447,87 @@ def _invoke_codex_cli(prompt: str) -> tuple[bool, str]:
             pass
 
 
-def invoke_doctor_agent(prompt: str) -> tuple[bool, str]:
-    """Diagnose using only the local Codex CLI tool.
+def _openweight_api_key() -> str:
+    """Resolve the open-weight API key: env override first, else the deepseek
+    key already provisioned in ~/.zeroclaw/config.toml (no extra secret store)."""
+    if DOCTOR_OPENWEIGHT_API_KEY:
+        return DOCTOR_OPENWEIGHT_API_KEY
+    try:
+        cfg = os.path.expanduser("~/.zeroclaw/config.toml")
+        with open(cfg) as f:
+            content = f.read()
+        # First api_key under any [providers.models.deepseek.*] block.
+        m = re.search(
+            r"\[providers\.models\.deepseek\.[^\]]+\][^\[]*?api_key\s*=\s*\"([^\"]+)\"",
+            content, re.DOTALL)
+        if m:
+            return m.group(1)
+    except OSError:
+        pass
+    return ""
 
-    User directive 2026-05-26: use the Codex tool, not direct Anthropic/OpenAI
-    compatible APIs. If Codex cannot run, fail the doctor job visibly instead
-    of silently falling back to another provider."""
-    if not os.path.exists(CODEX_BIN):
-        return False, f"codex binary not found at {CODEX_BIN}"
-    ok, text = _invoke_codex_cli(prompt)
+
+def _invoke_openweight(prompt: str, model_alias: str) -> tuple[bool, str]:
+    """Run a non-codex (open-weight) phase via an OpenAI-compatible chat
+    endpoint. Used for cheap phases like triage classification. Anthropic +
+    Together remain FORBIDDEN per CLAUDE.md — default endpoint is DeepSeek
+    direct. Returns (ok, text) with the same contract as the codex path."""
+    api_key = _openweight_api_key()
+    if not api_key:
+        return False, (f"open-weight model {model_alias!r} requested but no API key "
+                       "(set DOCTOR_OPENWEIGHT_API_KEY or deepseek key in config.toml)")
+    body = {
+        "model": DOCTOR_OPENWEIGHT_MODEL,
+        "messages": [
+            {"role": "system", "content": DOCTOR_SYSTEM},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.0,
+        "stream": False,
+    }
+    url = f"{DOCTOR_OPENWEIGHT_BASE_URL}/chat/completions"
+    data = json.dumps(body).encode()
+    req = urllib.request.Request(
+        url, data=data, method="POST",
+        headers={"content-type": "application/json",
+                 "authorization": f"Bearer {api_key}"})
+    log.info("invoking open-weight model=%s alias=%s prompt_chars=%d",
+             DOCTOR_OPENWEIGHT_MODEL, model_alias, len(prompt))
+    try:
+        with urllib.request.urlopen(req, timeout=DOCTOR_OPENWEIGHT_TIMEOUT) as r:
+            resp = json.loads(r.read())
+        text = (resp.get("choices") or [{}])[0].get("message", {}).get("content", "")
+        if text and text.strip():
+            return True, text.strip()
+        return False, f"open-weight empty response: {str(resp)[:300]}"
+    except urllib.error.HTTPError as e:
+        return False, f"open-weight HTTP {e.code}: {e.read()[:300]!r}"
+    except Exception as e:
+        return False, f"open-weight call failed: {e}"
+
+
+def invoke_doctor_agent(prompt: str, phase: str = "triage") -> tuple[bool, str]:
+    """Run the doctor LLM for a given PHASE using its configured model.
+
+    Phase model is selected via DOCTOR_<PHASE>_MODEL env (see _PHASE_MODELS):
+      - "codex"        -> local Codex CLI (adversarial review's strength)
+      - anything else  -> open-weight OpenAI-compatible path (e.g. deepseek)
+
+    Codex remains the REVIEW/verify model; triage defaults to cheap open-weight.
+    Anthropic/Together stay forbidden. Returns (ok, text); on failure the doctor
+    job fails visibly rather than silently switching providers."""
+    model_alias = _PHASE_MODELS.get(phase, DOCTOR_TRIAGE_MODEL)
+    if model_alias == "codex":
+        if not os.path.exists(CODEX_BIN):
+            return False, f"codex binary not found at {CODEX_BIN}"
+        ok, text = _invoke_codex_cli(prompt)
+        if ok and text.strip():
+            return True, text
+        return False, f"codex CLI failed: {text}"
+    ok, text = _invoke_openweight(prompt, model_alias)
     if ok and text.strip():
         return True, text
-    return False, f"codex CLI failed: {text}"
+    return False, f"open-weight ({model_alias}) failed: {text}"
 
 
 _CODE_FENCE_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE)
@@ -1102,7 +1208,10 @@ def process_triage_job(job: dict) -> dict:
 
     prompt = build_doctor_prompt(job, base_kind, failed, registry, failure_count)
 
-    ok, text = invoke_doctor_agent(prompt)
+    # Diagnose = triage phase (cheap open-weight by default). The doctor emits a
+    # JSON action; any code FIX is dispatched to open-weight workers, and
+    # adversarial REVIEW of that fix runs on codex (DOCTOR_REVIEW_MODEL).
+    ok, text = invoke_doctor_agent(prompt, phase="triage")
     if not ok:
         return {
             "exit_code": 2,
