@@ -2885,14 +2885,33 @@ async def knemon_route(req: Request):
         max_tier = "C"
     kind = str(body.get("kind") or "")
     cands = knemon_candidates(max_tier, kind)
+    open_weight_chain = [c["alias"] for c in cands]
+    # ── KNEMON sub-bucket dispatch (operator 2026-06-02): openai_codex sub is $0;
+    # gpt-5.3/5.4 unlimited. Lead EVERY job with the right codex/gpt agent, then
+    # fall back to metered open-weights. Job class -> served model:
+    #   review/adversarial -> hive_codex (codex-auto-review)
+    #   heavy (architecture/design/heavy:) -> hive_gpt_heavy (gpt-5.5, limited)
+    #   light/narrow (triage/docs/investigation) -> hive_gpt_mini (gpt-5.4-mini)
+    #   everything else (coding default) -> hive_gpt (gpt-5.4)
+    kl = kind.lower()
+    if any(kl.startswith(p) for p in ("review:", "codex", "doctor:codex-fix", "adversarial")):
+        CODEX_SUB_LEAD = ["hive_codex"]
+    elif any(t in kl for t in ("architecture", "design")) or kl.startswith("heavy:"):
+        CODEX_SUB_LEAD = ["hive_gpt_heavy"]
+    elif any(kl.startswith(p) for p in ("triage", "docs:", "investigation")):
+        CODEX_SUB_LEAD = ["hive_gpt_mini"]
+    else:
+        CODEX_SUB_LEAD = ["hive_gpt"]
+    chain = CODEX_SUB_LEAD + [a for a in open_weight_chain if a not in CODEX_SUB_LEAD]
     return {
         "ok": True,
         "max_cost_tier": max_tier,
         "kind": kind,
-        # alias chain shaped like the worker's local TIER_CHAINS values
-        "chain": [c["alias"] for c in cands],
+        "sub_lead": CODEX_SUB_LEAD,
+        # codex/gpt sub agent first ($0 unlimited), metered open-weights as fallback
+        "chain": chain,
         "candidates": cands,
-        "convention": "A=cheap/free, B=mid, C=premium; max_cost_tier is the ceiling",
+        "convention": "openai_codex sub leads ($0); open-weights fallback; A=cheap..C=premium ceiling",
     }
 
 
