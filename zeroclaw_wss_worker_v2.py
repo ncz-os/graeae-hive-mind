@@ -195,17 +195,35 @@ def _alias_cooled(alias: str) -> bool:
 # cost to the true provider, not openai. Remove once a build with #7066 ships.
 _ALIAS_REAL_CACHE = {}
 def _alias_real_provider(alias):
+    """Resolve a hive alias -> (provider_family, model) from the daemon's REAL
+    config so completion PATCHes attribute cost to the provider that actually
+    ran the job (deepseek/groq/together/xai/gemini/siliconflow/bedrock), not the
+    worker's registration default. Reads the central config-dir the daemon loads
+    first, then the legacy ~/.zeroclaw path. Returns the provider FAMILY (the
+    part before the '.' in model_provider, e.g. "deepseek" from "deepseek.v4_pro")
+    which is what KNEMON cost-stats group + price on."""
     if not _ALIAS_REAL_CACHE:
+        cfg = None
+        for _p in ("/etc/nclawzero/zeroclaw/config.toml",
+                   os.path.expanduser("~/.zeroclaw/config.toml")):
+            try:
+                cfg = open(_p).read(); break
+            except Exception:
+                continue
         try:
-            cfg = open(os.path.expanduser("~/.zeroclaw/config.toml")).read()
             prov_model = {}
-            for m in re.finditer(r"\[providers\.models\.([a-z0-9_.]+)\]\n((?:(?!\[).*\n)*)", cfg):
-                mm = re.search(r"^model = \"([^\"]+)\"", m.group(2), re.M)
-                prov_model[m.group(1)] = mm.group(1) if mm else m.group(1)
-            for m in re.finditer(r"\[agents\.([a-z0-9_]+)\]\n((?:(?!\[).*\n)*)", cfg):
-                mp = re.search(r"model_provider = \"([^\"]+)\"", m.group(2))
-                if mp:
-                    _ALIAS_REAL_CACHE[m.group(1)] = (mp.group(1), prov_model.get(mp.group(1), mp.group(1)))
+            if cfg:
+                for m in re.finditer(r"\[providers\.models\.([a-z0-9_.]+)\]\n((?:(?!\[).*\n)*)", cfg):
+                    mm = re.search(r"^model = \"([^\"]+)\"", m.group(2), re.M)
+                    prov_model[m.group(1)] = mm.group(1) if mm else m.group(1)
+                for m in re.finditer(r"\[agents\.([a-z0-9_]+)\]\n((?:(?!\[).*\n)*)", cfg):
+                    mp = re.search(r"model_provider = \"([^\"]+)\"", m.group(2))
+                    if mp:
+                        prof = mp.group(1)                 # e.g. "deepseek.v4_pro"
+                        family = prof.split(".", 1)[0]     # cost/display key: "deepseek"
+                        _ALIAS_REAL_CACHE[m.group(1)] = (family, prov_model.get(prof, prof))
+            if not _ALIAS_REAL_CACHE:
+                _ALIAS_REAL_CACHE["__err__"] = (None, None)
         except Exception:
             _ALIAS_REAL_CACHE["__err__"] = (None, None)
     return _ALIAS_REAL_CACHE.get(alias, (None, None))

@@ -983,7 +983,13 @@ def rate_for(provider: str, model: str) -> tuple[float, float]:
     return (1.0, 5.0)  # conservative fallback
 
 
+SUBSCRIPTION_PROVIDERS = {"openai", "codex", "codex-oauth", "codex-cli", "gpt", "chatgpt"}
+
+
 def estimate_cost(provider: str, model: str, tokens_in: int, tokens_out: int) -> float:
+    # openai + codex = ONE flat ChatGPT Pro subscription ($100/mo), NOT metered.
+    if (provider or "").lower() in SUBSCRIPTION_PROVIDERS:
+        return 0.0
     in_rate, out_rate = rate_for(provider, model)
     return round((tokens_in / 1_000_000) * in_rate + (tokens_out / 1_000_000) * out_rate, 6)
 
