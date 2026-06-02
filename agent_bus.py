@@ -2788,6 +2788,132 @@ async def cost_stats(since_hours: int = 168, group_by: str = "provider"):
     return {"since_hours": since_hours, "group_by": group_by, "totals": totals, "buckets": rows}
 
 
+# ── KNEMON COST-AWARE ROUTER (2026-06-02) ────────────────────────────────────
+# Deterministic, no external calls. Given a job's budget ceiling (max_cost_tier
+# or tier) + kind, return an ordered list of provider/model candidates that fit
+# the budget, cheapest-acceptable FIRST, then escalate.
+#
+# COST-TIER CONVENTION (authoritative, from PROVIDER_COST_TIER above):
+#   A = FREE/cheap-local   B = MID (cheap paid)   C = PREMIUM/reserve
+#   COST_TIERS = ["A","B","C"]  ordered cheap -> expensive.
+# `max_cost_tier` is the CEILING (most-expensive tier permitted). A job with
+# max_cost_tier="C" may use A/B/C providers; "B" -> A/B; "A" -> A only.
+# This matches the dequeue semantics + the operator intent ("generous budget =>
+# premium allowed; constrained budget => cheap only"). NOTE: the task brief
+# described A=premium which is INVERTED from the code; the code convention wins.
+#
+# Working provider set (operator 2026-06-01): deepseek/groq/together/xai/gemini/
+# siliconflow. EXCLUDED: codex (review-only, scarce OAuth pool), nvidia (Spark-
+# only, not integrated). Each entry: provider, model, worker alias, $/1M-out
+# (used only as the deterministic cheapest-first sort key).
+#
+# alias = the hive_* agent alias the wss worker dispatches to (gateway maps it
+# to provider+model). Returned so the worker can consume a chain shaped exactly
+# like its local TIER_CHAINS values.
+KNEMON_PROVIDERS: list[dict[str, Any]] = [
+    # provider,         model,                 alias,                  in,    out
+    {"provider": "groq",      "model": "gpt-oss-20b",          "alias": "hive_groq_1",        "tier": "B"},
+    {"provider": "gemini",    "model": "gemini-2.5-flash-lite","alias": "hive_gemini_1",      "tier": "B"},
+    {"provider": "siliconflow","model": "qwen2.5-coder-32b",   "alias": "hive_siliconflow_1", "tier": "B"},
+    {"provider": "deepseek-direct","model": "deepseek-v4-flash","alias": "hive_deepseek_1",   "tier": "B"},
+    {"provider": "together",  "model": "minimax-m2.7",         "alias": "hive_together_1",    "tier": "B"},
+    {"provider": "xai",       "model": "grok-4.1-fast",        "alias": "hive_xai_1",         "tier": "B"},
+    {"provider": "deepseek-direct","model": "deepseek-v4-pro", "alias": "hive_deepseek_pro_1","tier": "B"},
+]
+
+
+def knemon_candidates(max_tier: str, kind: str = "") -> list[dict[str, Any]]:
+    """Ordered provider/model candidates within budget, cheapest-acceptable first.
+
+    Cheapest-first is keyed on the per-provider/model OUTPUT rate from LLM_RATES
+    (output dominates code-gen spend), then input rate, then provider name for a
+    stable deterministic tie-break. Providers whose cost tier exceeds the budget
+    ceiling are excluded.
+    """
+    ceiling_idx = COST_TIERS.index(max_tier) if max_tier in COST_TIERS else len(COST_TIERS) - 1
+    out: list[dict[str, Any]] = []
+    for p in KNEMON_PROVIDERS:
+        # Effective cost tier is the per-entry, MODEL-SPECIFIC tier hint
+        # (e.g. gemini-flash-lite=B even though PROVIDER_COST_TIER['gemini']=C,
+        # which is the gemini-PRO tier; siliconflow isn't in the static map at
+        # all -> defaults to C). The static provider tier is only a fallback
+        # when an entry omits its hint. This keeps cheap model variants from
+        # being wrongly excluded under a tight budget.
+        eff_tier = (p.get("tier") or cost_tier_for(p["provider"])).upper()
+        if eff_tier not in COST_TIERS:
+            eff_tier = cost_tier_for(p["provider"])
+        if COST_TIERS.index(eff_tier) > ceiling_idx:
+            continue
+        in_rate, out_rate = rate_for(p["provider"], p["model"])
+        out.append({
+            "provider": p["provider"],
+            "model": p["model"],
+            "alias": p["alias"],
+            "cost_tier": eff_tier,
+            "rate_in_per_1m": in_rate,
+            "rate_out_per_1m": out_rate,
+        })
+    out.sort(key=lambda c: (c["rate_out_per_1m"], c["rate_in_per_1m"], c["provider"]))
+    return out
+
+
+@app.post("/v1/knemon/route")
+async def knemon_route(req: Request):
+    """Cost-aware routing. POST {max_cost_tier|tier, kind} -> ordered candidate
+    list (cheapest-acceptable first) + the alias chain the worker can consume.
+    Deterministic, no external calls, no DB write."""
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    raw_tier = (body.get("max_cost_tier") or body.get("tier") or "C")
+    max_tier = str(raw_tier).upper()
+    if max_tier not in COST_TIERS:
+        max_tier = "C"
+    kind = str(body.get("kind") or "")
+    cands = knemon_candidates(max_tier, kind)
+    return {
+        "ok": True,
+        "max_cost_tier": max_tier,
+        "kind": kind,
+        # alias chain shaped like the worker's local TIER_CHAINS values
+        "chain": [c["alias"] for c in cands],
+        "candidates": cands,
+        "convention": "A=cheap/free, B=mid, C=premium; max_cost_tier is the ceiling",
+    }
+
+
+@app.get("/v1/knemon/spend")
+async def knemon_spend(since_hours: int = 168):
+    """Total estimated spend over a window (visibility companion to the router)."""
+    # clamp window to a sane range (1h .. 1 year) so a pathological value
+    # cannot produce a nonsense cutoff.
+    try:
+        since_hours = max(1, min(int(since_hours), 24 * 366))
+    except (TypeError, ValueError):
+        since_hours = 168
+    cutoff = time.time() - since_hours * 3600
+    async with connect_db() as db:
+        async with db.execute(
+            "SELECT COUNT(*), ROUND(SUM(COALESCE(estimated_cost_usd,0)),4), "
+            "SUM(COALESCE(tokens_in,0)), SUM(COALESCE(tokens_out,0)) "
+            "FROM jobs WHERE ended_at IS NOT NULL AND ended_at >= ? "
+            "AND estimated_cost_usd IS NOT NULL",
+            (cutoff,),
+        ) as cur:
+            r = await cur.fetchone()
+    return {
+        "since_hours": since_hours,
+        "jobs_with_cost": (r[0] or 0) if r else 0,
+        "estimated_cost_usd": (r[1] or 0.0) if r else 0.0,
+        "tokens_in": (r[2] or 0) if r else 0,
+        "tokens_out": (r[3] or 0) if r else 0,
+    }
+
+
+
 @app.get("/v1/jobs/metrics")
 async def job_metrics():
     counts = {"pending": 0, "running": 0, "completed": 0, "failed": 0, "total": 0}
