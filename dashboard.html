@@ -162,6 +162,11 @@ small.dim{font-size:.85em}
   th:nth-child(5),td:nth-child(5){display:none}
   .worker-grid{grid-template-columns:1fr}
 }
+
+/* completion type coloring + model badge (operator 2026-06-02) */
+.result-card.rc-code{border-left:3px solid #2ea043}
+.result-card.rc-text{border-left:3px solid #58a6ff}
+.rc-model{background:#262d36;border:1px solid #3a4250;border-radius:10px;padding:.05em .5em;font-size:.7em;color:#d2a8ff;font-weight:600}
 </style>
 </head>
 <body>
@@ -710,6 +715,7 @@ async function refreshRealWork(){
   } catch(e) { console.warn('realwork err', e); }
 }
 
+const MODEL_NAMES={hive_deepseek_pro_2:'deepseek-v4-pro',hive_deepseek_pro_3:'deepseek-v4-pro',hive_deepseek_pro_4:'deepseek-v4-pro',hive_deepseek_pro_5:'deepseek-v4-pro',hive_deepseek_pro_6:'deepseek-v4-pro',hive_deepseek_pro_7:'deepseek-v4-pro',hive_deepseek_pro_8:'deepseek-v4-pro',hive_deepseek_3:'deepseek-v4-flash',hive_deepseek_4:'deepseek-v4-flash',hive_deepseek_5:'deepseek-v4-flash',hive_deepseek_6:'deepseek-v4-flash',hive_deepseek_7:'deepseek-v4-flash',hive_deepseek_8:'deepseek-v4-flash',hive_groq_8b:'llama-3.1-8b',hive_groq_2:'qwen3-32b',hive_groq_3:'gpt-oss-120b',hive_groq_4:'llama-4-scout',hive_groq_5:'llama-3.3-70b',hive_groq_6:'llama-3.3-70b',hive_groq_7:'llama-3.3-70b',hive_groq_8:'llama-3.3-70b',hive_groq_1:'gpt-5.3-codex',hive_xai_1:'gpt-5.3-codex',hive_nvidia_1:'gpt-5.3-codex',hive_siliconflow_3:'qwen3-coder-30b',hive_siliconflow_8:'deepseek-v4-pro(sf)',hive_nvidia_2:'nemotron-120b',hive_nvidia_5:'qwen3-coder-480b',hive_nvidia_6:'qwen3-coder-480b',hive_nvidia_7:'qwen3-coder-480b',hive_nvidia_8:'qwen3-coder-480b',hive_together_2:'kimi-k2.6'};
 async function refreshResults(){
   const d=await api('GET','/v1/jobs?status=done&limit=20');
   const jobs=(d.jobs||[]).sort((a,b)=>(b.ended_at||0)-(a.ended_at||0));
@@ -720,14 +726,17 @@ async function refreshResults(){
   if(!jobs.length){el.innerHTML='<div class="dim" style="font-size:.82em;padding:.3em">No completed jobs yet</div>';return;}
   for(const j of jobs.slice(0,15)){
     const card=document.createElement('div');
-    card.className='result-card done';
     const r=j.result||{};
+    const hasCode=r.commits&&r.commits.length;
+    card.className='result-card done '+(hasCode?'rc-code':'rc-text');
     const preview=r.summary||r.text||r.output||'(no text result)';
-    const commits=r.commits&&r.commits.length?`<div style="font-size:.74em;color:#7ee787;margin-top:.2em">commits: ${esc(r.commits.slice(0,3).join(', '))}</div>`:'';
+    const prov=r.gateway_model||MODEL_NAMES[r.agent_alias]||r.agent_alias||'';
+    const commits=hasCode?`<div style="font-size:.74em;color:#7ee787;margin-top:.2em">commits: ${esc(r.commits.slice(0,3).join(', '))}</div>`:'';
     card.innerHTML=`
       <div class="rc-head">
         <span class="rc-kind">${esc(j.kind)}</span>
         <span class="${badgeCls(j.status)}">${esc(j.status)}</span>
+        ${prov?`<span class="rc-model" title="model/provider that did this job">${esc(prov)}</span>`:''}
         <span class="rc-id">${esc(j.id.slice(0,10))}</span>
         <span class="dim" style="font-size:.75em;margin-left:auto">${relTime(j.ended_at)}</span>
       </div>

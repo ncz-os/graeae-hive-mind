@@ -7,7 +7,7 @@ Claims triage:* jobs from the hive queue and processes them by invoking
 the local Codex CLI tool through ChatGPT subscription auth.
 
 Doctor authority (GRAEAE-validated consultation 2026-05-26):
-  • Read /srv/agent-bus/agents.db directly to gather failed-job context.
+  • Read hive bus HTTP API to gather failed-job context.
   • Run codex exec with structured prompt requesting JSON action.
   • Execute allowlisted playbook actions: restart_service | resubmit_jobs |
     cancel_jobs | dispatch_codex_fix | no_action | escalate.
@@ -26,7 +26,6 @@ Env:
   ZEROCLAW_BIN               /usr/local/bin/zeroclaw
   DOCTOR_AGENT_ALIAS         hive_doctor (must exist in ~/.zeroclaw/config.toml)
   AGENT_HOST                 PYTHIA
-  HIVE_DB_PATH               /srv/agent-bus/agents.db
   POLL_INTERVAL              30 seconds idle wait
   HEARTBEAT_INTERVAL         15 seconds
   ZEROCLAW_TIMEOUT           900 seconds per LLM call
@@ -55,7 +54,6 @@ HIVE_URL = os.environ.get("HIVE_URL", "http://192.168.207.67:5005")
 ZEROCLAW_BIN = os.environ.get("ZEROCLAW_BIN", "/usr/local/bin/zeroclaw")
 DOCTOR_AGENT_ALIAS = os.environ.get("DOCTOR_AGENT_ALIAS", "hive_doctor")
 AGENT_HOST = os.environ.get("AGENT_HOST", socket.gethostname().split(".")[0])
-HIVE_DB_PATH = os.environ.get("HIVE_DB_PATH", "/srv/agent-bus/agents.db")
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "30"))
 HEARTBEAT_INTERVAL = float(os.environ.get("HEARTBEAT_INTERVAL", "15"))
 ZEROCLAW_TIMEOUT = int(os.environ.get("ZEROCLAW_TIMEOUT", "900"))
@@ -77,6 +75,35 @@ CLUSTER_WINDOW_SEC = float(os.environ.get("CLUSTER_WINDOW_SEC", "21600"))  # onl
 # auto-triaged within this rolling window:
 _recent_auto_triage: dict[str, float] = {}
 AUTO_TRIAGE_COOLDOWN = float(os.environ.get("AUTO_TRIAGE_COOLDOWN", "3600"))  # 1h per base_kind
+
+# ── Token-mismatch auto-fix (2026-05-27) ──
+# When a worker fails with "no token for host" because its gateway-tokens.json
+# 127.0.0.1 entry drifted away from the gateway's paired_tokens, the doctor
+# auto-dispatches a codex fix without burning an LLM call.
+# Rate-limit: max 3 fixes per host per hour to avoid loops.
+_token_fix_attempts: dict[str, list[float]] = {}
+MAX_TOKEN_FIX_PER_HOST = int(os.environ.get("MAX_TOKEN_FIX_PER_HOST", "3"))
+TOKEN_FIX_WINDOW_SEC = float(os.environ.get("TOKEN_FIX_WINDOW_SEC", "3600"))  # 1 hour
+FLEET_LAN_TOKEN = os.environ.get("FLEET_LAN_TOKEN", "fleet-lan-token-2026-05-26")
+# Known failure signatures → automatic dispatch (no LLM needed)
+KNOWN_FAILURE_SIGNATURES: list[tuple[re.Pattern, str]] = [
+    (re.compile(r'no token for host', re.IGNORECASE), 'token_mismatch'),
+    (re.compile(r'pair gateway first via POST /pair', re.IGNORECASE), 'token_mismatch'),
+    (re.compile(r'gateway.*unauthorized.*token', re.IGNORECASE), 'token_mismatch'),
+]
+# Full fleet including Mac hosts (ULTRA, STUDIO) and sshpass hosts (MEDUSA, HYDRA)
+ALL_FLEET_HOSTS: dict[str, dict] = {
+    "ultra":    {"ip": "192.168.207.60", "os": "macos",   "auth": "passwordless", "user": "jasonperlow"},
+    "studio":   {"ip": "192.168.207.10", "os": "macos",   "auth": "passwordless", "user": "jasonperlow"},
+    "medusa":   {"ip": "192.168.207.64", "os": "linux",   "auth": "sshpass",      "user": "jasonperlow"},
+    "hydra":    {"ip": "192.168.207.78", "os": "linux",   "auth": "sshpass",      "user": "jasonperlow"},
+    "cerberus": {"ip": "192.168.207.96", "os": "linux",   "auth": "passwordless", "user": "jasonperlow"},
+    "proteus":  {"ip": "192.168.207.25", "os": "linux",   "auth": "passwordless", "user": "jasonperlow"},
+    "bigpi":    {"ip": "192.168.207.65", "os": "linux",   "auth": "passwordless", "user": "jasonperlow"},
+    "clawpi":   {"ip": "192.168.207.54", "os": "linux",   "auth": "passwordless", "user": "jasonperlow"},
+    "zeropi":   {"ip": "192.168.207.56", "os": "linux",   "auth": "passwordless", "user": "jasonperlow"},
+    "typhon":   {"ip": "192.168.207.61", "os": "linux",   "auth": "passwordless", "user": "jasonperlow"},
+}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -161,7 +188,7 @@ def register() -> str:
         "capabilities": [
             "triage", "diagnose", "fix-agents", "fix-code",
             "dispatch-codex", "resubmit-jobs", "restart-services",
-            "db-read", "db-introspect",
+            "bus-http-read", "bus-http-write",
         ],
         "version": "zeroclaw-doctor/1.0",
         "metadata": {
@@ -213,8 +240,8 @@ def patch_job(job_id: str, status: str, result: dict | None = None):
 
 
 # ───────────────────────── Failure context (HTTP API) ─────────────────────────
-# Note: direct SQLite RO read is blocked by WAL-mode shm requirements (the bus
-# user owns the file). We use the HTTP API instead — same data, no lock impact.
+# Use the bus HTTP API for job context so the doctor stays behind the same
+# queue contract as the rest of the fleet.
 def fetch_failed_jobs_for_kind(base_kind: str, limit: int = 10) -> list[dict]:
     """Recent failed jobs whose kind starts with base_kind, newest first."""
     code, resp = _http("GET", "/v1/jobs?status=failed&limit=200", timeout=15.0)
@@ -625,6 +652,240 @@ def action_dispatch_codex_fix(codex_task: str | None, parent_job_id: str) -> str
     return f"codex submit FAILED code={code} resp={str(resp)[:200]}"
 
 
+# ── Token-mismatch auto-fix (2026-05-27) ──
+def _extract_host_from_job(job: dict, failed_jobs: list[dict]) -> str:
+    """Extract offending hostname from URN patterns in claimed_by or kind fields.
+    URN format: urn:agent:<kind>:<host>:<session_id>"""
+    # Check the triage job itself
+    for field in ("claimed_by", "submitter_urn"):
+        val = job.get(field) or ""
+        m = re.search(r'urn:agent:\w+:(\w+)', val)
+        if m:
+            return m.group(1).lower()
+    # Check recent failed jobs
+    for fj in failed_jobs[:10]:
+        for field in ("claimed_by", "submitter_urn"):
+            val = fj.get(field) or ""
+            m = re.search(r'urn:agent:\w+:(\w+)', val)
+            if m:
+                return m.group(1).lower()
+    # Try extracting from kind (e.g. "zeroclaw[ULTRA]")
+    kind = job.get("kind") or ""
+    m = re.search(r'\[(\w+)\]', kind)
+    if m:
+        return m.group(1).lower()
+    return ""
+
+
+def _check_token_fix_rate_limit(host: str) -> bool:
+    """True if we're under the rate limit for this host. False = blocked."""
+    now = time.time()
+    attempts = _token_fix_attempts.setdefault(host.lower(), [])
+    attempts[:] = [t for t in attempts if (now - t) <= TOKEN_FIX_WINDOW_SEC]
+    return len(attempts) < MAX_TOKEN_FIX_PER_HOST
+
+
+def _record_token_fix_attempt(host: str):
+    now = time.time()
+    _token_fix_attempts.setdefault(host.lower(), []).append(now)
+
+
+def _build_token_fix_codex_task(offending_host: str) -> str:
+    """Build an imperative codex task to fix gateway token mismatch on a host.
+    Includes OS detection, auth method selection, and health-check verification."""
+    host_info = ALL_FLEET_HOSTS.get(offending_host.lower(), {})
+    ip = host_info.get("ip", offending_host)
+    os_type = host_info.get("os", "linux")
+    auth = host_info.get("auth", "passwordless")
+    user = host_info.get("user", "jasonperlow")
+    host_upper = offending_host.upper()
+
+    # Build SSH command prefix based on auth method
+    if auth == "sshpass":
+        password_var = f"{offending_host.upper()}_SSH_PASSWORD"
+        ssh_prefix = (
+            f'PASSWORD="${{{password_var}:-$DOCTOR_SSH_PASSWORD}}"; '
+            f'if [ -n "$PASSWORD" ]; then '
+            f'sshpass -p "$PASSWORD" ssh -o PubkeyAuthentication=no '
+            f'-o StrictHostKeyChecking=no -o ConnectTimeout=10 {user}@{ip}; '
+            f'else ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 {user}@{ip}; fi'
+        )
+    else:
+        ssh_prefix = f'ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 {user}@{ip}'
+
+    # Build restart commands based on OS
+    if os_type == "macos":
+        restart_gateway = (
+            f'launchctl bootout gui/$(id -u {user}) '
+            f'~/Library/LaunchAgents/com.zeroclaw.gateway.plist 2>/dev/null || true; '
+            f'sleep 1; '
+            f'launchctl bootstrap gui/$(id -u {user}) '
+            f'~/Library/LaunchAgents/com.zeroclaw.gateway.plist'
+        )
+        restart_worker = (
+            f'pkill -f zeroclaw-wss-worker 2>/dev/null || true; '
+            f'sleep 1; '
+            f'nohup ~/zeroclaw-wss-worker &>/dev/null &'
+        )
+        restart_cmd = f'{restart_gateway}; {restart_worker}'
+    else:
+        restart_cmd = 'sudo systemctl restart zeroclaw-gateway; for i in 1 2 3 4; do sudo systemctl restart zeroclaw-wss-worker@$i; done'
+
+    return f"""FLEET INFRA FIX: Gateway token mismatch on {offending_host} ({ip}, {os_type} via {auth})
+
+DIAGNOSIS: Worker on {offending_host} is failing with 'no token for host' / 'pair gateway first via POST /pair'.
+The gateway-tokens.json 127.0.0.1 entry has drifted from the gateway's paired_tokens in config.toml.
+
+FLEET LAN TOKEN: {FLEET_LAN_TOKEN}
+
+FIX STEPS — execute in order via SSH to {offending_host} ({ip}):
+
+STEP 1 — SSH to host:
+  {ssh_prefix}
+
+STEP 2 — Fix gateway-tokens.json (MUST have both 127.0.0.1 AND hostname entries):
+  cat > /tmp/gateway-tokens-fix.json << 'TOKENS_EOF'
+{{
+  "127.0.0.1": "{FLEET_LAN_TOKEN}",
+  "{host_upper}": "{FLEET_LAN_TOKEN}"
+}}
+TOKENS_EOF
+  # Merge with existing entries (preserve other host tokens already in file)
+  python3 -c "
+import json, sys
+with open('/tmp/gateway-tokens-fix.json') as f:
+    new = json.load(f)
+try:
+    with open(os.path.expanduser('~/.zeroclaw/gateway-tokens.json')) as f:
+        old = json.load(f)
+except Exception:
+    old = {{}}
+old.update(new)
+with open(os.path.expanduser('~/.zeroclaw/gateway-tokens.json'), 'w') as f:
+    json.dump(old, f, indent=2)
+print('gateway-tokens.json updated')
+"
+  # Verify: cat ~/.zeroclaw/gateway-tokens.json
+
+STEP 3 — Fix config.toml [gateway] paired_tokens:
+  python3 -c "
+import sys, os
+path = os.path.expanduser('~/.zeroclaw/config.toml')
+with open(path) as f:
+    content = f.read()
+# Ensure [gateway] section exists with paired_tokens
+if '[gateway]' not in content:
+    content += '\\n[gateway]\\npaired_tokens = [\\'{FLEET_LAN_TOKEN}\\']\\n'
+elif 'paired_tokens' not in content.split('[gateway]')[1].split('[')[0] if '[gateway]' in content else '':
+    content = content.replace('[gateway]', '[gateway]\\npaired_tokens = [\\'{FLEET_LAN_TOKEN}\\']')
+else:
+    import re
+    content = re.sub(
+        r'paired_tokens\\s*=\\s*\\[.*?\\]',
+        'paired_tokens = [\\'{FLEET_LAN_TOKEN}\\']',
+        content
+    )
+with open(path, 'w') as f:
+    f.write(content)
+print('config.toml updated')
+"
+
+STEP 4 — Restart services:
+  {restart_cmd}
+
+STEP 5 — Verify health (CRITICAL — must return paired:true):
+  for attempt in 1 2 3 4 5; do
+    result=$(curl -s -m 5 http://127.0.0.1:42617/health 2>/dev/null)
+    if echo "$result" | grep -q '"paired":true'; then
+      echo "HEALTH CHECK PASSED: $result"
+      break
+    fi
+    echo "attempt $attempt: paired not yet true, waiting..."
+    sleep 2
+  done
+  if ! echo "$result" | grep -q '"paired":true'; then
+    echo "CRITICAL: health check FAILED after fix — escalate to human"
+    exit 1
+  fi
+
+CONSTRAINTS (READ CAREFULLY):
+- DO NOT touch ~/.codex/auth.json or ~/.api_keys_master.json under ANY circumstance.
+- Use sshpass with PubkeyAuthentication=no for MEDUSA and HYDRA.
+- Mac hosts (ULTRA, STUDIO) use launchctl + nohup, NOT systemctl.
+- Linux hosts use systemctl.
+- If ANY step fails, report the exact error and escalate."""
+
+
+def _match_known_signature(job: dict, base_kind: str,
+                           failed: list[dict]) -> dict | None:
+    """Check if the triage job or its associated failures match a known,
+    auto-fixable signature. Returns an action dict (bypassing the LLM)
+    or None if no signature matches.
+
+    Current signatures:
+      - token_mismatch: 'no token for host' / 'pair gateway first via POST /pair'
+    """
+    # Build searchable text from job description + failed-job results
+    search_text = (job.get("description") or "")[:10000]
+    for fj in failed[:8]:
+        result = fj.get("result") or ""
+        if isinstance(result, dict):
+            try:
+                result = json.dumps(result)
+            except Exception:
+                result = str(result)
+        search_text += " " + str(result)[:3000]
+
+    for pattern, sig_name in KNOWN_FAILURE_SIGNATURES:
+        if not pattern.search(search_text):
+            continue
+
+        offending_host = _extract_host_from_job(job, failed)
+        if not offending_host:
+            log.info("signature matched '%s' but could not extract host — "
+                     "falling through to LLM diagnosis", sig_name)
+            return None
+
+        # Check rate limit
+        if not _check_token_fix_rate_limit(offending_host):
+            count = len(_token_fix_attempts.get(offending_host.lower(), []))
+            log.warning("token-fix rate cap reached for %s (%d in %ds) — escalating",
+                        offending_host, count, int(TOKEN_FIX_WINDOW_SEC))
+            return {
+                "action_type": "escalate",
+                "confidence": 1.0,
+                "reason": (
+                    f"token-fix rate-limit: {count} fixes dispatched for "
+                    f"{offending_host} in last {int(TOKEN_FIX_WINDOW_SEC/3600)}h"
+                ),
+            }
+
+        # Check host is known
+        if offending_host.lower() not in ALL_FLEET_HOSTS:
+            log.warning("token-fix: host %s not in ALL_FLEET_HOSTS — "
+                        "falling through to LLM", offending_host)
+            return None
+
+        _record_token_fix_attempt(offending_host)
+        log.info("AUTO-DETECT signature=%s host=%s — bypassing LLM, "
+                 "dispatching codex fix directly", sig_name, offending_host)
+
+        return {
+            "action_type": "dispatch_codex_fix",
+            "confidence": 0.95,
+            "reason": (
+                f"auto-detected signature '{sig_name}': "
+                f"'no token for host' gateway-auth failure on {offending_host}"
+            ),
+            "codex_task": _build_token_fix_codex_task(offending_host),
+            "target_host": offending_host,
+            "signature": sig_name,
+            "auto_detected": True,
+        }
+
+    return None
+
+
 # ───────────────────────── Failed-cluster scanner (self-triage) ─────────────────────────
 def _base_kind(kind: str) -> str:
     """Strip [tag] suffix to canonicalize the kind."""
@@ -779,6 +1040,51 @@ def process_triage_job(job: dict) -> dict:
 
     failed = fetch_failed_jobs_for_kind(base_kind, limit=10)
     registry = fetch_agent_registry_summary()
+
+    # ── Check known failure signatures BEFORE LLM call ──
+    # If we match a known auto-fixable pattern (e.g. token mismatch),
+    # dispatch the codex fix directly — no LLM tokens burned.
+    known_action = _match_known_signature(job, base_kind, failed)
+    if known_action:
+        a = known_action.get("action_type", "no_action")
+        reason = known_action.get("reason", "")
+        log.info("doctor decision (SIGNATURE-MATCH): action=%s reason=%s", a, reason)
+        parts = [f"action={a}", f"conf={known_action.get('confidence', 1.0):.2f}",
+                 f"reason={reason}"]
+        if a == "dispatch_codex_fix":
+            parts.append(action_dispatch_codex_fix(
+                known_action.get("codex_task"), job_id))
+            broadcast_doctor_message("doctor.fix.token_mismatch", {
+                "host": AGENT_HOST,
+                "job_id": job_id,
+                "target_host": known_action.get("target_host"),
+                "signature": known_action.get("signature"),
+                "base_kind": base_kind,
+            })
+            # Release the triage job back to queue so the offending host
+            # (now fixed) or any other worker can reclaim it
+            parts.append(action_release_to_queue(
+                job_id, known_action.get("release_eligible_kinds")))
+        elif a == "escalate":
+            parts.append("escalated to human")
+            broadcast_doctor_message("doctor.escalate.token_mismatch", {
+                "host": AGENT_HOST,
+                "job_id": job_id,
+                "reason": reason,
+                "base_kind": base_kind,
+            })
+        else:
+            parts.append(f"unknown auto-action {a!r}")
+        return {
+            "exit_code": 0,
+            "stdout": "; ".join(parts),
+            "action": known_action,
+            "base_kind": base_kind,
+            "failed_count_seen": len(failed),
+            "auto_detected": True,
+            "released_to_queue": (a == "dispatch_codex_fix"),
+        }
+
     prompt = build_doctor_prompt(job, base_kind, failed, registry, failure_count)
 
     ok, text = invoke_doctor_agent(prompt)
