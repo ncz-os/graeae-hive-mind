@@ -388,6 +388,26 @@ def _verify_commit(workspace, sha):
     return r.returncode == 0
 
 
+def _sha_on_remote(workspace, remote, sha):
+    """Strict: confirm `sha` is the OBJECT ID (col 1) of some ref on `remote`.
+
+    This is the anti-FAKE-completion check — a local `git push` returning 0 is
+    NOT proof the commit landed; only the remote ref listing is. Matching col-1
+    avoids false positives where the SHA appears inside a ref name. Defensive:
+    any failure -> False.
+    """
+    if not (isinstance(sha, str) and re.fullmatch(r"[a-f0-9]{40}", sha)):
+        return False
+    lr = _git(workspace, "ls-remote", remote, timeout=60)
+    if lr.returncode != 0:
+        return False
+    for line in (lr.stdout or "").splitlines():
+        parts = line.split()
+        if parts and parts[0] == sha:
+            return True
+    return False
+
+
 COMMIT_MANDATORY_PREFIXES = ("feat:", "fix:", "argonaut:", "riskyeats:", "riskybiz:")
 
 
@@ -752,12 +772,23 @@ def process_job(urn, job):
         # reviewable/mergeable later.
         branch = "hive/" + re.sub(r"[^0-9a-zA-Z_-]", "", jid)[:24]
         _git(Path(workspace), "branch", "-f", branch, "HEAD", timeout=10)
-        pr = _git(Path(workspace), "push", "-u", "origin", branch, timeout=180)
-        pushed = (pr.returncode == 0)
+        pr = _git(Path(workspace), "push", "origin", f"{branch}:{branch}", timeout=180)
+        # ANTI-FAKE: a 0 exit from `git push` is NOT proof the commit landed.
+        # Resolve the FULL tip SHA and confirm it is actually present on origin
+        # via ls-remote (strict col-1). NEVER trust the local push exit alone.
+        tip = _git(Path(workspace), "rev-parse", "HEAD", timeout=10).stdout.strip()
+        verified = bool(tip) and _sha_on_remote(Path(workspace), "origin", tip)
+        pushed = verified
         result["pushed"] = pushed
-        result["pushed_branch"] = branch
+        result["pushed_branch"] = branch if pushed else None
         if not pushed:
-            result["worker_error"] = "push_failed:" + pr.stderr.strip()[:200]
+            _perr = (pr.stderr or "").strip()[:160]
+            if pr.returncode == 0:
+                result["worker_error"] = (
+                    "push_unverified: local commits NOT confirmed on remote "
+                    "(ls-remote missing tip SHA) — possible fake completion")
+            else:
+                result["worker_error"] = "push_failed:" + _perr
     requires_commit = has_remote and not kind.startswith("review:")  # review jobs emit a report, not a commit
     if requires_commit:
         # For a repo job the VERIFIED, PUSHED commit is the authoritative
