@@ -167,6 +167,9 @@ small.dim{font-size:.85em}
 .result-card.rc-code{border-left:3px solid #2ea043}
 .result-card.rc-text{border-left:3px solid #58a6ff}
 .rc-model{background:#262d36;border:1px solid #3a4250;border-radius:10px;padding:.05em .5em;font-size:.7em;color:#d2a8ff;font-weight:600}
+.rc-agent{background:#1c2530;border:1px solid #2f3b48;border-radius:10px;padding:.05em .5em;font-size:.7em;color:#9ecbff;font-weight:600;text-transform:lowercase}
+.rc-agent.codex{background:#3a2407;border-color:#8a5a12;color:#ffb454;font-weight:700}
+.result-card.rc-codexcard{border-left:3px solid #ffb454}
 </style>
 </head>
 <body>
@@ -774,10 +777,15 @@ async function refreshResults(){
     card.className='result-card done '+(hasCode?'rc-code':'rc-text');
     const preview=r.summary||r.text||r.output||'(no text result)';
     const prov=r.gateway_model||MODEL_NAMES[r.agent_alias]||r.agent_alias||'';
+    const isCodex=/^codex[:\-]/i.test(j.kind||'')||/codex/i.test(prov)||r.runtime==='codex'||r.via==='codex-cli';
+    let agentType=r.runtime||String(j.kind||'').split(':')[0]||'agent';
+    if(isCodex)agentType='codex';
+    if(isCodex)card.classList.add('rc-codexcard');
     const commits=hasCode?`<div style="font-size:.74em;color:#7ee787;margin-top:.2em">commits: ${esc(r.commits.slice(0,3).join(', '))}</div>`:'';
     card.innerHTML=`
       <div class="rc-head">
         <span class="rc-kind">${esc(j.kind)}</span>
+        <span class="rc-agent${isCodex?' codex':''}" title="agent type">${esc(agentType)}</span>
         <span class="${badgeCls(j.status)}">${esc(j.status)}</span>
         ${prov?`<span class="rc-model" title="model/provider that did this job">${esc(prov)}</span>`:''}
         <span class="rc-id">${esc(j.id.slice(0,10))}</span>
