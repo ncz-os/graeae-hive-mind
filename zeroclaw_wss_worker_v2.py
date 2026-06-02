@@ -85,6 +85,7 @@ KIND_WORKSPACE_MAP = {
     "riskybiz:p1-sunbiz-entity-resolver": ("florida-licenses", None),
     "riskybiz:":        ("florida-licenses", None),
     "riskyeats:":       ("riskyeats",      "https://gitlab.com/perlowja/riskyeats.git"),
+    "investorclaw:":    ("InvestorClaw",   "https://gitlab.com/argonautsystems/InvestorClaw.git"),
     "ncz-os-zeroclaw:": ("zeroclaw",       "https://gitlab.com/nclawzero/zeroclaw.git"),
     "ncz-os-openclaw:": ("openclaw",       "https://gitlab.com/nclawzero/openclaw.git"),
     "ncz-os-":          ("ncz-installer",  "https://gitlab.com/nclawzero/ncz-installer.git"),
@@ -466,6 +467,21 @@ def _resolve_workspace(kind, description):
         # with workspace=None rather than treat it as a hard failure.
         if any(kind.startswith(p) for p in NONCOMMIT_KIND_PREFIXES):
             return None, "noncommit_workspaceless"
+        # B (2026-06-02): zeroclaw is the MAIN worker — handle generic repo-dev
+        # jobs by cloning the repo named in a `repo:` hint, then running the
+        # OPEN-WEIGHT WSS chain on it (NO codex, NO claude). Only fall through to
+        # the orchestrator release when there is genuinely no repo to work in.
+        m = re.search(r"\brepo:\s*([A-Za-z0-9_./:\-]+)", (description or ""), re.I)
+        if m:
+            ref = m.group(1).strip().rstrip("/")
+            if ref.startswith("http") or ref.startswith("git@"):
+                sub = re.sub(r"[^A-Za-z0-9_-]", "-", ref.split("/")[-1].replace(".git", ""))[:40]
+                return _ensure_workspace(sub, ref, kind)
+            for _p, (_sub, _url) in KIND_WORKSPACE_MAP.items():
+                if _sub.lower() == ref.lower() and _url:
+                    return _ensure_workspace(_sub, _url, kind)
+            sub = re.sub(r"[^A-Za-z0-9_-]", "-", ref)[:40]
+            return _ensure_workspace(sub, "https://gitlab.com/argonautsystems/" + ref + ".git", kind)
         return None, "no_workspace_for_kind"
     prefix, (subdir, git_url) = best
     return _ensure_workspace(subdir, git_url, kind)
@@ -635,11 +651,16 @@ def process_job(urn, job):
                           {"worker_error": werr, "note": "released_by_host"})
                 log.info("→ released %s (%s)", jid[:12], werr)
                 return
-            patch_job(jid, urn, "cancelled",
-                      {"exit_code": 2, "via": "preflight", "commits": [],
-                       "worker_error": werr,
-                       "error": f"terminal_preflight:{werr}"})
-            log.info("→ cancelled %s (%s) — no retry", jid[:12], werr)
+            # Option A (2026-06-02): these are ORCHESTRATOR (claude/codex) jobs.
+            # A zeroclaw worker with no workspace handler must NOT cancel/destroy
+            # them — release to queued + strip zeroclaw from eligible_kinds so a
+            # Claude/Codex orchestrator claims them and we stop re-grabbing/churning.
+            _cur = job.get("eligible_kinds") or []
+            _new_elig = [k for k in _cur if k != "zeroclaw" and k not in _ZEROCLAW_PROVIDER_ALIASES] or ["claude", "codex"]
+            patch_job(jid, urn, "queued",
+                      {"worker_error": werr, "note": "released_to_orchestrator:no_zeroclaw_handler"})
+            http("PATCH", f"/v1/jobs/{jid}", {"eligible_kinds": _new_elig}, timeout=15)
+            log.info("→ released %s to orchestrator %s (%s) — no zeroclaw handler", jid[:12], _new_elig, werr)
             return
         if werr == "noncommit_workspaceless":
             workspace = None  # run the chain workspace-less (text answer)
