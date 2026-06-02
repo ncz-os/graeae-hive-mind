@@ -409,6 +409,18 @@ def _ensure_origin(path, subdir):
         _git(path, "remote", "set-url", "origin", _url, timeout=5)
 
 
+def _clone_url(subdir, git_url):
+    """Resolve an auth'd clone URL from ~/.zeroclaw/workspace_remotes.json (token-bearing,
+    synced to every worker via deploy.sh) so ANY host can clone private repos — not just
+    hosts with a git credential helper. Falls back to the tokenless map URL."""
+    try:
+        import json as _json
+        _r = _json.load(open(os.path.expanduser("~/.zeroclaw/workspace_remotes.json")))
+        return _r.get(subdir) or git_url
+    except Exception:
+        return git_url
+
+
 def _ensure_workspace(subdir, git_url, kind):
     path = WORKSPACE_ROOT / subdir
     git_dir = path / ".git"
@@ -431,7 +443,7 @@ def _ensure_workspace(subdir, git_url, kind):
         return path, None
     log.info("first-use clone: kind=%s url=%s → %s", kind, git_url, path)
     r = subprocess.run(
-        ["git", "clone", "--quiet", "--depth", "50", git_url, str(path)],
+        ["git", "clone", "--quiet", "--depth", "50", _clone_url(subdir, git_url), str(path)],
         capture_output=True, text=True, timeout=180,
     )
     if r.returncode != 0:
