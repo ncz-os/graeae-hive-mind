@@ -665,6 +665,27 @@ def wss_run(task, kind, workspace, alias, job_id, timeout_sec):
     return raw_result
 
 
+def route_chain(tier, kind, fallback):
+    """Ask the hive KNEMON cost router for an ordered alias chain that fits
+    the job budget. GRACEFUL: any error/timeout/empty -> return the local
+    fallback chain so job execution NEVER breaks on a routing hiccup."""
+    try:
+        code, resp = http("POST", "/v1/knemon/route",
+                          {"max_cost_tier": (tier or "C"), "kind": kind or ""},
+                          timeout=4)
+        if code in (200, 201) and isinstance(resp, dict):
+            chain = resp.get("chain")
+            if isinstance(chain, list):
+                # keep only usable non-empty string aliases (defensive vs a
+                # malformed router response); fall through to fallback if none.
+                clean = [a.strip() for a in chain if isinstance(a, str) and a.strip()]
+                if clean:
+                    return clean
+    except Exception as e:
+        log.warning("  knemon route failed (%s) -> local fallback", e)
+    return fallback
+
+
 def process_job(urn, job):
     jid = job["id"]
     kind = job.get("kind", "") or ""
@@ -675,8 +696,11 @@ def process_job(urn, job):
     # the loop below). Falls back to the legacy tier chain if classification is
     # somehow empty.
     registry = classify_registry(kind)
-    chain = MODEL_REGISTRIES.get(registry) or TIER_CHAINS.get((tier or "C").upper(), TIER_CHAINS["C"])
-    log.info("claimed %s kind=%s tier=%s -> registry=%s", jid[:12], kind[:50], tier, registry)
+    local_chain = MODEL_REGISTRIES.get(registry) or TIER_CHAINS.get((tier or "C").upper(), TIER_CHAINS["C"])
+    # KNEMON cost router (2026-06-02): hive returns a budget-fitted chain;
+    # falls back to local_chain on any error/timeout so execution is robust.
+    chain = route_chain(tier, kind, local_chain)
+    log.info("claimed %s kind=%s tier=%s -> registry=%s chain0=%s", jid[:12], kind[:50], tier, registry, (chain[0] if chain else None))
     patch_job(jid, urn, "running")
     started = time.time()
     try:
