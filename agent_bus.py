@@ -21,6 +21,8 @@ from contextlib import suppress
 from typing import Optional, Any
 
 import aiosqlite
+
+import queue_logic
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -444,6 +446,14 @@ async def connect_db():
             yield db
         finally:
             await db.close()
+
+
+def _is_dedup_violation(exc: BaseException) -> bool:
+    """Unique-violation from the active-only dedup index ONLY (never another PK/unique)."""
+    m = str(exc)
+    return "HIVE_JOBS_ACTIVE_DEDUP_UQ" in m.upper() or (
+        "unique constraint failed" in m.lower() and "dedup_hash" in m.lower()
+    )
 
 
 def uuidv7() -> str:
@@ -1142,6 +1152,7 @@ class JobCreate(BaseModel):
     mnemos_refs: Optional[list[str]] = None            # mem_XXX ids — context/handoffs/related work the worker should consult
     # DAG support:
     depends_on: Optional[list[str]] = None             # job ids that must be status='done' before this job is dequeueable
+    idempotency_key: Optional[str] = None              # forced-rerun escape: a unique value is never coalesced
 
 
 class JobUpdate(BaseModel):
@@ -2008,28 +2019,65 @@ async def create_job(req: JobCreate):
         # cache misses share the same enforcement (was bypassable for
         # worker-runtimes when cache had a relevant entry; see comment
         # near the role-enforcement block above).
-        await db.execute(
-            "INSERT INTO jobs (id, submitter_urn, parent_job_id, kind, description, priority, deadline, "
-            "required_capabilities, eligible_kinds, eligible_hosts, project, max_cost_tier, preferred_providers, preferred_models, "
-            "mnemos_refs, depends_on, max_retries, status, started_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
-            (
-                job_id, req.submitter_urn, req.parent_job_id, req.kind, req.description,
-                req.priority, req.deadline,
-                json.dumps(req.required_capabilities) if req.required_capabilities else None,
-                json.dumps(req.eligible_kinds) if req.eligible_kinds else None,
-                json.dumps(req.eligible_hosts) if req.eligible_hosts else None,
-                req.project,
-                max_cost_tier,
-                json.dumps(req.preferred_providers) if req.preferred_providers else None,
-                json.dumps(req.preferred_models) if req.preferred_models else None,
-                json.dumps(req.mnemos_refs) if req.mnemos_refs else None,
-                json.dumps(req.depends_on) if req.depends_on else None,
-                int(req.max_retries),
-                now,
-            ),
+        dedup_scope_version = json.dumps(
+            {
+                "tier": max_cost_tier,
+                "caps": sorted(req.required_capabilities or []),
+                "preferred_providers": req.preferred_providers or [],
+                "preferred_models": req.preferred_models or [],
+                "depends_on": sorted(req.depends_on or []),
+                "project": req.project,
+                "parent_job_id": req.parent_job_id,
+                "mnemos_refs": sorted(req.mnemos_refs or []),
+                "deadline": req.deadline,
+            },
+            sort_keys=True,
+            default=str,
         )
-        await db.commit()
+        dedup_hash = queue_logic.dedup_key(
+            tenant="_default",
+            kind=req.kind,
+            description=req.description,
+            version=dedup_scope_version,
+            idempotency_key=req.idempotency_key,
+        )
+        try:
+            await db.execute(
+                "INSERT INTO jobs (id, submitter_urn, parent_job_id, kind, description, priority, deadline, "
+                "required_capabilities, eligible_kinds, eligible_hosts, project, max_cost_tier, preferred_providers, preferred_models, "
+                "mnemos_refs, depends_on, max_retries, dedup_hash, status, started_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
+                (
+                    job_id, req.submitter_urn, req.parent_job_id, req.kind, req.description,
+                    req.priority, req.deadline,
+                    json.dumps(req.required_capabilities) if req.required_capabilities else None,
+                    json.dumps(req.eligible_kinds) if req.eligible_kinds else None,
+                    json.dumps(req.eligible_hosts) if req.eligible_hosts else None,
+                    req.project,
+                    max_cost_tier,
+                    json.dumps(req.preferred_providers) if req.preferred_providers else None,
+                    json.dumps(req.preferred_models) if req.preferred_models else None,
+                    json.dumps(req.mnemos_refs) if req.mnemos_refs else None,
+                    json.dumps(req.depends_on) if req.depends_on else None,
+                    int(req.max_retries),
+                    dedup_hash,
+                    now,
+                ),
+            )
+            await db.commit()
+        except Exception as _dexc:
+            if not _is_dedup_violation(_dexc):
+                raise
+            async with db.execute(
+                "SELECT id, started_at FROM jobs WHERE dedup_hash = ? "
+                "AND status IN ('queued', 'offered', 'claimed', 'running') "
+                "ORDER BY started_at ASC LIMIT 1",
+                (dedup_hash,),
+            ) as _cur:
+                _row = await _cur.fetchone()
+            if _row:
+                return {"id": _row[0], "created_at": _row[1], "coalesced": True}
+            raise
         await emit_event(db, "job.queued", {
             "id": job_id, "submitter": req.submitter_urn, "kind": req.kind,
             "description": req.description, "priority": req.priority,
