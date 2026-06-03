@@ -2825,7 +2825,8 @@ KNEMON_PROVIDERS: list[dict[str, Any]] = [
     # provider,         model,                 alias,                  in,    out
     {"provider": "groq",      "model": "gpt-oss-20b",          "alias": "hive_groq_1",        "tier": "B"},
     {"provider": "gemini",    "model": "gemini-2.5-flash-lite","alias": "hive_gemini_1",      "tier": "B"},
-    {"provider": "siliconflow","model": "qwen2.5-coder-32b",   "alias": "hive_siliconflow_1", "tier": "B"},
+    # DISABLED 2026-06-03 (blocker C): siliconflow key 401 invalid fleet-wide. Re-enable after key rotation.
+    # {"provider": "siliconflow","model": "qwen2.5-coder-32b",   "alias": "hive_siliconflow_1", "tier": "B"},
     {"provider": "deepseek-direct","model": "deepseek-v4-flash","alias": "hive_deepseek_1",   "tier": "B"},
     {"provider": "together",  "model": "minimax-m2.7",         "alias": "hive_together_1",    "tier": "B"},
     {"provider": "xai",       "model": "grok-4.1-fast",        "alias": "hive_xai_1",         "tier": "B"},
@@ -2868,6 +2869,24 @@ def knemon_candidates(max_tier: str, kind: str = "") -> list[dict[str, Any]]:
     return out
 
 
+# ── HIVE-LEVEL KNEMON BYPASS FLAG (operator 2026-06-03) ──────────────────
+# Presence of this file = bypass ON for the WHOLE hive. Durable across bus
+# restarts; observable (ls/cat); togglable via the /v1/knemon/bypass endpoints
+# below or a plain touch/rm. Cheap stat() per route call. When set, the router
+# drops the codex/gpt sub-lead and returns the plain metered open-weight chain,
+# so EVERY worker that polls /v1/knemon/route runs jobs directly on open-weights
+# — the stabilization lever when the GPT-first lead is broken (e.g. hive_gpt
+# 400 'missing input' cascade).
+KNEMON_BYPASS_FILE = "/srv/agent-bus/knemon_bypass.flag"
+
+
+def knemon_bypass_active() -> bool:
+    try:
+        return os.path.exists(KNEMON_BYPASS_FILE)
+    except Exception:
+        return False
+
+
 @app.post("/v1/knemon/route")
 async def knemon_route(req: Request):
     """Cost-aware routing. POST {max_cost_tier|tier, kind} -> ordered candidate
@@ -2902,17 +2921,56 @@ async def knemon_route(req: Request):
         CODEX_SUB_LEAD = ["hive_gpt_mini"]
     else:
         CODEX_SUB_LEAD = ["hive_gpt"]
-    chain = CODEX_SUB_LEAD + [a for a in open_weight_chain if a not in CODEX_SUB_LEAD]
+    # HIVE-LEVEL BYPASS: when the flag is set, drop the codex/gpt sub-lead and
+    # hand back the plain metered open-weight chain so all workers run direct.
+    bypass = knemon_bypass_active()
+    if bypass:
+        CODEX_SUB_LEAD = []
+        chain = list(open_weight_chain)
+    else:
+        chain = CODEX_SUB_LEAD + [a for a in open_weight_chain if a not in CODEX_SUB_LEAD]
     return {
         "ok": True,
         "max_cost_tier": max_tier,
         "kind": kind,
+        "knemon_bypass": bypass,
         "sub_lead": CODEX_SUB_LEAD,
         # codex/gpt sub agent first ($0 unlimited), metered open-weights as fallback
         "chain": chain,
         "candidates": cands,
         "convention": "openai_codex sub leads ($0); open-weights fallback; A=cheap..C=premium ceiling",
     }
+
+
+@app.get("/v1/knemon/bypass")
+async def knemon_bypass_get():
+    """Read hive-level KNEMON bypass state."""
+    return {"ok": True, "bypass": knemon_bypass_active(),
+            "flag_file": KNEMON_BYPASS_FILE}
+
+
+@app.post("/v1/knemon/bypass")
+async def knemon_bypass_set(req: Request):
+    """Toggle hive-level KNEMON bypass. POST {enabled: bool, reason?: str}.
+    When enabled, ALL workers skip the codex/gpt sub-lead (open-weights only)."""
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    enabled = bool(body.get("enabled"))
+    reason = str(body.get("reason") or "")
+    try:
+        if enabled:
+            with open(KNEMON_BYPASS_FILE, "w") as f:
+                f.write((reason or "bypass enabled") + "\n")
+        else:
+            if os.path.exists(KNEMON_BYPASS_FILE):
+                os.remove(KNEMON_BYPASS_FILE)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "bypass": knemon_bypass_active(), "reason": reason}
 
 
 @app.get("/v1/knemon/spend")
