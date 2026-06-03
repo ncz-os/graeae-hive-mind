@@ -76,16 +76,20 @@ def match(
 ) -> MatchResult:
     """Decide whether ``worker_caps`` can run a job needing ``job_labels``.
 
-    HARD labels must ALL be present (or the worker advertises ``*``), else the
-    worker is INELIGIBLE (strict). SOFT labels raise the score (affinity).
+    HARD labels must ALL be present (exact caps; a ``*`` wildcard does NOT
+    bypass HARD), else the worker is INELIGIBLE (strict). SOFT labels raise the score (affinity).
     ``worker_load`` (0..1, fraction busy) lowers the score so the dispatcher can
     spread work and avoid herding onto a single capable worker.
     """
     caps = set(worker_caps or [])
-    star = "*" in caps
     hard, soft = _split_labels(job_labels)
 
-    if not star and not hard.issubset(caps):
+    # HARD labels require the EXACT cap — a '*' wildcard does NOT bypass them.
+    # Honest-caps mandate (operator 2026-06-03): no worker should advertise '*';
+    # a stray '*' (misconfigured/legacy worker) must skip-at-poll hard jobs
+    # rather than claim hardware/build work it cannot actually do. '*' still
+    # trivially satisfies bare/soft labels (it just earns no soft affinity).
+    if not hard.issubset(caps):
         missing = sorted(hard - caps)
         return MatchResult(False, 0.0, f"missing hard caps: {missing}")
 

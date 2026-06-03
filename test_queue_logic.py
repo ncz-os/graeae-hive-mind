@@ -45,7 +45,8 @@ check(not r.eligible and "missing hard" in r.reason, "hard missing -> ineligible
 r = match(["hard:build-rust", "hard:gpu"], ["gpu"])
 check(not r.eligible, "partial hard -> ineligible")
 r = match(["hard:gpu"], ["*"])
-check(r.eligible, "star wildcard satisfies hard")
+check(not r.eligible, "star wildcard does NOT bypass hard (honest-caps mandate)")
+check(match(["riskyeats"], ["*"]).eligible, "star still eligible for bare/soft labels")
 
 # ── SOFT preference (never blocks) ──
 r = match(["soft:workspace-riskybiz"], ["python"])
