@@ -20,9 +20,13 @@ from contextlib import asynccontextmanager
 from contextlib import suppress
 from typing import Optional, Any
 
-import aiosqlite
+try:
+    import aiosqlite
+except ModuleNotFoundError:
+    from hive.persistence import _sqlite_async as aiosqlite
 
 import queue_logic
+from hive.persistence.factory import get_hive_repository
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -66,8 +70,8 @@ def _parse_oracle_url(url: str) -> tuple[str, str, str]:
     return user, password, f"{host}:{port}/{service}"
 
 
-if HIVE_BACKEND not in {"sqlite", "oracle"}:
-    raise RuntimeError(f"HIVE_BACKEND must be sqlite or oracle, got {HIVE_BACKEND!r}")
+if HIVE_BACKEND not in {"sqlite", "oracle", "db2"}:
+    raise RuntimeError(f"HIVE_BACKEND must be sqlite, oracle, or db2, got {HIVE_BACKEND!r}")
 
 if HIVE_BACKEND == "oracle":
     try:
@@ -84,6 +88,8 @@ if HIVE_BACKEND == "oracle":
         raise
 else:
     oracledb = None
+
+_HIVE_REPO = None
 
 
 # ---------- helpers ----------
@@ -423,29 +429,23 @@ class OracleConnection:
         if hasattr(result, "__await__"):
             await result
 
+
+def hive_repo():
+    global _HIVE_REPO
+    if _HIVE_REPO is None:
+        _HIVE_REPO = get_hive_repository(
+            HIVE_BACKEND,
+            db_path=DB_PATH,
+            busy_timeout_ms=SQLITE_BUSY_TIMEOUT_MS,
+            dsn=ORACLE_DSN,
+            db2_dsn=os.environ.get("DB2_DSN") or os.environ.get("HIVE_DB2_DSN", ""),
+        )
+    return _HIVE_REPO
+
 @asynccontextmanager
 async def connect_db():
-    if HIVE_BACKEND == "oracle":
-        user, password, dsn = _parse_oracle_url(ORACLE_DSN)
-        raw = await oracledb.connect_async(user=user, password=password, dsn=dsn)
-        db = OracleConnection(raw)
-        try:
-            yield db
-        finally:
-            await db.close()
-    else:
-        db = await aiosqlite.connect(
-            DB_PATH,
-            timeout=SQLITE_BUSY_TIMEOUT_MS / 1000,
-            check_same_thread=False,
-        )
-        try:
-            await db.execute("PRAGMA journal_mode=WAL")
-            await db.execute("PRAGMA synchronous=NORMAL")
-            await db.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
-            yield db
-        finally:
-            await db.close()
+    async with hive_repo().connection() as db:
+        yield db
 
 
 def _is_dedup_violation(exc: BaseException) -> bool:
@@ -2105,143 +2105,41 @@ async def dequeue_next_job(agent_urn: str):
     Race-safe via SQLite immediate-mode UPDATE...WHERE rowid=(SELECT...LIMIT 1) under a transaction.
     """
     now = time.time()
-    async with connect_db() as db:
-        async with db.execute(
-            "SELECT kind, capabilities, runtime, model, provider, cost_tier, "
-            "auth_method, plan_cap_usd, plan_period_used_usd, status "
-            "FROM agents WHERE urn=?",
-            (agent_urn,),
-        ) as cur:
-            row = await cur.fetchone()
-        if not row:
-            raise HTTPException(404, f"claim failed: agent not registered: {agent_urn}")
-        agent_kind, caps_json, a_runtime, a_model, a_provider, a_tier, a_auth, a_cap, a_used, agent_status = row
-        if agent_status not in ACTIVE_AGENT_STATUSES:
-            raise HTTPException(409, f"claim failed: agent status is {agent_status!r}, not online/idle: {agent_urn}")
-        # Host denylist — refuse to offer jobs to known-broken hosts.
-        # Extracts host short-name from urn:agent:<kind>:<host>:<sid>.
-        try:
-            urn_parts = agent_urn.split(":")
-            urn_host = (urn_parts[3] if len(urn_parts) >= 4 else "").lower()
-        except Exception:
-            urn_host = ""
-        if urn_host in HOST_DENYLIST:
-            # Don't return 404 (worker would retry frantically) — return 204
-            # so the worker treats it as 'no work, idle wait' and stops flooding.
-            from fastapi.responses import Response as _DRsp
-            return _DRsp(status_code=204, headers={
-                "X-Hive-Claim-Result": "host_denylisted",
-                "X-Hive-Claim-Detail": f"host {urn_host} is in HIVE_HOST_DENYLIST",
+    try:
+        claimed = await hive_repo().claim_next_job(
+            agent_urn=agent_urn,
+            now=now,
+            active_statuses=ACTIVE_AGENT_STATUSES,
+            claim_lease_seconds=CLAIM_LEASE_SECONDS,
+            host_denylist=HOST_DENYLIST,
+            match_capabilities=queue_logic.match,
+            kind_aliases=agent_kind_aliases,
+            json_list=json_list,
+        )
+    except aiosqlite.Error as e:
+        raise HTTPException(500, f"claim failed: database error while claiming next job: {e}") from e
+    if isinstance(claimed, dict) and claimed.get("error") == "not_registered":
+        raise HTTPException(404, f"claim failed: agent not registered: {agent_urn}")
+    if isinstance(claimed, dict) and claimed.get("error") == "inactive":
+        raise HTTPException(
+            409,
+            f"claim failed: agent status is {claimed.get('status')!r}, not online/idle: {agent_urn}",
+        )
+    if isinstance(claimed, dict) and claimed.get("error") == "host_denylisted":
+        from fastapi.responses import Response as _DRsp
+        return _DRsp(status_code=204, headers={
+            "X-Hive-Claim-Result": "host_denylisted",
+            "X-Hive-Claim-Detail": f"host {claimed.get('host')} is in HIVE_HOST_DENYLIST",
+        })
+    if claimed:
+        resources = claimed.get("claimed_resources") or {}
+        async with connect_db() as db:
+            await emit_event(db, "job.claimed", {
+                "id": claimed["id"], "claimed_by": agent_urn, "kind": claimed["kind"],
+                "runtime": resources.get("runtime"), "model": resources.get("model"),
+                "provider": resources.get("provider"), "cost_tier": resources.get("cost_tier"),
             })
-        agent_caps = set(json.loads(caps_json)) if caps_json else set()
-        eligible_aliases = agent_kind_aliases(agent_kind, a_runtime)
-        a_tier = a_tier or "C"
-        a_auth = (a_auth or "unknown").lower()
-        # Throttle: subscription agents over 85% MTD usage get refused tier-B/C jobs;
-        # they can still claim tier-A (free) work. Forces API/free fallback as plan cap nears.
-        sub_throttled = (a_auth == "subscription" and a_cap and a_used and a_used >= THROTTLE_HEADROOM * a_cap)
-
-        await db.execute("BEGIN IMMEDIATE")
-        committed = False
-        try:
-            async with db.execute(
-                "SELECT id, kind, description, priority, deadline, required_capabilities, eligible_kinds, "
-                "eligible_hosts, submitter_urn, parent_job_id, started_at, max_cost_tier, preferred_providers, preferred_models, "
-                "mnemos_refs, depends_on "
-                "FROM jobs WHERE status='queued' "
-                "AND (retry_backoff_until IS NULL OR retry_backoff_until <= ?) "
-                "ORDER BY priority DESC, started_at ASC",
-                (time.time(),)
-            ) as cur:
-                # parse agent host from URN: urn:agent:<kind>:<host>:<session_id>
-                urn_parts = agent_urn.split(":")
-                agent_host = urn_parts[3] if len(urn_parts) > 3 else None
-                async for r in cur:
-                    (job_id, j_kind, j_desc, j_prio, j_dead, j_caps_json, j_kinds_json,
-                     j_hosts_json, j_sub, j_par, j_started, j_max_tier, j_pref_providers, j_pref_models,
-                     j_mnemos_refs, j_deps_json) = r
-                    # DAG gate: all depends_on must be status='done'
-                    if j_deps_json:
-                        deps = json_list(j_deps_json)
-                        if deps:
-                            ph = ",".join("?" * len(deps))
-                            async with db.execute(
-                                f"SELECT COUNT(*) FROM jobs WHERE id IN ({ph}) AND status='done'",
-                                tuple(deps),
-                            ) as dc:
-                                done_count = (await dc.fetchone())[0]
-                            if done_count < len(deps):
-                                continue  # parent not yet done; skip
-                    # HARD/SOFT capability gate (operator 2026-06-03): required_capabilities
-                    # entries are labels — "hard:X" must ALL be in the worker's caps (or
-                    # "*"); "soft:X"/bare are preferred only and never block. Replaces the
-                    # earlier strict filter: bare caps no longer gate (existing jobs are
-                    # unaffected), only jobs declaring hard: labels are restricted, so a
-                    # build-incapable worker skips a hard:-labelled job AT POLL without
-                    # host-pin starvation. kind/eligible_hosts/tier gates stay off.
-                    if j_caps_json:
-                        _labels = json_list(j_caps_json)
-                        if _labels and not queue_logic.match(_labels, agent_caps).eligible:
-                            continue
-                    # NO TIER GATING (operator 2026-06-01): all executor agents
-                    # may claim any job regardless of cost tier. Cost/model
-                    # selection is a DISPATCH concern — zeroclaw routes per-model
-                    # by complexity via KNEMON; it is not a claim-time gate.
-                    # (cost-tier + subscription-throttle filters removed here.)
-                    # filter: preferred_providers (if set, agent must match one)
-                    if j_pref_providers:
-                        provs = json.loads(j_pref_providers)
-                        if provs and a_provider not in provs:
-                            continue
-                    if j_pref_models:
-                        models = json.loads(j_pref_models)
-                        if models and a_model not in models:
-                            continue
-                    # match — claim + record dispatch resources
-                    # P0-1 fix (2026-05-28): capture cursor + check rowcount.
-                    # Oracle adapter drops BEGIN IMMEDIATE so concurrent claimers can
-                    # both pass the queue filter; the UPDATE WHERE status='queued' is
-                    # the race-guard. rowcount==0 means another claimer beat us → skip.
-                    claim_cur = await db.execute(
-                        "UPDATE jobs SET status='claimed', claimed_by=?, claimed_at=?, "
-                        "claimed_runtime=?, claimed_model=?, claimed_provider=?, claimed_cost_tier=?, "
-                        "claim_lease_expires_at=? "
-                        "WHERE id=? AND status='queued'",
-                        (agent_urn, now, a_runtime, a_model, a_provider, a_tier,
-                         now + CLAIM_LEASE_SECONDS, job_id),
-                    )
-                    if (getattr(claim_cur, "rowcount", 0) or 0) < 1:
-                        # Lost race to another claimer. Continue to next candidate.
-                        continue
-                    await db.execute("COMMIT")
-                    committed = True
-                    await emit_event(db, "job.claimed", {
-                        "id": job_id, "claimed_by": agent_urn, "kind": j_kind,
-                        "runtime": a_runtime, "model": a_model,
-                        "provider": a_provider, "cost_tier": a_tier,
-                    })
-                    return {
-                        "id": job_id, "kind": j_kind, "description": j_desc,
-                        "priority": j_prio, "deadline": j_dead,
-                        "max_cost_tier": j_max_tier,
-                        "submitter_urn": j_sub, "parent_job_id": j_par,
-                        "claimed_at": now, "queued_at": j_started,
-                        "mnemos_refs": json.loads(j_mnemos_refs) if j_mnemos_refs else [],
-                        "claimed_resources": {
-                            "runtime": a_runtime, "model": a_model,
-                            "provider": a_provider, "cost_tier": a_tier,
-                        },
-                    }
-            await db.execute("COMMIT")
-            committed = True
-        except aiosqlite.Error as e:
-            if not committed:
-                await db.execute("ROLLBACK")
-            raise HTTPException(500, f"claim failed: database error while claiming next job: {e}") from e
-        except Exception:
-            if not committed:
-                await db.execute("ROLLBACK")
-            raise
+        return claimed
     # HTTP 204 = No Content. By spec the response body must be EMPTY.
     # JSONResponse(content=None) writes 'null' (4 bytes) which violates the
     # contract and triggers h11 LocalProtocolError. Use Response (no body).
