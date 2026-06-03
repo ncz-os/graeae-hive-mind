@@ -85,7 +85,7 @@ LOOP_ESCALATE_THRESHOLD = int(os.environ.get("LOOP_ESCALATE_THRESHOLD", "3"))
 #             only governs any in-doctor model call labelled "fix".
 # Value is a model alias: "codex" -> local codex CLI; anything else -> the
 # open-weight OpenAI-compatible path (DOCTOR_OPENWEIGHT_*).
-DOCTOR_TRIAGE_MODEL = os.environ.get("DOCTOR_TRIAGE_MODEL", "deepseek").strip().lower()
+DOCTOR_TRIAGE_MODEL = os.environ.get("DOCTOR_TRIAGE_MODEL", "gateway").strip().lower()
 DOCTOR_REVIEW_MODEL = os.environ.get("DOCTOR_REVIEW_MODEL", "codex").strip().lower()
 DOCTOR_FIX_MODEL = os.environ.get("DOCTOR_FIX_MODEL", "codex").strip().lower()
 _PHASE_MODELS = {
@@ -218,7 +218,7 @@ def register() -> str:
         # Per-phase models (2026-06-02): triage model is the doctor's primary
         # diagnose model; review/fix models surfaced in metadata.phase_models.
         "model": DOCTOR_TRIAGE_MODEL,
-        "provider": ("codex" if DOCTOR_TRIAGE_MODEL == "codex" else "openai-compatible"),
+        "provider": ("codex" if DOCTOR_TRIAGE_MODEL in ("gateway", "codex", "openai", "gpt") else "openai-compatible"),
         "autonomy_level": "autonomous",
         "auth_method": "subscription",
         "capabilities": [
@@ -399,6 +399,37 @@ def build_doctor_prompt(job: dict, base_kind: str, failed: list[dict],
     return "\n".join(msg)
 
 
+DOCTOR_GATEWAY_HOST = os.environ.get("GATEWAY_HOST", "127.0.0.1").strip()
+DOCTOR_GATEWAY_PORT = int(os.environ.get("GATEWAY_PORT", "42617"))
+DOCTOR_GATEWAY_TIMEOUT = int(os.environ.get("DOCTOR_GATEWAY_TIMEOUT", "180"))
+
+
+def _invoke_gateway(prompt: str) -> tuple[bool, str]:
+    """Reason via the LOCAL zeroclaw gateway codex chain — the SAME path the
+    workers use. The gateway KNEMON-routes POST /webhook to codex/gpt over
+    ChatGPT-OAuth ($0, no API key, not the codex CLI subprocess). This is the
+    doctor's DEFAULT reasoning path per operator doctrine 2026-06-03
+    (codex/OpenAI-OAuth first; open-weight only on a genuine gateway outage)."""
+    full = DOCTOR_SYSTEM + "\n\n" + prompt
+    url = f"http://{DOCTOR_GATEWAY_HOST}:{DOCTOR_GATEWAY_PORT}/webhook"
+    data = json.dumps({"message": full}).encode()
+    req = urllib.request.Request(
+        url, data=data, method="POST",
+        headers={"content-type": "application/json"})
+    log.info("invoking gateway codex path %s prompt_chars=%d", url, len(full))
+    try:
+        with urllib.request.urlopen(req, timeout=DOCTOR_GATEWAY_TIMEOUT) as r:
+            resp = json.loads(r.read())
+        text = (resp.get("response") or resp.get("message") or "").strip()
+        if text:
+            return True, text
+        return False, f"gateway empty response: {str(resp)[:300]}"
+    except urllib.error.HTTPError as e:
+        return False, f"gateway HTTP {e.code}: {e.read()[:300]!r}"
+    except Exception as e:
+        return False, f"gateway call failed: {e}"
+
+
 CODEX_BIN = os.environ.get("CODEX_BIN", "/usr/local/bin/codex")
 CODEX_TIMEOUT = int(os.environ.get("CODEX_TIMEOUT", "120"))
 
@@ -517,13 +548,20 @@ def invoke_doctor_agent(prompt: str, phase: str = "triage") -> tuple[bool, str]:
     Anthropic/Together stay forbidden. Returns (ok, text); on failure the doctor
     job fails visibly rather than silently switching providers."""
     model_alias = _PHASE_MODELS.get(phase, DOCTOR_TRIAGE_MODEL)
-    if model_alias == "codex":
-        if not os.path.exists(CODEX_BIN):
-            return False, f"codex binary not found at {CODEX_BIN}"
-        ok, text = _invoke_codex_cli(prompt)
+    # Doctrine (operator 2026-06-03): the doctor reasons via the SAME local
+    # gateway codex path the workers use — ChatGPT-OAuth ($0), no API key, NOT
+    # the codex CLI subprocess, NEVER open-weight by default. The gateway
+    # KNEMON-routes /webhook to codex/gpt. Open-weight (deepseek) is FALLBACK
+    # only, for a genuine gateway outage.
+    if model_alias in ("gateway", "codex", "openai", "gpt") or model_alias.startswith("gpt-"):
+        ok, text = _invoke_gateway(prompt)
         if ok and text.strip():
             return True, text
-        return False, f"codex CLI failed: {text}"
+        log.warning("gateway codex path failed (%s) — open-weight fallback", str(text)[:200])
+        ok2, text2 = _invoke_openweight(prompt, DOCTOR_OPENWEIGHT_MODEL)
+        if ok2 and text2.strip():
+            return True, text2
+        return False, f"gateway codex failed: {text}; open-weight fallback failed: {text2}"
     ok, text = _invoke_openweight(prompt, model_alias)
     if ok and text.strip():
         return True, text
@@ -745,12 +783,14 @@ def action_dispatch_codex_fix(codex_task: str | None, parent_job_id: str) -> str
         "description": codex_task,
         "submitter_urn": _urn,
         "parent_job_id": parent_job_id,
-        # gpt-5.3-codex 400s "not supported with ChatGPT account" + codex burns the
-        # scarce $100 OAuth pool -> route the FIX to zeroclaw (open-weight deepseek).
+        # codex-first (operator 2026-06-03): the fix runs on a codex-capable
+        # zeroclaw worker (ChatGPT-OAuth, NO API key). hard:codex gates it to
+        # codex workers only AND stops the doctor (no codex cap) from re-claiming
+        # its own dispatch — the self-loop that thrashed deepseek.
         "eligible_kinds": ["zeroclaw"],
         "max_cost_tier": "C",
         "priority": 80,
-        "required_capabilities": ["code-edit"],
+        "required_capabilities": ["hard:codex"],
     }
     if DRY_RUN:
         return f"DRY_RUN: would submit codex sub-job ({len(codex_task)} chars)"
