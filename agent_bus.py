@@ -828,8 +828,11 @@ def cost_tier_for(provider: str) -> str:
 def json_list(raw: Optional[str]) -> list[Any]:
     if not raw:
         return []
-    val = json.loads(raw)
-    return val if isinstance(val, list) else []
+    try:
+        val = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return []
+    return [x for x in val if isinstance(x, str)] if isinstance(val, list) else []
 
 
 def clamp_limit(value: int, *, default: int = 100, max_limit: int = 1000) -> int:
@@ -2169,11 +2172,17 @@ async def dequeue_next_job(agent_urn: str):
                                 done_count = (await dc.fetchone())[0]
                             if done_count < len(deps):
                                 continue  # parent not yet done; skip
-                    # ELIGIBILITY FILTERS REMOVED (operator 2026-06-03):
-                    # all workers eligible for everything — any worker claims any
-                    # queued job. kind-affinity / eligible_kinds / eligible_hosts /
-                    # required_capabilities / workspace-capability gates deleted.
-                    # DAG depends_on + retry-backoff above still honored.
+                    # HARD/SOFT capability gate (operator 2026-06-03): required_capabilities
+                    # entries are labels — "hard:X" must ALL be in the worker's caps (or
+                    # "*"); "soft:X"/bare are preferred only and never block. Replaces the
+                    # earlier strict filter: bare caps no longer gate (existing jobs are
+                    # unaffected), only jobs declaring hard: labels are restricted, so a
+                    # build-incapable worker skips a hard:-labelled job AT POLL without
+                    # host-pin starvation. kind/eligible_hosts/tier gates stay off.
+                    if j_caps_json:
+                        _labels = json_list(j_caps_json)
+                        if _labels and not queue_logic.match(_labels, agent_caps).eligible:
+                            continue
                     # NO TIER GATING (operator 2026-06-01): all executor agents
                     # may claim any job regardless of cost tier. Cost/model
                     # selection is a DISPATCH concern — zeroclaw routes per-model
