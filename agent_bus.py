@@ -1951,23 +1951,8 @@ async def create_job(req: JobCreate):
             missing = [d for d in req.depends_on if d not in found]
             if missing:
                 raise HTTPException(422, f"depends_on references unknown job ids: {missing}")
-    # AUTO HOST AFFINITY: inject eligible_hosts based on kind prefix if not already set.
-    if req.eligible_hosts is None:
-        for prefix, hosts in KIND_HOST_AFFINITY.items():
-            if req.kind.startswith(prefix):
-                req = req.model_copy(update={"eligible_hosts": hosts})
-                break
-    kind_affinity = kind_affinity_for_kind(req.kind)
-    if kind_affinity:
-        req = req.model_copy(update={"eligible_kinds": kind_affinity})
-        if req.kind.startswith("dream-walker:"):
-            max_cost_tier = "C"
-    workspace_capability = workspace_capability_for_kind(req.kind)
-    if workspace_capability:
-        required = list(req.required_capabilities or [])
-        if "*" not in required and workspace_capability not in required:
-            required.append(workspace_capability)
-            req = req.model_copy(update={"required_capabilities": required})
+    # AFFINITY INJECTION REMOVED (operator 2026-06-03): jobs are not pinned to
+    # hosts/kinds/capabilities — all workers eligible for everything.
     # ROLE ENFORCEMENT: check submitter runtime BEFORE the cache lookup so
     # worker-only runtimes get a 403 consistently for both cache hits and
     # cache misses. Unregistered submitter_urn values are rejected too; the
@@ -2136,32 +2121,11 @@ async def dequeue_next_job(agent_urn: str):
                                 done_count = (await dc.fetchone())[0]
                             if done_count < len(deps):
                                 continue  # parent not yet done; skip
-                    # filter: kind affinity guard
-                    kind_affinity = kind_affinity_for_kind(j_kind)
-                    if kind_affinity and not set(kind_affinity).intersection(eligible_aliases):
-                        continue
-                    # filter: eligible_kinds
-                    if j_kinds_json:
-                        kinds = set(json_list(j_kinds_json))
-                        if kinds and "*" not in kinds and not kinds.intersection(eligible_aliases):
-                            continue
-                    # filter: eligible_hosts (host affinity)
-                    if j_hosts_json:
-                        hosts = set(json_list(j_hosts_json))
-                        if hosts and "*" not in hosts and agent_host not in hosts:
-                            continue
-                    # filter: required_capabilities
-                    if j_caps_json and "*" not in agent_caps:
-                        need = set(json_list(j_caps_json))
-                        if not need.issubset(agent_caps):
-                            continue
-                    workspace_capability = workspace_capability_for_kind(j_kind)
-                    if (
-                        workspace_capability
-                        and "*" not in agent_caps
-                        and workspace_capability not in agent_caps
-                    ):
-                        continue
+                    # ELIGIBILITY FILTERS REMOVED (operator 2026-06-03):
+                    # all workers eligible for everything — any worker claims any
+                    # queued job. kind-affinity / eligible_kinds / eligible_hosts /
+                    # required_capabilities / workspace-capability gates deleted.
+                    # DAG depends_on + retry-backoff above still honored.
                     # NO TIER GATING (operator 2026-06-01): all executor agents
                     # may claim any job regardless of cost tier. Cost/model
                     # selection is a DISPATCH concern — zeroclaw routes per-model
