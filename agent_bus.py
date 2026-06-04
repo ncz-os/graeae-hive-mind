@@ -728,6 +728,9 @@ KIND_HOST_AFFINITY: dict[str, list[str]] = {
     # those by SSHing to the appropriate host. Host affinity would over-restrict.
 }
 
+NARROW_HOSTS = {"cixmini", "bigpi", "clawpi", "zeropi"}
+NARROW_ALLOWLIST = ("cixmini-os:", "ncz-os-", "fleet-infra:")
+
 # WORKSPACE AFFINITY — automatic required_capabilities injection + claim guard.
 # Workspace-scoped jobs must only be offered to workers that explicitly
 # advertise the matching workspace capability. This protects both newly
@@ -3003,6 +3006,9 @@ async def claim_job(job_id: str, by: str):
          j_pref_providers, j_pref_models, j_deps_json,
          j_retry_backoff_until) = job_row
 
+        urn_parts = by.split(":")
+        agent_host = (urn_parts[3] if len(urn_parts) > 3 else "").lower()
+
         if j_status not in ("queued", "offered"):
             raise HTTPException(
                 409, f"job already in status={j_status!r}; cannot claim"
@@ -3014,6 +3020,9 @@ async def claim_job(job_id: str, by: str):
                 409,
                 f"job is in retry backoff until {j_retry_backoff_until} (now={now})",
             )
+
+        if agent_host in NARROW_HOSTS and not (j_kind or "").startswith(NARROW_ALLOWLIST):
+            raise HTTPException(403, f"narrow host {agent_host} not allowed for kind {j_kind}")
 
         kind_affinity = kind_affinity_for_kind(j_kind)
         if kind_affinity and not set(kind_affinity).intersection(eligible_aliases):
@@ -3051,9 +3060,7 @@ async def claim_job(job_id: str, by: str):
         # eligible_hosts
         if j_hosts_json:
             hosts = set(json_list(j_hosts_json))
-            urn_parts = by.split(":")
             host_lc = {h.lower() for h in hosts}
-            agent_host = (urn_parts[3] if len(urn_parts) > 3 else "").lower()
             if hosts and "*" not in hosts and agent_host not in host_lc:
                 raise HTTPException(
                     403,

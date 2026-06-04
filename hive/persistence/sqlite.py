@@ -15,6 +15,10 @@ except ModuleNotFoundError:
 from .base import HiveMindRepository, Transaction
 
 
+NARROW_HOSTS = {"cixmini", "bigpi", "clawpi", "zeropi"}
+NARROW_ALLOWLIST = ("cixmini-os:", "ncz-os-", "fleet-infra:")
+
+
 class SqliteHiveRepository(HiveMindRepository):
     def __init__(self, db_path: str, *, busy_timeout_ms: int = 5000) -> None:
         self.db_path = db_path
@@ -208,6 +212,8 @@ class SqliteHiveRepository(HiveMindRepository):
                         (job_id, j_kind, j_desc, j_prio, j_dead, j_caps_json, _j_kinds_json,
                          _j_hosts_json, j_sub, j_par, j_started, j_max_tier, j_pref_providers,
                          j_pref_models, j_mnemos_refs, j_deps_json) = r
+                        if urn_host in NARROW_HOSTS and not (j_kind or "").startswith(NARROW_ALLOWLIST):
+                            continue
                         if j_deps_json:
                             deps = json_list(j_deps_json)
                             if deps:
