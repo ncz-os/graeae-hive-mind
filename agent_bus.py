@@ -3149,12 +3149,14 @@ async def claim_job(job_id: str, by: str):
 async def list_jobs(
     status: Optional[str] = None,
     agent_urn: Optional[str] = None,
+    parent_job_id: Optional[str] = None,
     since: Optional[float] = None,
     limit: int = 100,
 ):
     limit = clamp_limit(limit, default=100, max_limit=1000)
     sql = ("SELECT id, submitter_urn, parent_job_id, kind, description, priority, status, "
-           "claimed_by, started_at, ended_at, result, estimated_cost_usd, eligible_kinds, eligible_hosts FROM jobs WHERE 1=1")
+           "claimed_by, started_at, ended_at, result, estimated_cost_usd, "
+           "required_capabilities, eligible_kinds, eligible_hosts FROM jobs WHERE 1=1")
     args: list = []
     cnt_sql = "SELECT COUNT(*) FROM jobs WHERE 1=1"
     cnt_args: list = []
@@ -3168,6 +3170,11 @@ async def list_jobs(
         cnt_sql += " AND (submitter_urn=? OR claimed_by=?)"
         args.extend([agent_urn, agent_urn])
         cnt_args.extend([agent_urn, agent_urn])
+    if parent_job_id:
+        sql += " AND parent_job_id=?"
+        cnt_sql += " AND parent_job_id=?"
+        args.append(parent_job_id)
+        cnt_args.append(parent_job_id)
     if since:
         sql += " AND started_at >= ?"
         cnt_sql += " AND started_at >= ?"
@@ -3194,8 +3201,9 @@ async def list_jobs(
                     "started_at": r[8], "ended_at": r[9],
                     "result": json.loads(r[10]) if r[10] else None,
                     "estimated_cost_usd": r[11],
-                    "eligible_kinds": json.loads(r[12]) if r[12] else None,
-                    "eligible_hosts": json.loads(r[13]) if r[13] else None,
+                    "required_capabilities": json.loads(r[12]) if r[12] else None,
+                    "eligible_kinds": json.loads(r[13]) if r[13] else None,
+                    "eligible_hosts": json.loads(r[14]) if r[14] else None,
                 })
     return {"count": len(rows), "total": total, "jobs": rows}
 
