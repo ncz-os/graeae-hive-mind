@@ -3063,9 +3063,12 @@ async def knemon_route(req: Request):
         CODEX_SUB_LEAD = []
         chain = list(open_weight_chain)
     else:
-        # metered open-weight provider keys REVOKED 2026-06-04 (401 fleet-wide) -> OAuth-only,
-        # no metered fallback (a throttled gpt retries/waits rather than 401-cascading 6 dead providers).
-        chain = list(CODEX_SUB_LEAD)
+        # OAuth codex/gpt ($0) leads. Its allowance is a rolling ~5h window (operator/Gemini
+        # 2026-06-04) and caps under heavy job load (gpt-5.4/5.5/mini exhausted; only
+        # gpt-5.3-codex-spark live). When it 429s/usage_limit, fall through to deepseek-direct
+        # (working key in gateway env): v4-pro (main, cheapest after OpenAI) then v4-flash (light).
+        DEEPSEEK_FALLBACK = ["hive_deepseek_pro_1", "hive_deepseek_1"]
+        chain = list(CODEX_SUB_LEAD) + DEEPSEEK_FALLBACK
     return {
         "ok": True,
         "max_cost_tier": max_tier,
