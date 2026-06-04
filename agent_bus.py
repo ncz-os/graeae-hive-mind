@@ -2026,6 +2026,8 @@ async def create_job(req: JobCreate):
             {
                 "tier": max_cost_tier,
                 "caps": sorted(req.required_capabilities or []),
+                "eligible_hosts": sorted(req.eligible_hosts or []),
+                "eligible_kinds": sorted(req.eligible_kinds or []),
                 "preferred_providers": req.preferred_providers or [],
                 "preferred_models": req.preferred_models or [],
                 "depends_on": sorted(req.depends_on or []),
@@ -2115,6 +2117,8 @@ async def dequeue_next_job(agent_urn: str):
             match_capabilities=queue_logic.match,
             kind_aliases=agent_kind_aliases,
             json_list=json_list,
+            cost_tiers=COST_TIERS,
+            throttle_headroom=THROTTLE_HEADROOM,
         )
     except aiosqlite.Error as e:
         raise HTTPException(500, f"claim failed: database error while claiming next job: {e}") from e
@@ -2975,7 +2979,9 @@ async def claim_job(job_id: str, by: str):
             raise HTTPException(409, f"claim failed: agent status is {agent_status!r}, not online/idle: {by}")
         agent_caps = set(json.loads(caps_json)) if caps_json else set()
         eligible_aliases = agent_kind_aliases(agent_kind, a_runtime)
-        a_tier = a_tier or "C"
+        a_tier = (a_tier or "C").upper()
+        if a_tier not in COST_TIERS:
+            a_tier = "C"
         a_auth = (a_auth or "unknown").lower()
         sub_throttled = (
             a_auth == "subscription" and a_cap and a_used
@@ -2985,7 +2991,7 @@ async def claim_job(job_id: str, by: str):
         # 2. job must exist + be claimable + agent must satisfy its filters
         async with db.execute(
             "SELECT status, kind, required_capabilities, eligible_kinds, "
-            "max_cost_tier, preferred_providers, preferred_models, "
+            "eligible_hosts, max_cost_tier, preferred_providers, preferred_models, "
             "depends_on, retry_backoff_until "
             "FROM jobs WHERE id=?",
             (job_id,),
@@ -2993,7 +2999,7 @@ async def claim_job(job_id: str, by: str):
             job_row = await cur.fetchone()
         if not job_row:
             raise HTTPException(404, f"job not found: {job_id}")
-        (j_status, j_kind, j_caps_json, j_kinds_json, j_max_tier,
+        (j_status, j_kind, j_caps_json, j_kinds_json, j_hosts_json, j_max_tier,
          j_pref_providers, j_pref_models, j_deps_json,
          j_retry_backoff_until) = job_row
 
@@ -3042,15 +3048,25 @@ async def claim_job(job_id: str, by: str):
                     f"agent kind aliases={sorted(eligible_aliases)!r} not in eligible_kinds={sorted(kinds)}",
                 )
 
-        # required_capabilities (wildcard "*" claim-any escape)
-        if j_caps_json and "*" not in agent_caps:
-            need = set(json_list(j_caps_json))
-            if not need.issubset(agent_caps):
-                missing = sorted(need - agent_caps)
+        # eligible_hosts
+        if j_hosts_json:
+            hosts = set(json_list(j_hosts_json))
+            urn_parts = by.split(":")
+            host_lc = {h.lower() for h in hosts}
+            agent_host = (urn_parts[3] if len(urn_parts) > 3 else "").lower()
+            if hosts and "*" not in hosts and agent_host not in host_lc:
                 raise HTTPException(
                     403,
-                    f"agent missing required_capabilities: {missing}",
+                    f"agent host={agent_host!r} not in eligible_hosts={sorted(hosts)}",
                 )
+
+        # required_capabilities: use queue_logic.match so hard labels require
+        # exact caps; a legacy "*" capability only satisfies soft/bare labels.
+        if j_caps_json:
+            labels = json_list(j_caps_json)
+            cap_match = queue_logic.match(labels, agent_caps)
+            if labels and not cap_match.eligible:
+                raise HTTPException(403, f"agent does not satisfy required_capabilities: {cap_match.reason}")
 
         workspace_capability = workspace_capability_for_kind(j_kind)
         if (
