@@ -430,6 +430,26 @@ def _invoke_gateway(prompt: str) -> tuple[bool, str]:
         return False, f"gateway call failed: {e}"
 
 
+def _gateway_failure_allows_fallback(reason: str) -> bool:
+    """Only genuine gateway transport outages may fall back to open-weight."""
+    text = (reason or "").lower()
+    if re.search(r"gateway http (502|503|504)\b", text):
+        return True
+    if not text.startswith("gateway call failed:"):
+        return False
+    outage_markers = (
+        "connection refused",
+        "connection reset",
+        "connection aborted",
+        "timed out",
+        "timeout",
+        "network is unreachable",
+        "no route to host",
+        "temporarily unavailable",
+    )
+    return any(marker in text for marker in outage_markers)
+
+
 CODEX_BIN = os.environ.get("CODEX_BIN", "/usr/local/bin/codex")
 CODEX_TIMEOUT = int(os.environ.get("CODEX_TIMEOUT", "120"))
 
@@ -557,7 +577,9 @@ def invoke_doctor_agent(prompt: str, phase: str = "triage") -> tuple[bool, str]:
         ok, text = _invoke_gateway(prompt)
         if ok and text.strip():
             return True, text
-        log.warning("gateway codex path failed (%s) — open-weight fallback", str(text)[:200])
+        if not _gateway_failure_allows_fallback(text):
+            return False, f"gateway codex failed: {text}"
+        log.warning("gateway codex transport outage (%s) — open-weight fallback", str(text)[:200])
         ok2, text2 = _invoke_openweight(prompt, DOCTOR_OPENWEIGHT_MODEL)
         if ok2 and text2.strip():
             return True, text2
