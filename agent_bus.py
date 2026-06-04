@@ -800,7 +800,7 @@ TERMINAL_JOB_STATUSES = {"done", "failed", "cancelled", "dead-letter"}
 # legitimate "not me" routing signals. They must not burn the decline dead-letter
 # threshold; real execution failures use the failed/retry path.
 MAX_DECLINE_REQUEUES = 3
-DECLINE_REASON_PREFIXES: tuple[str, ...] = ()
+DECLINE_REASON_PREFIXES: tuple[str, ...] = ("no_workspace_for_kind", "no_workspace_for_repo")  # job-level unschedulable -> count toward dead-letter (terminate reclaim loop); host_declines_kind/released_by_host stay OUT (matcher routes to capable hosts)
 STATUS_TRANSITIONS: dict[str, set[str]] = {
     "queued": {"queued", "offered", "claimed", "cancelled"},
     "offered": {"queued", "claimed", "cancelled"},
