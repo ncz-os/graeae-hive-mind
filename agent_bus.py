@@ -1970,6 +1970,18 @@ async def create_job(req: JobCreate):
                 raise HTTPException(422, f"depends_on references unknown job ids: {missing}")
     # AFFINITY INJECTION REMOVED (operator 2026-06-03): jobs are not pinned to
     # hosts/kinds/capabilities — all workers eligible for everything.
+    # NARROW HEAVY-REPO CARVE-OUT (operator 2026-06-04, GRAEAE consult): the only
+    # documented exception to the line above. Large-repo classes (zeroclaw — big
+    # Rust tree) strain a lightweight worker's in-job clone -> timeout -> retry
+    # thrash -> dead-letter. Tagging them 'heavy-repo' means ONLY build hosts that
+    # advertise that capability claim them (true skip-at-poll, NOT decline-after-
+    # claim per directive 15). Everything else stays all-eligible.
+    HEAVY_REPO_KIND_PREFIXES = ("zeroclaw:", "ncz-os-zeroclaw:")
+    if any((req.kind or "").startswith(_p) for _p in HEAVY_REPO_KIND_PREFIXES):
+        _caps = list(req.required_capabilities or [])
+        if "heavy-repo" not in _caps:
+            _caps.append("heavy-repo")
+            req = req.model_copy(update={"required_capabilities": _caps})
     # ROLE ENFORCEMENT: check submitter runtime BEFORE the cache lookup so
     # worker-only runtimes get a 403 consistently for both cache hits and
     # cache misses. Unregistered submitter_urn values are rejected too; the
