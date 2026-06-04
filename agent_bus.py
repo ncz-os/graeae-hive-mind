@@ -751,6 +751,8 @@ KIND_WORKSPACE_CAPABILITY: dict[str, str] = {
     "riskybiz:": "workspace-riskybiz",
 }
 
+HEAVY_REPO_KIND_PREFIXES = ("zeroclaw:", "ncz-os-zeroclaw:")
+
 # COST-TIER MAP (per ~/.claude/rules/llm-usage-policy-2026-05-22.md):
 #   A = FREE   — local + NGC NIM (try first, token-miser)
 #   B = CHEAP  — Groq Dev tier, xAI, DeepSeek direct, Together cheap, Gemini-Flash, OpenAI-mini
@@ -794,14 +796,11 @@ PROVIDER_COST_TIER: dict[str, str] = {
 COST_TIERS = ["A", "B", "C"]
 VALID_JOB_STATUSES = {"queued", "offered", "claimed", "running", "done", "failed", "failed_completion", "cancelled", "dead-letter"}
 TERMINAL_JOB_STATUSES = {"done", "failed", "cancelled", "dead-letter"}
-# Thrash fix (2026-06-02): a host-pinned job whose only eligible host declines
-# its kind would requeue forever (claim→decline→requeue→claim...). After this
-# many worker-decline requeues we divert the job to the terminal 'dead-letter'
-# status instead of 'queued', so the dequeue loop (WHERE status='queued') stops
-# re-serving it. Worker declines are PATCH status=queued carrying a worker_error
-# of host_declines_kind / no_workspace_for_kind in the result payload.
+# Skip releases (host_declines_kind/released_by_host/no_workspace_for_kind) are
+# legitimate "not me" routing signals. They must not burn the decline dead-letter
+# threshold; real execution failures use the failed/retry path.
 MAX_DECLINE_REQUEUES = 3
-DECLINE_REASON_PREFIXES = ("host_declines_kind", "no_workspace_for_kind")
+DECLINE_REASON_PREFIXES: tuple[str, ...] = ()
 STATUS_TRANSITIONS: dict[str, set[str]] = {
     "queued": {"queued", "offered", "claimed", "cancelled"},
     "offered": {"queued", "claimed", "cancelled"},
@@ -848,7 +847,17 @@ def clamp_limit(value: int, *, default: int = 100, max_limit: int = 1000) -> int
     return min(limit, max_limit)
 
 
+def _norm_str(value: Any) -> str:
+    return value.lower() if isinstance(value, str) else ""
+
+
+def _norm_str_set(values: Any) -> set[str]:
+    return {_norm_str(v) for v in (values or []) if _norm_str(v)}
+
+
 def agent_kind_aliases(kind: str, runtime: Optional[str]) -> set[str]:
+    kind = _norm_str(kind)
+    runtime = _norm_str(runtime)
     aliases = {kind}
     if runtime:
         aliases.add(runtime)
@@ -857,19 +866,12 @@ def agent_kind_aliases(kind: str, runtime: Optional[str]) -> set[str]:
         if kind in kinds:
             aliases.add(rt)
             aliases.update(kinds)
-    # ALL-EXECUTORS-ELIGIBLE (operator 2026-06-01): claude, opencode, codex and
-    # zeroclaw are MUTUALLY eligible for every executor job. They differ only at
-    # DISPATCH — zeroclaw routes per-model by complexity (KNEMON); the others are
-    # single-agent. No tier or cross-kind gating between executors. A job marked
-    # for any one of them is claimable by all of them.
-    EXECUTOR_KINDS = {"claude", "codex", "zeroclaw", "opencode"}
-    if aliases & EXECUTOR_KINDS:
-        aliases |= EXECUTOR_KINDS
     aliases.discard("")
     return aliases
 
 
 def workspace_capability_for_kind(kind: str) -> Optional[str]:
+    kind = _norm_str(kind)
     for prefix, capability in KIND_WORKSPACE_CAPABILITY.items():
         if kind.startswith(prefix):
             return capability
@@ -877,10 +879,73 @@ def workspace_capability_for_kind(kind: str) -> Optional[str]:
 
 
 def kind_affinity_for_kind(kind: str) -> Optional[list[str]]:
+    kind = _norm_str(kind)
     for prefix, kinds in KIND_KIND_AFFINITY.items():
         if kind.startswith(prefix):
             return kinds
     return None
+
+
+def heavy_repo_required_for_kind(kind: str) -> bool:
+    kind = _norm_str(kind)
+    return any(kind.startswith(prefix) for prefix in HEAVY_REPO_KIND_PREFIXES)
+
+
+def job_agent_preference_score(job: dict[str, Any], agent: dict[str, Any]) -> int:
+    score = 0
+    agent_provider = _norm_str(agent.get("provider"))
+    agent_model = _norm_str(agent.get("model"))
+    provs = [_norm_str(p) for p in (job.get("preferred_providers") or []) if _norm_str(p)]
+    models = [_norm_str(m) for m in (job.get("preferred_models") or []) if _norm_str(m)]
+    if agent_provider in provs:
+        score += 1000 - provs.index(agent_provider)
+    if agent_model in models:
+        score += 1000 - models.index(agent_model)
+    return score
+
+
+def job_agent_eligible(job: dict[str, Any], agent: dict[str, Any]) -> tuple[bool, str]:
+    agent_host = _norm_str(agent.get("host"))
+    agent_caps = _norm_str_set(agent.get("capabilities"))
+    eligible_aliases = _norm_str_set(agent.get("eligible_aliases"))
+    j_kind = _norm_str(job.get("kind"))
+
+    if agent_host in NARROW_HOSTS and not j_kind.startswith(NARROW_ALLOWLIST):
+        return False, f"narrow host {agent_host} not allowed for kind {j_kind}"
+
+    kind_affinity = kind_affinity_for_kind(j_kind)
+    if kind_affinity and not _norm_str_set(kind_affinity).intersection(eligible_aliases):
+        return False, f"agent kind aliases={sorted(eligible_aliases)!r} do not satisfy kind affinity={kind_affinity!r}"
+
+    kinds = _norm_str_set(job.get("eligible_kinds"))
+    if kinds and "*" not in kinds and not kinds.intersection(eligible_aliases):
+        return False, f"agent kind aliases={sorted(eligible_aliases)!r} not in eligible_kinds={sorted(kinds)}"
+
+    hosts = _norm_str_set(job.get("eligible_hosts"))
+    if hosts and "*" not in hosts and agent_host not in hosts:
+        return False, f"agent host={agent_host!r} not in eligible_hosts={sorted(hosts)}"
+
+    labels = [_norm_str(c) for c in (job.get("required_capabilities") or []) if _norm_str(c)]
+    if heavy_repo_required_for_kind(j_kind) and "heavy-repo" not in labels:
+        labels.append("heavy-repo")
+    if labels:
+        cap_match = queue_logic.match(labels, agent_caps)
+        if not cap_match.eligible:
+            return False, f"agent does not satisfy required_capabilities: {cap_match.reason}"
+
+    job_max_tier = (job.get("max_cost_tier") or "B").upper()
+    agent_tier = (agent.get("cost_tier") or "C").upper()
+    if job_max_tier not in COST_TIERS:
+        return False, f"job max_cost_tier is invalid: {job_max_tier!r}"
+    if agent_tier not in COST_TIERS:
+        agent_tier = "C"
+    if COST_TIERS.index(agent_tier) > COST_TIERS.index(job_max_tier):
+        return False, f"agent cost_tier={agent_tier!r} exceeds job max_cost_tier={job_max_tier!r}"
+
+    if agent.get("subscription_throttled") and job_max_tier != "A":
+        return False, f"subscription agent throttled (>= {THROTTLE_HEADROOM*100:.0f}% MTD); cannot claim tier-{job_max_tier} jobs"
+
+    return True, "eligible"
 
 
 def field_was_set(model: BaseModel, name: str) -> bool:
@@ -1943,7 +2008,7 @@ async def create_job(req: JobCreate):
     if req.eligible_kinds:
         ek = list(req.eligible_kinds)
         # Filter out non-claimer kinds
-        kept = [k for k in ek if k not in NON_CLAIMER_KINDS]
+        kept = [k for k in ek if _norm_str(k) not in NON_CLAIMER_KINDS]
         if not kept:
             # All entries were non-claimer → rewrite to zeroclaw
             req = req.model_copy(update={"eligible_kinds": ["zeroclaw"]})
@@ -1976,10 +2041,9 @@ async def create_job(req: JobCreate):
     # thrash -> dead-letter. Tagging them 'heavy-repo' means ONLY build hosts that
     # advertise that capability claim them (true skip-at-poll, NOT decline-after-
     # claim per directive 15). Everything else stays all-eligible.
-    HEAVY_REPO_KIND_PREFIXES = ("zeroclaw:", "ncz-os-zeroclaw:")
-    if any((req.kind or "").startswith(_p) for _p in HEAVY_REPO_KIND_PREFIXES):
+    if heavy_repo_required_for_kind(req.kind):
         _caps = list(req.required_capabilities or [])
-        if "heavy-repo" not in _caps:
+        if "heavy-repo" not in _norm_str_set(_caps):
             _caps.append("heavy-repo")
             req = req.model_copy(update={"required_capabilities": _caps})
     # ROLE ENFORCEMENT: check submitter runtime BEFORE the cache lookup so
@@ -1987,6 +2051,22 @@ async def create_job(req: JobCreate):
     # cache misses. Unregistered submitter_urn values are rejected too; the
     # endpoint contract says jobs are submitted by registered orchestrators.
     await require_orchestrator_submitter(req.submitter_urn)
+
+    if req.eligible_kinds and "*" not in req.eligible_kinds:
+        async with connect_db() as _edb:
+            async with _edb.execute(
+                "SELECT kind, runtime FROM agents"
+            ) as _cur:
+                registered_aliases: set[str] = set()
+                async for _kind, _runtime in _cur:
+                    registered_aliases.update(agent_kind_aliases(_kind, _runtime))
+        requested = _norm_str_set(req.eligible_kinds)
+        if requested and not requested.intersection(registered_aliases):
+            raise HTTPException(
+                422,
+                f"eligible_kinds has no registered worker: requested={sorted(requested)!r}; "
+                f"registered_agent_kinds={sorted(registered_aliases)!r}",
+            )
 
     # RESULT-CACHE CHECK: identical (kind, description, max_cost_tier, required_caps) within TTL → return cached result, mark new job done immediately
     ck = cache_key_for(req.kind, req.description, max_cost_tier, req.required_capabilities)
@@ -2122,43 +2202,166 @@ async def dequeue_next_job(agent_urn: str):
     Race-safe via SQLite immediate-mode UPDATE...WHERE rowid=(SELECT...LIMIT 1) under a transaction.
     """
     now = time.time()
-    try:
-        claimed = await hive_repo().claim_next_job(
-            agent_urn=agent_urn,
-            now=now,
-            active_statuses=ACTIVE_AGENT_STATUSES,
-            claim_lease_seconds=CLAIM_LEASE_SECONDS,
-            host_denylist=HOST_DENYLIST,
-            match_capabilities=queue_logic.match,
-            kind_aliases=agent_kind_aliases,
-            json_list=json_list,
-            cost_tiers=COST_TIERS,
-            throttle_headroom=THROTTLE_HEADROOM,
-        )
-    except aiosqlite.Error as e:
-        raise HTTPException(500, f"claim failed: database error while claiming next job: {e}") from e
-    if isinstance(claimed, dict) and claimed.get("error") == "not_registered":
-        raise HTTPException(404, f"claim failed: agent not registered: {agent_urn}")
-    if isinstance(claimed, dict) and claimed.get("error") == "inactive":
-        raise HTTPException(
-            409,
-            f"claim failed: agent status is {claimed.get('status')!r}, not online/idle: {agent_urn}",
-        )
-    if isinstance(claimed, dict) and claimed.get("error") == "host_denylisted":
+    urn_parts = agent_urn.split(":")
+    agent_host = (urn_parts[3] if len(urn_parts) > 3 else "").lower()
+    if agent_host in HOST_DENYLIST:
         from fastapi.responses import Response as _DRsp
         return _DRsp(status_code=204, headers={
             "X-Hive-Claim-Result": "host_denylisted",
-            "X-Hive-Claim-Detail": f"host {claimed.get('host')} is in HIVE_HOST_DENYLIST",
+            "X-Hive-Claim-Detail": f"host {agent_host} is in HIVE_HOST_DENYLIST",
         })
-    if claimed:
-        resources = claimed.get("claimed_resources") or {}
+
+    try:
         async with connect_db() as db:
-            await emit_event(db, "job.claimed", {
-                "id": claimed["id"], "claimed_by": agent_urn, "kind": claimed["kind"],
-                "runtime": resources.get("runtime"), "model": resources.get("model"),
-                "provider": resources.get("provider"), "cost_tier": resources.get("cost_tier"),
-            })
-        return claimed
+            await db.execute("BEGIN IMMEDIATE")
+            async with db.execute(
+                "SELECT kind, capabilities, runtime, model, provider, cost_tier, "
+                "auth_method, plan_cap_usd, plan_period_used_usd, status "
+                "FROM agents WHERE urn=?",
+                (agent_urn,),
+            ) as cur:
+                agent_row = await cur.fetchone()
+            if not agent_row:
+                await db.execute("ROLLBACK")
+                raise HTTPException(404, f"claim failed: agent not registered: {agent_urn}")
+            (agent_kind, caps_json, a_runtime, a_model, a_provider, a_tier,
+             a_auth, a_cap, a_used, agent_status) = agent_row
+            if agent_status not in ACTIVE_AGENT_STATUSES:
+                await db.execute("ROLLBACK")
+                raise HTTPException(
+                    409,
+                    f"claim failed: agent status is {agent_status!r}, not online/idle: {agent_urn}",
+                )
+            agent_caps = set(json.loads(caps_json)) if caps_json else set()
+            a_tier = (a_tier or "C").upper()
+            if a_tier not in COST_TIERS:
+                a_tier = "C"
+            a_auth = (a_auth or "unknown").lower()
+            agent = {
+                "urn": agent_urn,
+                "host": agent_host,
+                "kind": agent_kind,
+                "runtime": a_runtime,
+                "model": a_model,
+                "provider": a_provider,
+                "cost_tier": a_tier,
+                "capabilities": agent_caps,
+                "eligible_aliases": agent_kind_aliases(agent_kind, a_runtime),
+                "subscription_throttled": (
+                    a_auth == "subscription" and a_cap and a_used
+                    and a_used >= THROTTLE_HEADROOM * a_cap
+                ),
+            }
+
+            async with db.execute(
+                "SELECT id, submitter_urn, parent_job_id, kind, description, priority, deadline, "
+                "required_capabilities, eligible_kinds, eligible_hosts, project, max_cost_tier, "
+                "preferred_providers, preferred_models, mnemos_refs, depends_on, retry_backoff_until "
+                "FROM jobs WHERE status IN ('queued','offered') "
+                "AND (retry_backoff_until IS NULL OR retry_backoff_until <= ?) "
+                "ORDER BY priority DESC, started_at ASC LIMIT 100",
+                (now,),
+            ) as cur:
+                candidates = [tuple(r) async for r in cur]
+            candidates = [
+                r for _idx, r in sorted(
+                    enumerate(candidates),
+                    key=lambda item: (
+                        item[1][5] or 0,
+                        job_agent_preference_score(
+                            {
+                                "preferred_providers": json_list(item[1][12]),
+                                "preferred_models": json_list(item[1][13]),
+                            },
+                            agent,
+                        ),
+                        -item[0],
+                    ),
+                    reverse=True,
+                )
+            ]
+
+            claimed = None
+            for r in candidates:
+                (j_id, j_submitter, j_parent, j_kind, j_desc, j_priority, j_deadline,
+                 j_caps_json, j_kinds_json, j_hosts_json, j_project, j_max_tier,
+                 j_pref_providers, j_pref_models, j_mnemos_refs, j_deps_json,
+                 _j_retry_backoff_until) = r
+                deps = json_list(j_deps_json)
+                if deps:
+                    ph = ",".join("?" * len(deps))
+                    async with db.execute(
+                        f"SELECT COUNT(*) FROM jobs WHERE id IN ({ph}) AND status='done'",
+                        tuple(deps),
+                    ) as dc:
+                        done_count = (await dc.fetchone())[0]
+                    if done_count < len(deps):
+                        continue
+                job = {
+                    "id": j_id,
+                    "kind": j_kind,
+                    "required_capabilities": json_list(j_caps_json),
+                    "eligible_kinds": json_list(j_kinds_json),
+                    "eligible_hosts": json_list(j_hosts_json),
+                    "max_cost_tier": j_max_tier,
+                    "preferred_providers": json_list(j_pref_providers),
+                    "preferred_models": json_list(j_pref_models),
+                }
+                eligible, _reason = job_agent_eligible(job, agent)
+                if not eligible:
+                    continue
+                cur2 = await db.execute(
+                    "UPDATE jobs SET status='claimed', claimed_by=?, claimed_at=?, "
+                    "claimed_runtime=?, claimed_model=?, claimed_provider=?, claimed_cost_tier=?, "
+                    "claim_lease_expires_at=? "
+                    "WHERE id=? AND status IN ('queued','offered')",
+                    (agent_urn, now, a_runtime, a_model, a_provider, a_tier,
+                     now + CLAIM_LEASE_SECONDS, j_id),
+                )
+                if cur2.rowcount == 0:
+                    continue
+                claimed = {
+                    "id": j_id,
+                    "submitter_urn": j_submitter,
+                    "parent_job_id": j_parent,
+                    "kind": j_kind,
+                    "description": j_desc,
+                    "priority": j_priority,
+                    "deadline": j_deadline,
+                    "required_capabilities": json_list(j_caps_json),
+                    "eligible_kinds": json_list(j_kinds_json),
+                    "eligible_hosts": json_list(j_hosts_json),
+                    "project": j_project,
+                    "max_cost_tier": j_max_tier,
+                    "preferred_providers": json_list(j_pref_providers),
+                    "preferred_models": json_list(j_pref_models),
+                    "mnemos_refs": json_list(j_mnemos_refs),
+                    "status": "claimed",
+                    "claimed_by": agent_urn,
+                    "claimed_at": now,
+                    "claim_lease_expires_at": now + CLAIM_LEASE_SECONDS,
+                    "claimed_resources": {
+                        "runtime": a_runtime,
+                        "model": a_model,
+                        "provider": a_provider,
+                        "cost_tier": a_tier,
+                    },
+                }
+                break
+            await db.commit()
+            if claimed:
+                resources = claimed.get("claimed_resources") or {}
+                await emit_event(db, "job.claimed", {
+                    "id": claimed["id"], "claimed_by": agent_urn, "kind": claimed["kind"],
+                    "runtime": resources.get("runtime"), "model": resources.get("model"),
+                    "provider": resources.get("provider"), "cost_tier": resources.get("cost_tier"),
+                })
+                return claimed
+    except HTTPException:
+        raise
+    except aiosqlite.Error as e:
+        raise HTTPException(500, f"claim failed: database error while claiming next job: {e}") from e
+
     # HTTP 204 = No Content. By spec the response body must be EMPTY.
     # JSONResponse(content=None) writes 'null' (4 bytes) which violates the
     # contract and triggers h11 LocalProtocolError. Use Response (no body).
@@ -2208,10 +2411,8 @@ async def update_job(job_id: str, req: JobUpdate):
     )
     cost_estimate = None
 
-    # Thrash fix (2026-06-02): is this a worker DECLINE (release to queued with a
-    # host_declines_kind / no_workspace_for_kind worker_error)? If so we count it,
-    # and after MAX_DECLINE_REQUEUES divert the job to terminal 'dead-letter'
-    # instead of re-queueing it forever.
+    # Skip releases are not failures. DECLINE_REASON_PREFIXES is intentionally
+    # empty unless a future real failure release reason needs dead-letter counting.
     decline_reason = None
     dead_lettered = False
     if req.status == "queued" and isinstance(req.result, dict):
@@ -2351,12 +2552,8 @@ async def update_job(job_id: str, req: JobUpdate):
                     f"job {job_id} status changed concurrently (expected {old_status!r}); retry",
                 )
 
-            # Thrash fix (2026-06-02): worker-decline requeue counting. The main
-            # UPDATE above already set status='queued'. Now bump decline_count; if
-            # it reaches MAX_DECLINE_REQUEUES, divert to terminal 'dead-letter' so
-            # the claim→decline→requeue loop terminates. (Only declines via
-            # host_declines_kind / no_workspace_for_kind count — genuine releases
-            # without a decline worker_error do not.)
+            # Optional real-failure release counting. Routing skips such as
+            # host_declines_kind/released_by_host/no_workspace_for_kind do not count.
             if decline_reason is not None and release_to_queue:
                 new_decline_count = (decline_count or 0) + 1
                 if new_decline_count >= MAX_DECLINE_REQUEUES:
@@ -3033,16 +3230,6 @@ async def claim_job(job_id: str, by: str):
                 f"job is in retry backoff until {j_retry_backoff_until} (now={now})",
             )
 
-        if agent_host in NARROW_HOSTS and not (j_kind or "").startswith(NARROW_ALLOWLIST):
-            raise HTTPException(403, f"narrow host {agent_host} not allowed for kind {j_kind}")
-
-        kind_affinity = kind_affinity_for_kind(j_kind)
-        if kind_affinity and not set(kind_affinity).intersection(eligible_aliases):
-            raise HTTPException(
-                403,
-                f"agent kind aliases={sorted(eligible_aliases)!r} do not satisfy kind affinity={kind_affinity!r}",
-            )
-
         # DAG gate: all depends_on must be status='done'
         if j_deps_json:
             deps = json_list(j_deps_json)
@@ -3060,77 +3247,32 @@ async def claim_job(job_id: str, by: str):
                         f"({done_count}/{len(deps)} done)",
                     )
 
-        # eligible_kinds
-        if j_kinds_json:
-            kinds = set(json_list(j_kinds_json))
-            if kinds and "*" not in kinds and not kinds.intersection(eligible_aliases):
-                raise HTTPException(
-                    403,
-                    f"agent kind aliases={sorted(eligible_aliases)!r} not in eligible_kinds={sorted(kinds)}",
-                )
-
-        # eligible_hosts
-        if j_hosts_json:
-            hosts = set(json_list(j_hosts_json))
-            host_lc = {h.lower() for h in hosts}
-            if hosts and "*" not in hosts and agent_host not in host_lc:
-                raise HTTPException(
-                    403,
-                    f"agent host={agent_host!r} not in eligible_hosts={sorted(hosts)}",
-                )
-
-        # required_capabilities: use queue_logic.match so hard labels require
-        # exact caps; a legacy "*" capability only satisfies soft/bare labels.
-        if j_caps_json:
-            labels = json_list(j_caps_json)
-            cap_match = queue_logic.match(labels, agent_caps)
-            if labels and not cap_match.eligible:
-                raise HTTPException(403, f"agent does not satisfy required_capabilities: {cap_match.reason}")
-
-        workspace_capability = workspace_capability_for_kind(j_kind)
-        if (
-            workspace_capability
-            and "*" not in agent_caps
-            and workspace_capability not in agent_caps
-        ):
-            raise HTTPException(
-                403,
-                f"agent missing workspace capability for {j_kind!r}: {workspace_capability!r}",
-            )
-
-        # cost-tier ceiling
-        job_max_tier = (j_max_tier or "B").upper()
-        if job_max_tier not in COST_TIERS:
-            raise HTTPException(422, f"job max_cost_tier is invalid: {job_max_tier!r}")
-        if COST_TIERS.index(a_tier) > COST_TIERS.index(job_max_tier):
-            raise HTTPException(
-                403,
-                f"agent cost_tier={a_tier!r} exceeds job max_cost_tier={job_max_tier!r}",
-            )
-
-        # subscription throttling
-        if sub_throttled and job_max_tier != "A":
-            raise HTTPException(
-                429,
-                f"subscription agent throttled (>= {THROTTLE_HEADROOM*100:.0f}% MTD); "
-                f"cannot claim tier-{job_max_tier} jobs",
-            )
-
-        # preferred_providers / preferred_models
-        if j_pref_providers:
-            provs = json.loads(j_pref_providers)
-            if provs and a_provider not in provs:
-                raise HTTPException(
-                    403,
-                    f"agent provider={a_provider!r} not in preferred_providers={provs}",
-                )
-        if j_pref_models:
-            models = json.loads(j_pref_models)
-            if models and a_model not in models:
-                raise HTTPException(
-                    403,
-                    f"agent model={a_model!r} not in preferred_models={models}",
-                )
+        agent = {
+            "urn": by,
+            "host": agent_host,
+            "kind": agent_kind,
+            "runtime": a_runtime,
+            "model": a_model,
+            "provider": a_provider,
+            "cost_tier": a_tier,
+            "capabilities": agent_caps,
+            "eligible_aliases": eligible_aliases,
+            "subscription_throttled": sub_throttled,
+        }
+        job = {
+            "id": job_id,
+            "kind": j_kind,
+            "required_capabilities": json_list(j_caps_json),
+            "eligible_kinds": json_list(j_kinds_json),
+            "eligible_hosts": json_list(j_hosts_json),
+            "max_cost_tier": j_max_tier,
+            "preferred_providers": json_list(j_pref_providers),
+            "preferred_models": json_list(j_pref_models),
+        }
+        eligible, reason = job_agent_eligible(job, agent)
+        if not eligible:
+            status = 422 if reason.startswith("job max_cost_tier") else (429 if reason.startswith("subscription agent throttled") else 403)
+            raise HTTPException(status, reason)
 
         # 3. atomic claim with race guard + populate claimed_resources
         cur = await db.execute(
