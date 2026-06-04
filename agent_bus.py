@@ -3022,6 +3022,30 @@ def knemon_bypass_active() -> bool:
         return False
 
 
+KNEMON_CAP_FILE = "/srv/agent-bus/knemon_oauth_cap.json"
+# ChatGPT-subscription codex/gpt allowance is a rolling ~5h window (operator/Gemini 2026-06-04).
+OAUTH_CAP_RESET_SEC = 5 * 3600
+
+
+def oauth_cap_state() -> dict:
+    """OAuth-cap circuit-breaker state. A worker that hits usage_limit on the codex/gpt
+    lead POSTs /v1/knemon/cap, opening the breaker so knemon_route stops leading every job
+    with the doomed OAuth model. Auto-expires at capped_until (then a spark-lead probe
+    resumes; a probe success clears the file via /v1/knemon/cap/clear)."""
+    import json as _j
+    import time as _t
+    try:
+        with open(KNEMON_CAP_FILE) as f:
+            d = _j.load(f)
+        until = float(d.get("capped_until") or 0)
+        now = _t.time()
+        return {"capped": now < until, "capped_until": until, "hit_at": d.get("hit_at"),
+                "model": d.get("model"), "remaining_sec": max(0, int(until - now))}
+    except Exception:
+        return {"capped": False, "capped_until": None, "hit_at": None,
+                "model": None, "remaining_sec": 0}
+
+
 @app.post("/v1/knemon/route")
 async def knemon_route(req: Request):
     """Cost-aware routing. POST {max_cost_tier|tier, kind} -> ordered candidate
@@ -3068,12 +3092,21 @@ async def knemon_route(req: Request):
         # gpt-5.3-codex-spark live). When it 429s/usage_limit, fall through to deepseek-direct
         # (working key in gateway env): v4-pro (main, cheapest after OpenAI) then v4-flash (light).
         DEEPSEEK_FALLBACK = ["hive_deepseek_pro_1", "hive_deepseek_1"]
-        chain = list(CODEX_SUB_LEAD) + DEEPSEEK_FALLBACK
+        cap = oauth_cap_state()
+        if cap.get("capped"):
+            # OAuth lead is inside its ~5h cap window (a worker reported usage_limit): route
+            # deepseek ONLY (drop the codex lead) so no job wastes a doomed 429. The breaker
+            # auto-expires at capped_until; knemon then resumes codex-first, and THAT post-expiry
+            # codex attempt is the reset probe (a success -> /v1/knemon/cap/clear).
+            chain = list(DEEPSEEK_FALLBACK)
+        else:
+            chain = list(CODEX_SUB_LEAD) + DEEPSEEK_FALLBACK
     return {
         "ok": True,
         "max_cost_tier": max_tier,
         "kind": kind,
         "knemon_bypass": bypass,
+        "oauth_cap": oauth_cap_state(),
         "sub_lead": CODEX_SUB_LEAD,
         # codex/gpt sub agent first ($0 unlimited), metered open-weights as fallback
         "chain": chain,
@@ -3111,6 +3144,61 @@ async def knemon_bypass_set(req: Request):
     except Exception as e:
         return {"ok": False, "error": str(e)}
     return {"ok": True, "bypass": knemon_bypass_active(), "reason": reason}
+
+
+@app.get("/v1/knemon/cap")
+async def knemon_cap_get():
+    """OAuth-cap circuit-breaker state (dashboard 5h countdown reads this)."""
+    return {"ok": True, "reset_sec": OAUTH_CAP_RESET_SEC,
+            "flag_file": KNEMON_CAP_FILE, **oauth_cap_state()}
+
+
+@app.post("/v1/knemon/cap")
+async def knemon_cap_set(req: Request):
+    """A worker reports the codex/gpt lead hit usage_limit. POST {model?, reset_sec?}.
+    Opens the breaker: knemon_route leads deepseek for ~5h (codex kept last as probe)."""
+    import json as _j
+    import time as _t
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    # debounce the worker stampede: the first usage_limit opens the breaker for the full
+    # window; concurrent reporters within the window are no-ops (don't churn/extend it).
+    cur = oauth_cap_state()
+    if cur.get("capped"):
+        return {"ok": True, "debounced": True, **cur}
+    try:
+        reset = float(body.get("reset_sec") or OAUTH_CAP_RESET_SEC)
+    except (TypeError, ValueError):
+        reset = float(OAUTH_CAP_RESET_SEC)
+    if reset != reset or reset in (float("inf"), float("-inf")):  # NaN/Inf guard
+        reset = float(OAUTH_CAP_RESET_SEC)
+    reset = max(60.0, min(reset, 86400.0))
+    now = _t.time()
+    state = {"hit_at": now, "capped_until": now + reset, "model": str(body.get("model") or "")}
+    try:
+        tmp = KNEMON_CAP_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            _j.dump(state, f)
+        os.replace(tmp, KNEMON_CAP_FILE)  # atomic publish (no partial-read race)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, **oauth_cap_state()}
+
+
+@app.post("/v1/knemon/cap/clear")
+async def knemon_cap_clear():
+    """Confirm OAuth reset (a codex/gpt probe succeeded). Closes the breaker."""
+    try:
+        os.remove(KNEMON_CAP_FILE)  # no exists() pre-check (avoid TOCTOU)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, **oauth_cap_state()}
 
 
 @app.get("/v1/knemon/spend")
