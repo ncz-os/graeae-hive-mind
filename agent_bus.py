@@ -3091,7 +3091,12 @@ async def knemon_route(req: Request):
         # 2026-06-04) and caps under heavy job load (gpt-5.4/5.5/mini exhausted; only
         # gpt-5.3-codex-spark live). When it 429s/usage_limit, fall through to deepseek-direct
         # (working key in gateway env): v4-pro (main, cheapest after OpenAI) then v4-flash (light).
-        DEEPSEEK_FALLBACK = ["hive_deepseek_pro_1", "hive_deepseek_1"]
+        DEEPSEEK_FALLBACK = ["hive_deepseek_pro_1", "hive_deepseek_1", "hive_xai_1"]  # grok-4.3 = capable last-resort for heavy jobs deepseek cant finish (funded xai)
+        # Heavy code/architecture jobs: deepseek-v4 cannot complete them (observed: ~7min then
+        # fail, 0 commits) -> lead the capable grok-4.3 first among the metered fallbacks so we
+        # do not waste two doomed deepseek attempts. Light jobs keep deepseek-first (cost).
+        if ("code" in kl) or kl.startswith(("heavy:", "architecture", "design")):
+            DEEPSEEK_FALLBACK = ["hive_xai_1", "hive_deepseek_pro_1", "hive_deepseek_1"]
         cap = oauth_cap_state()
         if cap.get("capped"):
             # OAuth lead is inside its ~5h cap window (a worker reported usage_limit): route
