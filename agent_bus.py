@@ -3051,7 +3051,7 @@ async def knemon_route(req: Request):
     if any(kl.startswith(p) for p in ("review:", "codex", "doctor:codex-fix", "adversarial")):
         CODEX_SUB_LEAD = ["hive_codex"]
     elif any(t in kl for t in ("architecture", "design")) or kl.startswith("heavy:"):
-        CODEX_SUB_LEAD = ["hive_gpt_heavy"]
+        CODEX_SUB_LEAD = ["hive_gpt"]  # gpt-5.5 (hive_gpt_heavy) OAuth allowance exhausted 2026-06-04 -> use gpt-5.4
     elif any(kl.startswith(p) for p in ("triage", "docs:", "investigation")):
         CODEX_SUB_LEAD = ["hive_gpt_mini"]
     else:
@@ -3063,7 +3063,9 @@ async def knemon_route(req: Request):
         CODEX_SUB_LEAD = []
         chain = list(open_weight_chain)
     else:
-        chain = CODEX_SUB_LEAD + [a for a in open_weight_chain if a not in CODEX_SUB_LEAD]
+        # metered open-weight provider keys REVOKED 2026-06-04 (401 fleet-wide) -> OAuth-only,
+        # no metered fallback (a throttled gpt retries/waits rather than 401-cascading 6 dead providers).
+        chain = list(CODEX_SUB_LEAD)
     return {
         "ok": True,
         "max_cost_tier": max_tier,
