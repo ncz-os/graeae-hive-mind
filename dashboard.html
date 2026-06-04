@@ -175,6 +175,7 @@ small.dim{font-size:.85em}
 </head>
 <body>
 <h1>🐝 GRAEAE Hive Mind</h1>
+<div id="cap-banner" style="display:none;margin:.4em 0;padding:.5em .8em;border-radius:6px;background:#3d2b00;border:1px solid #8a6d00;color:#ffd866;font-size:.9em"></div>
 <div class="meta">
   <span id="meta-time">connecting…</span>
   <span class="pill" id="meta-reg">agent: registering…</span>
@@ -314,7 +315,7 @@ small.dim{font-size:.85em}
   </div>
 
   <div class="panel full-width" id="failed-panel">
-    <h2>❌ Failed Jobs <span class="cnt" id="failed-cnt"></span></h2>
+    <h2>❌ Failed / Dead-letter <span class="cnt" id="failed-cnt"></span></h2>
     <div id="failed-list"></div>
   </div>
 
@@ -777,7 +778,7 @@ async function refreshResults(){
     const hasCode=r.commits&&r.commits.length;
     card.className='result-card done '+(hasCode?'rc-code':'rc-text');
     const preview=r.summary||r.text||r.output||'(no text result)';
-    const prov=r.gateway_model||MODEL_NAMES[r.agent_alias]||r.agent_alias||'';
+    const _at=(r.alias_tried&&r.alias_tried.length)?r.alias_tried[r.alias_tried.length-1]:'';const prov=r.gateway_model||r.gateway_provider_reported||MODEL_NAMES[_at]||_at||MODEL_NAMES[r.agent_alias]||r.agent_alias||'';
     const isCodex=/codex/i.test(j.kind||'')||/codex/i.test(prov)||/codex/i.test(r.via||'')||/codex/i.test(r.gateway_provider||'')||r.runtime==='codex';
     let agentType=r.runtime||String(j.kind||'').split(':')[0]||'agent';
     const wkHost=(String(j.claimed_by||'').match(/:zeroclaw:([^:]+):/)||[])[1]||(String(j.claimed_by||'').split(':')[3])||'';
@@ -855,8 +856,12 @@ async function refreshDoctor(){
 }
 
 async function refreshFailed(){
-  const d=await api('GET','/v1/jobs?status=failed&limit=50').catch(()=>({jobs:[]}));
-  const jobs=(d.jobs||[]).sort((a,b)=>(b.ended_at||0)-(a.ended_at||0));
+  const [df,dd]=await Promise.all([
+    api('GET','/v1/jobs?status=failed&limit=50').catch(()=>({jobs:[]})),
+    api('GET','/v1/jobs?status=dead-letter&limit=50').catch(()=>({jobs:[]})),
+  ]);
+  const d={total:(df.total||0)+(dd.total||0)};
+  const jobs=[...(df.jobs||[]),...(dd.jobs||[])].sort((a,b)=>(b.ended_at||0)-(a.ended_at||0));
   _failedJobs=Object.fromEntries(jobs.map(j=>[j.id,j]));
   const cntEl=document.getElementById('failed-cnt');
   const total=d.total||0;
@@ -877,7 +882,7 @@ async function refreshFailed(){
     const jid=j.id;
     card.innerHTML=`
       <div class="fc-head">
-        <span class="fc-kind">${esc(j.kind)}</span>
+        <span class="fc-kind">${esc(j.kind)}</span><span class="${badgeCls(j.status)}" title="job status" style="margin-left:.3em">${esc(j.status)}</span>
         <span class="dim" style="font-size:.75em">P${j.priority}</span>
         ${j.claimed_by?`<span class="dim" style="font-size:.75em">via ${esc(j.claimed_by.split(':').slice(2,4).join('@').slice(0,20))}</span>`:''}
         <span class="dim" style="font-size:.75em;margin-left:auto">${relTime(j.ended_at)}</span>
@@ -1113,11 +1118,24 @@ async function refreshHosts(){
   }
 }
 
+let _capUntil=0;
+async function refreshCapBanner(){
+  try{const d=await api('GET','/v1/knemon/cap');_capUntil=d.capped?(d.capped_until||0):0;renderCapBanner();}catch(_){}
+}
+function renderCapBanner(){
+  const el=document.getElementById('cap-banner');if(!el)return;
+  const rem=Math.max(0,Math.round(_capUntil-Date.now()/1000));
+  if(rem<=0){el.style.display='none';return;}
+  const h=Math.floor(rem/3600),m=Math.floor((rem%3600)/60),sc=rem%60;
+  el.style.display='block';
+  el.innerHTML='\u23f3 <b>OpenAI OAuth allowance capped</b> \u2014 routing deepseek fallback. Reset probe in <b>'+h+'h '+String(m).padStart(2,'0')+'m '+String(sc).padStart(2,'0')+'s</b> (cleared early if a codex probe succeeds).';
+}
+setInterval(renderCapBanner,1000);
 async function refreshAll(){
   document.getElementById('meta-time').textContent=`last refresh ${new Date().toLocaleTimeString()} · auto 8s`;
   try{
     await Promise.all([
-      refreshRunning(),refreshAgents(),refreshJobs(),refreshResults(),
+      refreshRunning(),refreshAgents(),refreshJobs(),refreshResults(),refreshCapBanner(),
       refreshFailed(),refreshCosts(),refreshWorkers(),refreshSchedules(),
       refreshHosts(),refreshDoctor(),refreshGPU(),
       refreshRemote(),
