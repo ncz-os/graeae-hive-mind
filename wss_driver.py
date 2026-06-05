@@ -16,9 +16,14 @@ import json
 import logging
 import os
 import re
+import socket
+import threading
 import time
+import uuid
 from pathlib import Path
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 import websockets
 
@@ -38,6 +43,7 @@ GIT_COMMIT_RE = re.compile(
     r"\bcommit\s+(?P<sha2>[a-f0-9]{40})\b",
     re.MULTILINE,
 )
+_TOKENS_LOCK = threading.Lock()
 
 # ── Token Pricing Registry ────────────────────────────────────────────────
 PRICING_REGISTRY_PATH = os.environ.get(
@@ -156,17 +162,115 @@ def _capture_preview(text, max_bytes: int = MAX_CAPTURE_BYTES) -> str:
 
 
 def load_tokens():
-    if TOKENS_FILE.exists():
-        try:
-            return json.loads(TOKENS_FILE.read_text())
-        except Exception:
-            return {}
-    return {}
+    with _TOKENS_LOCK:
+        if TOKENS_FILE.exists():
+            try:
+                return json.loads(TOKENS_FILE.read_text())
+            except Exception:
+                return {}
+        return {}
 
 
 def save_tokens(d):
-    TOKENS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    TOKENS_FILE.write_text(json.dumps(d, indent=2))
+    with _TOKENS_LOCK:
+        TOKENS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = TOKENS_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(d, indent=2))
+        tmp.replace(TOKENS_FILE)
+
+
+def _gateway_base_url(host: str) -> str:
+    return f"http://{host}:{HOST_PORT}"
+
+
+def _http_json(method: str, url: str, headers: dict | None = None, timeout: float = 10.0) -> tuple[int, dict]:
+    req = Request(url, data=b"" if method.upper() in {"POST", "PATCH", "PUT"} else None,
+                  method=method.upper(), headers=headers or {})
+    try:
+        with urlopen(req, timeout=timeout) as r:
+            raw = r.read()
+            return r.status, json.loads(raw.decode("utf-8")) if raw else {}
+    except HTTPError as e:
+        try:
+            raw = e.read()
+            body = json.loads(raw.decode("utf-8")) if raw else {}
+        except Exception:
+            body = {"error": str(e)}
+        return e.code, body
+    except (OSError, URLError) as e:
+        return 0, {"error": str(e)}
+
+
+def _gateway_health(host: str) -> dict:
+    code, body = _http_json("GET", f"{_gateway_base_url(host)}/health", timeout=5.0)
+    return body if code == 200 and isinstance(body, dict) else {}
+
+
+def _pairing_code_from_env_or_gateway(host: str) -> str:
+    code = (
+        os.environ.get("ZEROCLAW_PAIRING_CODE")
+        or os.environ.get("GATEWAY_PAIRING_CODE")
+        or os.environ.get("PAIRING_CODE")
+        or ""
+    ).strip()
+    if code:
+        return code
+    code_status, code_body = _http_json("GET", f"{_gateway_base_url(host)}/pair/code", timeout=5.0)
+    if code_status == 200 and isinstance(code_body, dict):
+        return str(code_body.get("pairing_code") or "").strip()
+    return ""
+
+
+def _token_for_host(host: str) -> str | None:
+    tokens = load_tokens()
+    for key in _token_keys_for_host(host):
+        token = tokens.get(key)
+        if token:
+            return token
+    return None
+
+
+def _remember_token(host: str, token: str) -> None:
+    tokens = load_tokens()
+    for key in _token_keys_for_host(host):
+        tokens[key] = token
+    save_tokens(tokens)
+
+
+def _ensure_gateway_token(host: str, force_pair: bool = False) -> tuple[str | None, str | None]:
+    """Return a bearer token when the gateway requires pairing.
+
+    Gateways with require_pairing=false intentionally accept unauthenticated
+    local WS sessions; in that mode an absent token is not an error.
+    """
+    health = _gateway_health(host)
+    require_pairing = bool(health.get("require_pairing"))
+    if not require_pairing:
+        return None, None
+
+    if not force_pair:
+        token = _token_for_host(host)
+        if token:
+            return token, None
+
+    code = _pairing_code_from_env_or_gateway(host)
+    if not code:
+        return None, f"no pairing code for host {host}; set ZEROCLAW_PAIRING_CODE or generate one via the gateway"
+
+    status, body = _http_json(
+        "POST",
+        f"{_gateway_base_url(host)}/pair",
+        headers={
+            "X-Pairing-Code": code,
+            "X-Client-Id": f"{socket.gethostname()}-wss-driver",
+        },
+        timeout=10.0,
+    )
+    token = body.get("token") if isinstance(body, dict) else None
+    if status == 200 and isinstance(token, str) and token:
+        _remember_token(host, token)
+        return token, None
+    return None, f"pairing failed for host {host}: http {status} {body}"
 
 
 def _harvest_commits_from_tool_call(call_args, tool_name):
@@ -224,30 +328,17 @@ def _token_keys_for_host(host: str) -> list[str]:
     return keys
 
 
+class _SessionNotFresh(RuntimeError):
+    """Raised when a uniquely-keyed WS session unexpectedly RESUMED a
+    foreign conversation — the confab/fake-done cross-wire. Reported as a
+    distinct `session_not_fresh` error so the orchestrator can route/retry
+    it apart from genuine task failures."""
+
+
 async def _drive_one(host: str, agent_alias: str, task: str, job_id: str,
                     timeout_sec: float = SESSION_TIMEOUT_SEC,
                     max_tool_iterations: int | None = None) -> dict:
     """Open a WSS session, drive one task to completion, return result dict."""
-    tokens = load_tokens()
-    token = None
-    for _key in _token_keys_for_host(host):
-        token = tokens.get(_key)
-        if token: break
-    if not token:
-        return {
-            "exit_code": 2,
-            "worker_error": "no_gateway_token",
-            "error": f"no token for host {host}; pair gateway first via POST /pair with X-Pairing-Code",
-        }
-    params = {
-        "agent": agent_alias,
-        "session_id": f"doctor-{job_id[:12]}-{int(time.time())}",
-        "name": "doctor-driven",
-        "token": token,
-    }
-    if max_tool_iterations is not None:
-        params["max_tool_iterations"] = str(max_tool_iterations)
-    uri = f"ws://{host}:{HOST_PORT}/ws/chat?{urlencode(params)}"
     started = time.time()
     tool_calls = []
     tool_results = []
@@ -260,11 +351,69 @@ async def _drive_one(host: str, agent_alias: str, task: str, job_id: str,
     frame_stats = {"outbound_truncations": 0, "max_outbound_frame_bytes": 0, "max_inbound_frame_bytes": 0}
 
     try:
-        async with websockets.connect(uri, open_timeout=15, close_timeout=10, max_size=None) as ws:
+        token, token_error = _ensure_gateway_token(host)
+        if token_error:
+            return {
+                "exit_code": 2,
+                "worker_error": "no_gateway_token",
+                "error": token_error,
+            }
+        params = {
+            "agent": agent_alias,
+            "session_id": f"job-{job_id[:18]}-{uuid.uuid4().hex}",  # globally-unique per drive: stops gateway session-resume cross-wiring (confab root 2026-06-05)
+            "name": "doctor-driven",
+        }
+        if max_tool_iterations is not None:
+            params["max_tool_iterations"] = str(max_tool_iterations)
+        uri = f"ws://{host}:{HOST_PORT}/ws/chat?{urlencode(params)}"
+        headers = {"Authorization": f"Bearer {token}"} if token else None
+
+        try:
+            ws_ctx = websockets.connect(
+                uri,
+                additional_headers=headers,
+                open_timeout=15,
+                close_timeout=10,
+                max_size=None,
+            )
+            ws = await ws_ctx.__aenter__()
+        except websockets.exceptions.InvalidStatus as first_error:
+            # A stale cached token can fail during upgrade; pair once more and retry.
+            token, token_error = _ensure_gateway_token(host, force_pair=True)
+            if token_error:
+                raise first_error
+            headers = {"Authorization": f"Bearer {token}"} if token else None
+            ws_ctx = websockets.connect(
+                uri,
+                additional_headers=headers,
+                open_timeout=15,
+                close_timeout=10,
+                max_size=None,
+            )
+            ws = await ws_ctx.__aenter__()
+
+        try:
             # First frame: session_start
             first = await asyncio.wait_for(ws.recv(), timeout=15.0)
             frame_stats["max_inbound_frame_bytes"] = max(frame_stats["max_inbound_frame_bytes"], _utf8_len(first))
             session_start = json.loads(first)
+            # ── Confab guard (2026-06-05) ────────────────────────────────
+            # A uniquely-generated session_id MUST yield a brand-new session.
+            # If the gateway says it RESUMED an existing conversation (or a
+            # non-zero message history), this socket is wired into a FOREIGN
+            # session: the model would answer the other jobs topic and report
+            # fake-done. Fail honestly instead of running into polluted ctx.
+            # Fatal ONLY on `resumed` — message_count is advisory. A future
+            # gateway may legitimately seed a fresh session with a system
+            # preamble (message_count>0, resumed=False); treating that as
+            # fatal would brick every job. `resumed=True` is the true
+            # cross-wire signal (empirically fresh=False/0, collision=True/2).
+            if os.environ.get("WSS_FRESHNESS_GUARD", "1") not in ("0", "false", "no"):
+                if session_start.get("resumed"):
+                    raise _SessionNotFresh(
+                        "resumed=%r msgcount=%r — unique session_id resumed a "
+                        "foreign conversation (confab guard)"
+                        % (session_start.get("resumed"), session_start.get("message_count")))
             # Send the actual task
             await _send_json_bounded(ws, {"type": "message", "content": task}, frame_stats)
             deadline = time.time() + timeout_sec
@@ -323,6 +472,16 @@ async def _drive_one(host: str, agent_alias: str, task: str, job_id: str,
                     error = f.get("error") or f.get("message") or str(f)[:200]
                     break
                 # chunk/chunk_reset/system frames: ignored
+        finally:
+            # Cleanup must NEVER mask the real error. Graceful-close on an
+            # abandoned socket is bounded by close_timeout=10; swallow any
+            # handshake exception so it cannot overwrite `error`.
+            try:
+                await ws_ctx.__aexit__(None, None, None)
+            except Exception:
+                pass
+    except _SessionNotFresh as e:
+        error = f"session_not_fresh: {e}"[:200]
     except asyncio.TimeoutError:
         error = "session_timeout"
     except websockets.exceptions.WebSocketException as e:
