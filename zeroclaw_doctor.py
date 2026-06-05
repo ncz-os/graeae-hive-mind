@@ -56,7 +56,6 @@ import urllib.error
 import urllib.request
 import uuid
 from collections import deque
-from urllib.parse import quote
 
 HIVE_URL = os.environ.get("HIVE_URL", "http://192.168.207.67:5005")
 ZEROCLAW_BIN = os.environ.get("ZEROCLAW_BIN", "/usr/local/bin/zeroclaw")
@@ -158,7 +157,7 @@ _host_last_action: dict[str, float] = {}
 # Allowlisted services for restart_service action
 ALLOWED_SERVICE_RE = re.compile(
     r"^(zeroclaw-worker(@[a-z0-9-]+)?|zeroclaw-fanout|zeroclaw-doctor|"
-    r"hive-triage|graeae-system-watcher|goose-worker(@[a-z0-9-]+)?)\.service$"
+    r"hive-triage|graeae-system-watcher)\.service$"
 )
 
 # Fleet hosts eligible for SSH restart actions (NOT PYTHIA itself, NOT ARGOS)
@@ -280,11 +279,11 @@ def patch_job(job_id: str, status: str, result: dict | None = None):
 # ───────────────────────── Failure context (HTTP API) ─────────────────────────
 # Use the bus HTTP API for job context so the doctor stays behind the same
 # queue contract as the rest of the fleet.
-def fetch_jobs_for_kind(base_kind: str, status: str = "failed", limit: int = 10) -> list[dict]:
-    """Recent jobs of status whose kind starts with base_kind, newest first."""
-    code, resp = _http("GET", f"/v1/jobs?status={status}&limit=200", timeout=15.0)
+def fetch_failed_jobs_for_kind(base_kind: str, limit: int = 10) -> list[dict]:
+    """Recent failed jobs whose kind starts with base_kind, newest first."""
+    code, resp = _http("GET", "/v1/jobs?status=failed&limit=200", timeout=15.0)
     if code != 200 or not resp:
-        log.warning("fetch_%s_jobs http=%s", status, code)
+        log.warning("fetch_failed_jobs http=%s", code)
         return []
     jobs = resp.get("jobs", []) or []
     # match kind prefix OR exact base_kind after stripping [tag] suffix
@@ -296,11 +295,6 @@ def fetch_jobs_for_kind(base_kind: str, status: str = "failed", limit: int = 10)
     ]
     matched.sort(key=lambda j: j.get("ended_at") or 0, reverse=True)
     return matched[:limit]
-
-
-def fetch_failed_jobs_for_kind(base_kind: str, limit: int = 10) -> list[dict]:
-    """Recent failed jobs whose kind starts with base_kind, newest first."""
-    return fetch_jobs_for_kind(base_kind, "failed", limit)
 
 
 def fetch_agent_registry_summary() -> dict:
@@ -335,7 +329,7 @@ Output STRICT JSON only (no prose, no markdown fences), one object:
   "confidence":  0.0..1.0
   "reason":      short string explaining the diagnosis
   "release_eligible_kinds": list of kinds that should be retried, e.g.
-                 ["zeroclaw","codex","opencode","goose"], for release_to_queue.
+                 ["zeroclaw","codex","opencode"], for release_to_queue.
                  Use [] (empty) to allow any worker.  Use ["doctor"] to
                  keep the job in the doctor pool (only if you want re-diagnosis).
   "target_host": fleet hostname or null (cixmini|cerberus|medusa|proteus|
@@ -362,21 +356,18 @@ When to use each action_type:
 
 
 def build_doctor_prompt(job: dict, base_kind: str, failed: list[dict],
-                        registry: dict, failure_count_hint: int,
-                        source_status: str = "failed") -> str:
-    status_label = "DEAD-LETTER" if source_status == "dead-letter" else "FAILED"
+                        registry: dict, failure_count_hint: int) -> str:
     msg = [
         "TRIAGE REQUEST",
         f"triage_job_id: {job.get('id', '')}",
         f"triage_kind: {job.get('kind', '')}",
         f"base_kind: {base_kind}",
-        f"source_status: {source_status}",
         f"failure_count_hint: {failure_count_hint}",
         "",
         "TRIAGE DESCRIPTION:",
         (job.get("description") or "")[:6000],
         "",
-        f"RECENT {status_label} JOBS OF base_kind={base_kind!r} ({len(failed)} shown):",
+        f"RECENT FAILED JOBS OF base_kind={base_kind!r} ({len(failed)} shown):",
     ]
     for fj in failed[:8]:
         result_preview = ""
@@ -402,14 +393,6 @@ def build_doctor_prompt(job: dict, base_kind: str, failed: list[dict],
         f"  by_kind: {json.dumps(registry.get('by_kind', {}))}",
         f"  by_host: {json.dumps(registry.get('by_host', {}))}",
         f"  by_status: {json.dumps(registry.get('by_status', {}))}",
-        "",
-        "DEAD-LETTER POLICY:",
-        "  If source_status=dead-letter, do not reopen the terminal job.",
-        "  Choose resubmit_jobs only when the observed cause looks transient or now-fixed,",
-        "  such as thrash_guard:max_decline_requeues_exceeded, no_gateway_token,",
-        "  ws_exception, network, timeout, gateway transport, connection reset/refused.",
-        "  Choose no_action for test/junk work or clear permanent failures.",
-        "  Choose dispatch_codex_fix or escalate when the dead-letter points to a real code/config bug.",
         "",
         "Respond with the JSON action object only.",
     ])
@@ -720,98 +703,7 @@ def action_restart_service(target_host: str | None, service: str | None) -> str:
         return f"SSH timeout to {target_host}"
 
 
-DEAD_LETTER_RESUBMIT_CAP = int(os.environ.get("DEAD_LETTER_RESUBMIT_CAP", "2"))
-
-
-def _doctor_submitted_jobs(limit: int = 1000) -> list[dict]:
-    if not _urn:
-        return []
-    code, resp = _http("GET", f"/v1/jobs?agent_urn={_urn}&limit={limit}", timeout=15.0)
-    if code != 200 or not resp:
-        log.warning("fetch doctor-submitted jobs http=%s", code)
-        return []
-    return resp.get("jobs", []) or []
-
-
-def _dead_letter_resubmit_count(source_job_id: str) -> int:
-    if not source_job_id:
-        return 0
-    source_q = quote(source_job_id, safe="")
-    code, resp = _http("GET", f"/v1/jobs?parent_job_id={source_q}&limit=1", timeout=15.0)
-    if code != 200 or not resp:
-        log.warning("fetch dead-letter resubmit count source=%s http=%s", source_job_id[:12], code)
-        return DEAD_LETTER_RESUBMIT_CAP
-    return int(resp.get("total") or resp.get("count") or 0)
-
-
-def _dead_letter_sources_all_at_cap(sources: list[dict]) -> bool:
-    if not sources:
-        return False
-    return all(_dead_letter_resubmit_count(j.get("id") or "") >= DEAD_LETTER_RESUBMIT_CAP
-               for j in sources)
-
-
-def _clone_dead_letter_job(source: dict) -> tuple[bool, str]:
-    source_id = source.get("id") or ""
-    if not source_id:
-        return False, "dead-letter source missing id"
-    prior = _dead_letter_resubmit_count(source_id)
-    if prior >= DEAD_LETTER_RESUBMIT_CAP:
-        return False, (f"skip {source_id[:12]}: already resubmitted "
-                       f"{prior} times (cap={DEAD_LETTER_RESUBMIT_CAP})")
-    body = {
-        "kind": source.get("kind") or "",
-        "description": source.get("description") or "",
-        "submitter_urn": _urn,
-        "parent_job_id": source_id,
-        "priority": int(source.get("priority") or 0),
-        "idempotency_key": (
-            f"doctor-deadletter-resubmit:{source_id}:{prior + 1}:{int(time.time())}"
-        ),
-    }
-    for field in ("required_capabilities", "eligible_kinds", "eligible_hosts"):
-        val = source.get(field)
-        if val:
-            body[field] = val
-    if not body["kind"]:
-        return False, f"skip {source_id[:12]}: missing kind"
-    if DRY_RUN:
-        return True, f"DRY_RUN: would submit fresh retry for {source_id[:12]}"
-    code, resp = _http("POST", "/v1/jobs", body, timeout=15.0)
-    if code in (200, 201) and resp:
-        return True, f"submitted fresh retry id={resp.get('id', '?')[:12]} source={source_id[:12]}"
-    return False, f"submit fresh retry FAILED source={source_id[:12]} code={code} resp={str(resp)[:200]}"
-
-
-def action_resubmit_dead_letter_jobs(base_kind: str | None, max_resubmits: int = 20) -> str:
-    if not base_kind:
-        return "resubmit_dead_letter_jobs missing base_kind"
-    jobs = fetch_jobs_for_kind(base_kind, "dead-letter", limit=200)
-    target_jobs = jobs[:max(1, int(max_resubmits))]
-    if not target_jobs:
-        return f"no dead-letter jobs of base_kind={base_kind}"
-    submitted = 0
-    skipped = 0
-    notes = []
-    for source in target_jobs:
-        ok, msg = _clone_dead_letter_job(source)
-        submitted += 1 if ok else 0
-        skipped += 0 if ok else 1
-        notes.append(msg)
-    broadcast_doctor_message("doctor.resubmit.dead_letter", {
-        "host": AGENT_HOST,
-        "base_kind": base_kind,
-        "submitted": submitted,
-        "skipped": skipped,
-    })
-    return (f"dead-letter fresh retries submitted={submitted} skipped={skipped}; "
-            + " | ".join(notes[:5]))
-
-
-def action_resubmit_jobs(base_kind: str | None, max_resubmits: int = 20,
-                         source_status: str = "failed") -> str:
-    if source_status == "dead-letter":
-        return action_resubmit_dead_letter_jobs(base_kind, max_resubmits)
+def action_resubmit_jobs(base_kind: str | None, max_resubmits: int = 20) -> str:
     if not base_kind:
         return "resubmit_jobs missing base_kind"
     code, resp = _http("GET", "/v1/jobs?status=failed&limit=200")
@@ -864,7 +756,7 @@ def action_cancel_jobs(base_kind: str | None, max_cancels: int = 20) -> str:
     return f"recorded cancel intent for {len(target_ids)} jobs of {base_kind}"
 
 
-DEFAULT_RELEASE_KINDS = ["zeroclaw", "codex", "opencode", "goose"]
+DEFAULT_RELEASE_KINDS = ["zeroclaw", "codex", "opencode"]
 
 
 def action_release_to_queue(job_id: str, release_eligible_kinds: list | None) -> str:
@@ -1181,56 +1073,49 @@ def _base_kind(kind: str) -> str:
 
 
 def scan_for_failure_clusters() -> list[dict]:
-    """Inspect failed and dead-letter jobs; return clusters of N+ jobs of same
-    base_kind within CLUSTER_WINDOW_SEC, not auto-triaged within cooldown.
-    Returns list of {base_kind, source_status, count, sample_job_id}."""
+    """Inspect /v1/jobs?status=failed; return clusters of N+ failures of same base_kind
+    within CLUSTER_WINDOW_SEC, that haven't been auto-triaged within AUTO_TRIAGE_COOLDOWN.
+    Returns list of {base_kind, count, sample_job_id}."""
+    code, resp = _http("GET", "/v1/jobs?status=failed&limit=500", timeout=20.0)
+    if code != 200 or not resp:
+        return []
     cutoff = time.time() - CLUSTER_WINDOW_SEC
-    counts: dict[tuple[str, str], list[dict]] = {}
-    for status in ("failed", "dead-letter"):
-        code, resp = _http("GET", f"/v1/jobs?status={status}&limit=500", timeout=20.0)
-        if code != 200 or not resp:
+    counts: dict[str, list[dict]] = {}
+    for j in resp.get("jobs", []) or []:
+        if (j.get("ended_at") or 0) < cutoff:
             continue
-        for j in resp.get("jobs", []) or []:
-            if (j.get("ended_at") or 0) < cutoff:
-                continue
-            bk = _base_kind(j.get("kind", ""))
-            if not bk or bk.startswith("triage:") or bk.startswith("doctor:"):
-                continue
-            counts.setdefault((status, bk), []).append(j)
+        bk = _base_kind(j.get("kind", ""))
+        if not bk or bk.startswith("triage:") or bk.startswith("doctor:"):
+            continue
+        counts.setdefault(bk, []).append(j)
     clusters = []
     now = time.time()
-    for (status, bk), jobs in counts.items():
+    for bk, jobs in counts.items():
         if len(jobs) < CLUSTER_THRESHOLD:
             continue
-        triage_key = f"{status}:{bk}"
-        last = _recent_auto_triage.get(triage_key, 0)
+        last = _recent_auto_triage.get(bk, 0)
         if now - last < AUTO_TRIAGE_COOLDOWN:
             continue
         # Also skip if an active triage:<bk> already exists in queued/running
-        if _active_triage_exists(bk, status):
+        if _active_triage_exists(bk):
             continue
         clusters.append({
             "base_kind": bk,
-            "source_status": status,
             "count": len(jobs),
             "sample_job_id": jobs[0].get("id", ""),
         })
     return clusters
 
 
-def _active_triage_exists(base_kind: str, source_status: str = "failed") -> bool:
-    """True if a triage:<status>:<base_kind> job is currently queued or running."""
+def _active_triage_exists(base_kind: str) -> bool:
+    """True if a triage:<base_kind> job is currently queued or running."""
     for status in ("queued", "running"):
         code, resp = _http("GET", f"/v1/jobs?status={status}&limit=200", timeout=10.0)
         if code != 200 or not resp:
             continue
-        target = f"triage:{source_status}:{base_kind}"
-        legacy_target = f"triage:{base_kind}"
+        target = f"triage:{base_kind}"
         for j in resp.get("jobs", []) or []:
-            kind = j.get("kind") or ""
-            if kind.startswith(target) or (
-                source_status == "failed" and kind.startswith(legacy_target)
-            ):
+            if (j.get("kind") or "").startswith(target):
                 # Also check it includes "doctor" in eligible_kinds OR is unrestricted
                 ek = j.get("eligible_kinds") or []
                 if not ek or "doctor" in ek:
@@ -1238,27 +1123,16 @@ def _active_triage_exists(base_kind: str, source_status: str = "failed") -> bool
     return False
 
 
-def submit_auto_triage(base_kind: str, count: int, sample_job_id: str,
-                       source_status: str = "failed") -> str | None:
-    """Submit a triage:<status>:<base_kind> job targeting eligible_kinds=['doctor']."""
-    noun = "dead-letter" if source_status == "dead-letter" else "fail"
-    action_hint = (
-        "For dead-letter clusters: reason via gateway-codex; if cause is transient "
-        "or now-fixed, choose resubmit_jobs so the doctor submits fresh queued "
-        "clones capped at two per source job. If test/junk or permanent, choose "
-        "no_action/escalate and leave the terminal jobs in place."
-        if source_status == "dead-letter"
-        else "Doctor: analyze failure pattern, diagnose root cause, dispatch fix "
-             "(codex sub-job, service restart, or resubmit) and clear the failed cluster."
-    )
+def submit_auto_triage(base_kind: str, count: int, sample_job_id: str) -> str | None:
+    """Submit a triage:<base_kind> job targeting eligible_kinds=['doctor']."""
     body = {
-        "kind": f"triage:{source_status}:{base_kind}",
+        "kind": f"triage:{base_kind}",
         "description": (
-            f"HIVE AUTO-TRIAGE — {count} {noun} jobs of base_kind={base_kind} in last "
+            f"HIVE AUTO-TRIAGE — {count} fails of base_kind={base_kind} in last "
             f"{int(CLUSTER_WINDOW_SEC/3600)}h.\n"
-            f"source_status: {source_status}\n"
-            f"Sample {noun} job id: {sample_job_id}\n\n"
-            f"{action_hint}"
+            f"Sample failed job id: {sample_job_id}\n\n"
+            f"Doctor: analyze failure pattern, diagnose root cause, dispatch fix "
+            f"(codex sub-job, service restart, or resubmit) and clear the failed cluster."
         ),
         "submitter_urn": _urn,
         "priority": 90,
@@ -1267,18 +1141,17 @@ def submit_auto_triage(base_kind: str, count: int, sample_job_id: str,
         "required_capabilities": ["triage"],
     }
     if DRY_RUN:
-        log.info("DRY_RUN: would auto-submit triage:%s:%s (count=%d)",
-                 source_status, base_kind, count)
+        log.info("DRY_RUN: would auto-submit triage:%s (count=%d)", base_kind, count)
         return None
     code, resp = _http("POST", "/v1/jobs", body, timeout=15.0)
     if code in (200, 201) and resp:
         jid = resp.get("id", "")
-        _recent_auto_triage[f"{source_status}:{base_kind}"] = time.time()
-        log.info("auto-triage submitted id=%s status=%s base_kind=%s count=%d",
-                 jid[:12], source_status, base_kind, count)
+        _recent_auto_triage[base_kind] = time.time()
+        log.info("auto-triage submitted id=%s base_kind=%s count=%d",
+                 jid[:12], base_kind, count)
         return jid
-    log.warning("auto-triage submit failed code=%s status=%s base_kind=%s resp=%s",
-                code, source_status, base_kind, str(resp)[:200])
+    log.warning("auto-triage submit failed code=%s base_kind=%s resp=%s",
+                code, base_kind, str(resp)[:200])
     return None
 
 
@@ -1314,23 +1187,9 @@ def process_triage_job(job: dict) -> dict:
     desc = job.get("description", "") or ""
 
     is_explicit_triage = kind.startswith("triage:")
-    source_status = "failed"
-    if is_explicit_triage:
-        triage_target = kind[len("triage:"):]
-        if triage_target.startswith("dead-letter:"):
-            source_status = "dead-letter"
-            base_kind = triage_target[len("dead-letter:"):]
-        elif triage_target.startswith("failed:"):
-            base_kind = triage_target[len("failed:"):]
-        else:
-            base_kind = triage_target
-            m_status = re.search(r"source_status:\s*(dead-letter|failed)", desc)
-            if m_status:
-                source_status = m_status.group(1)
-    else:
-        base_kind = _base_kind(kind)
+    base_kind = kind[len("triage:"):] if is_explicit_triage else _base_kind(kind)
 
-    m = re.search(r"(\d+)\s+(?:fail|dead-letter)", desc, re.IGNORECASE)
+    m = re.search(r"(\d+)\s+fail", desc, re.IGNORECASE)
     failure_count = int(m.group(1)) if m else 0
 
     # Loop detection — if we've already cycled this job through the doctor
@@ -1352,37 +1211,20 @@ def process_triage_job(job: dict) -> dict:
             "action": {"action_type": "escalate", "confidence": 1.0,
                        "reason": f"loop-detect {len(history)} attempts"},
             "base_kind": base_kind,
-            "source_status": source_status,
             "loop_detected": True,
         }
 
-    log.info("processing %s job=%s status=%s base_kind=%s failures=%d attempt=%d",
+    log.info("processing %s job=%s base_kind=%s failures=%d attempt=%d",
              "TRIAGE" if is_explicit_triage else "DIRECT",
-             job_id[:12], source_status, base_kind, failure_count, len(history))
+             job_id[:12], base_kind, failure_count, len(history))
 
-    failed = fetch_jobs_for_kind(base_kind, source_status, limit=10)
-    if source_status == "dead-letter" and _dead_letter_sources_all_at_cap(failed):
-        reason = (f"all {len(failed)} dead-letter source(s) already at "
-                  f"resubmit cap={DEAD_LETTER_RESUBMIT_CAP}")
-        log.info("dead-letter triage skipped base_kind=%s reason=%s", base_kind, reason)
-        return {
-            "exit_code": 0,
-            "stdout": f"action=no_action; conf=1.00; reason={reason}",
-            "action": {"action_type": "no_action", "confidence": 1.0, "reason": reason},
-            "base_kind": base_kind,
-            "source_status": source_status,
-            "failed_count_seen": len(failed),
-            "terminal_cluster_at_cap": True,
-        }
-
+    failed = fetch_failed_jobs_for_kind(base_kind, limit=10)
     registry = fetch_agent_registry_summary()
 
     # ── Check known failure signatures BEFORE LLM call ──
     # If we match a known auto-fixable pattern (e.g. token mismatch),
     # dispatch the codex fix directly — no LLM tokens burned.
-    known_action = None
-    if source_status == "failed":
-        known_action = _match_known_signature(job, base_kind, failed)
+    known_action = _match_known_signature(job, base_kind, failed)
     if known_action:
         a = known_action.get("action_type", "no_action")
         reason = known_action.get("reason", "")
@@ -1421,14 +1263,12 @@ def process_triage_job(job: dict) -> dict:
             "stdout": "; ".join(parts),
             "action": known_action,
             "base_kind": base_kind,
-            "source_status": source_status,
             "failed_count_seen": len(failed),
             "auto_detected": True,
             "released_to_queue": (a in ("dispatch_codex_fix", "release_to_queue")),
         }
 
-    prompt = build_doctor_prompt(job, base_kind, failed, registry, failure_count,
-                                 source_status)
+    prompt = build_doctor_prompt(job, base_kind, failed, registry, failure_count)
 
     # Diagnose = triage phase (cheap open-weight by default). The doctor emits a
     # JSON action; any code FIX is dispatched to open-weight workers, and
@@ -1461,24 +1301,20 @@ def process_triage_job(job: dict) -> dict:
     released = False  # whether we put the job back to queued (changes return shape)
 
     if a == "release_to_queue":
-        if source_status == "dead-letter":
-            parts.append("release_to_queue refused for dead-letter triage; terminal jobs left in place")
+        rk = action.get("release_eligible_kinds")
+        if isinstance(rk, list):
+            rk_clean = [k for k in rk if isinstance(k, str) and k]
         else:
-            rk = action.get("release_eligible_kinds")
-            if isinstance(rk, list):
-                rk_clean = [k for k in rk if isinstance(k, str) and k]
-            else:
-                rk_clean = None
-            parts.append(action_release_to_queue(job_id, rk_clean))
-            released = True
+            rk_clean = None
+        parts.append(action_release_to_queue(job_id, rk_clean))
+        released = True
     elif a == "restart_service" and conf >= 0.7:
         parts.append(action_restart_service(
             action.get("target_host"), action.get("service_name")))
     elif a == "resubmit_jobs":
         parts.append(action_resubmit_jobs(
             action.get("resubmit_base_kind") or base_kind,
-            int(action.get("max_resubmits", 20) or 20),
-            source_status))
+            int(action.get("max_resubmits", 20) or 20)))
     elif a == "cancel_jobs":
         parts.append(action_cancel_jobs(
             action.get("resubmit_base_kind") or base_kind,
@@ -1488,14 +1324,6 @@ def process_triage_job(job: dict) -> dict:
             action.get("codex_task"), job_id))
     elif a == "no_action":
         parts.append("no action — triage cleared")
-        if source_status == "dead-letter":
-            broadcast_doctor_message("doctor.dead_letter.handled", {
-                "host": AGENT_HOST,
-                "job_id": job_id,
-                "base_kind": base_kind,
-                "reason": reason,
-                "terminal_jobs_left_in_place": True,
-            })
     elif a == "escalate":
         parts.append("escalated to human")
     else:
@@ -1506,7 +1334,6 @@ def process_triage_job(job: dict) -> dict:
         "stdout": "; ".join(parts),
         "action": action,
         "base_kind": base_kind,
-        "source_status": source_status,
         "failed_count_seen": len(failed),
         "released_to_queue": released,
     }
@@ -1533,18 +1360,15 @@ def main():
                 try:
                     clusters = scan_for_failure_clusters()
                     if clusters:
-                        log.info("scan: %d terminal clusters above threshold",
+                        log.info("scan: %d failed-clusters above threshold",
                                  len(clusters))
                         for c in clusters[:5]:  # cap to avoid burst-submit
                             submit_auto_triage(c["base_kind"], c["count"],
-                                               c["sample_job_id"],
-                                               c.get("source_status", "failed"))
+                                               c["sample_job_id"])
                         broadcast_doctor_message("doctor.scan", {
                             "host": AGENT_HOST,
                             "clusters_found": len(clusters),
                             "auto_triaged": min(5, len(clusters)),
-                            "statuses": sorted({c.get("source_status", "failed")
-                                                for c in clusters}),
                         })
                 except Exception as e:
                     log.warning("scan error: %s", e)

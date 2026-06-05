@@ -666,7 +666,7 @@ RUNTIME_KIND_MAP: dict[str, set[str]] = {
     "codex":         {"codex"},
     "codex-cli":     {"codex"},
     "hermes":        {"hermes"},
-    "zeroclaw":      {"zeroclaw"},  # zeroclaw is its own kind; does not alias goose/codex/opencode/claude
+    "zeroclaw":      {"zeroclaw"},  # zeroclaw is its own kind; does not alias codex/opencode/claude
     "openclaw":      {"openclaw"},
     "ic-engine":     {"ic-engine"},
     "mnemos":        {"mnemos"},
