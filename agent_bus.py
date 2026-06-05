@@ -2563,6 +2563,21 @@ async def update_job(job_id: str, req: JobUpdate):
                     "claimed_by=NULL", "claimed_at=NULL", "claimed_runtime=NULL",
                     "claimed_model=NULL", "claimed_provider=NULL", "claimed_cost_tier=NULL",
                 ])
+                # GRAEAE dispatch consensus 1.0 (2026-06-04) SHIP-FIRST: backoff on EVERY release
+                # so a job a worker can't run cannot hot-loop (claim->release->reclaim). The serve
+                # query already skips jobs with retry_backoff_until>now. Mild exponential on
+                # decline_count + ±20% jitter (decorrelate N simultaneous releases); ~5s first
+                # bounce -> 300s cap. Stops the pegasus/medusa thrash.
+                import random as _rnd
+                # exponential per-release (NOT flat — flat = infinite churn on a job no local
+                # worker can run; GRAEAE 2026-06-04). Bump retry_count each release so the
+                # backoff escalates to the 300s cap (~6 bounces); a capable host grabs it during
+                # a backoff window while the incapable host stops hammering it.
+                _rc = int(retry_count or 0) + 1
+                _bo = min(5.0 * (2 ** min(_rc, 6)), 300.0) * (1.0 + _rnd.uniform(-0.2, 0.2))
+                fields.append("retry_count=retry_count+1")
+                fields.append("retry_backoff_until=?")
+                args.append(now + _bo)
             if req.status in {"claimed", "running"}:
                 fields.append("claim_lease_expires_at=?")
                 args.append(now + CLAIM_LEASE_SECONDS)
