@@ -2461,6 +2461,27 @@ async def update_job(job_id: str, req: JobUpdate):
                 claimed_by=req.claimed_by, tokens_in=req.tokens_in,
                 tokens_out=req.tokens_out, result_mnemos_id=req.result_mnemos_id,
             )
+    # WORK CONTRACT (GRAEAE worker-accountability consensus 1.0, 2026-06-04): a commit-mandatory
+    # job marked done with ZERO commits is a contract breach — a silent fake-completion (model
+    # confabulated off-task instead of committing; observed 23/40 riskyeats/code "done" w/ 0
+    # commits + off-task chatter like "Hetzner API"/"SRRS"). Reclassify to failed so it never
+    # counts as done + feeds fault-attribution/backoff. kind from worker-stamped result;
+    # exit_code=-3 (vs hallucination_guard -2).
+    if req.status == "done" and isinstance(req.result, dict) and not halluc_reason:
+        _k = str(req.result.get("kind") or "")
+        _commits = req.result.get("commits") or []
+        _mand = (_k in ("riskyeats", "code") or _k.startswith((
+            "riskyeats:", "feat:", "fix:", "argonaut:", "riskybiz:", "mnemos:",
+            "ic-engine", "investorclaw", "ncz-os")))
+        if _mand and not _commits:
+            _p = dict(req.result or {})
+            _p["exit_code"] = -3
+            _p["failure_reason"] = "contract_breach:commit_mandatory_no_commits"
+            req = JobUpdate(
+                status="failed", result=_p, claimed_by=req.claimed_by,
+                tokens_in=req.tokens_in, tokens_out=req.tokens_out,
+                result_mnemos_id=req.result_mnemos_id,
+            )
     req.result = normalize_result_payload(req.status, req.result)
 
     claimed_by_was_set = original_claimed_by_was_set
