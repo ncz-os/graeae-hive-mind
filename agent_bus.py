@@ -2117,6 +2117,15 @@ async def create_job(req: JobCreate):
         elif _wsrc == "prefix-fallback":
             print(f"ADMISSION_SHADOW deprecated_prefix_resolve kind={req.kind!r} -> ws={_ws} "
                   f"(migrate submitter to target_workspace)", flush=True)
+        if _wsrc in ("UNRESOLVABLE", "prefix-fallback"):
+            try:
+                import json as _sj
+                with open("/srv/agent-bus/admission_shadow.jsonl", "a") as _sf:
+                    _sf.write(_sj.dumps({"ts": now, "verdict": _wsrc, "kind": req.kind,
+                                         "project": req.project, "submitter": req.submitter_urn,
+                                         "resolved_ws": _ws}) + "\n")
+            except Exception:
+                pass
     except Exception:
         pass
     # RESULT-CACHE CHECK: identical (kind, description, max_cost_tier, required_caps) within TTL → return cached result, mark new job done immediately

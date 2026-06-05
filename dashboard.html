@@ -121,6 +121,24 @@ small.dim{font-size:.85em}
 .badge-queued{background:#1f2937;color:#c9d1d9}
 .badge-claimed,.badge-running{background:#3d2a00;color:#d29922}
 .badge-cancelled{background:#21262d;color:#6e7681}
+.badge-dead-letter{background:#5a1a1a;color:#ff7b72}
+.failed-card.tq-failed{border-left-color:#d29922}
+.failed-card.tq-failed .fc-kind{color:#d29922}
+.failed-card.tq-dead-letter{border-left-color:#f85149;background:#1a0808}
+.failed-card.tq-dead-letter .fc-kind{color:#ff7b72}
+.failed-card.tq-running{border-left-color:#3fb950;background:#0a140a}
+.failed-card.tq-running .fc-kind{color:#3fb950}
+.failed-card.tq-claimed{border-left-color:#58a6ff;background:#0a0f18}
+.failed-card.tq-claimed .fc-kind{color:#58a6ff}
+.failed-card.tq-offered{border-left-color:#bc8cff;background:#0f0a18}
+.failed-card.tq-offered .fc-kind{color:#bc8cff}
+.failed-card.tq-queued{border-left-color:#6e7681;background:#0d1117}
+.failed-card.tq-queued .fc-kind{color:#8b949e}
+.badge-offered{background:#2d1f3d;color:#bc8cff}
+.tq-pri{font-size:.7em;font-weight:bold;padding:.05em .4em;border-radius:3px}
+.tq-pri.pri-hi{background:#5a1a1a;color:#ff7b72}
+.tq-pri.pri-mid{background:#3d2a00;color:#d29922}
+.tq-pri.pri-lo{background:#21262d;color:#6e7681}
 
 /* priority bar */
 .pbar{display:inline-block;width:30px;height:6px;background:#21262d;border-radius:3px;vertical-align:middle}
@@ -302,20 +320,10 @@ small.dim{font-size:.85em}
     </table>
   </div>
 
-  <div class="panel full-width" id="doctor-panel">
-    <h2>🩺 Doctor Queue <span class="cnt" id="doctor-cnt"></span>
-        <small class="dim" id="doctor-workers" style="margin-left:1em;font-weight:normal"></small></h2>
-    <div style="margin-bottom:.6em;font-size:.78em" class="dim">
-      Jobs eligible for the PYTHIA zeroclaw-doctor (kind=doctor). Claimed jobs stay here until released back to the regular queue or terminated.
-    </div>
-    <table id="doctor-tbl">
-      <thead><tr><th>P</th><th>kind</th><th>status</th><th>description</th><th>claimed_by</th><th>age</th></tr></thead>
-      <tbody></tbody>
-    </table>
-  </div>
+    <!-- Doctor Queue merged into the unified Triage Queue below (operator 2026-06-04) -->
 
-  <div class="panel full-width" id="failed-panel">
-    <h2>❌ Failed / Dead-letter <span class="cnt" id="failed-cnt"></span></h2>
+    <div class="panel full-width" id="failed-panel">
+    <h2>🔧 Triage Queue <span class="cnt" id="failed-cnt"></span></h2>
     <div id="failed-list"></div>
   </div>
 
@@ -855,50 +863,51 @@ async function refreshDoctor(){
   }
 }
 
-async function refreshFailed(){
-  const [df,dd]=await Promise.all([
-    api('GET','/v1/jobs?status=failed&limit=50').catch(()=>({jobs:[]})),
-    api('GET','/v1/jobs?status=dead-letter&limit=50').catch(()=>({jobs:[]})),
-  ]);
-  const d={total:(df.total||0)+(dd.total||0)};
-  const jobs=[...(df.jobs||[]),...(dd.jobs||[])].sort((a,b)=>(b.ended_at||0)-(a.ended_at||0));
-  _failedJobs=Object.fromEntries(jobs.map(j=>[j.id,j]));
-  const cntEl=document.getElementById('failed-cnt');
-  const total=d.total||0;
-  if(cntEl)cntEl.textContent=jobs.length?(total>jobs.length?`(${jobs.length} of ${total})`:`(${jobs.length})`):'';
-  const el=document.getElementById('failed-list');
-  if(!el)return;
-  el.innerHTML='';
-  if(!jobs.length){
-    el.innerHTML='<div class="failed-panel-empty">No failed jobs — queue is healthy ✓</div>';
-    return;
+async function refreshDoctor(){ /* merged into unified Triage Queue (refreshFailed) */ }
+  async function refreshFailed(){
+    // UNIFIED TRIAGE QUEUE (operator 2026-06-04): one queue, all non-done/non-cancelled
+    // statuses, color-coded + priority. Replaces the separate Failed + Doctor panels.
+    const sts=['dead-letter','failed','running','claimed','offered','queued'];
+    const res=await Promise.all(sts.map(st=>api('GET',`/v1/jobs?status=${st}&limit=${st==='queued'?300:100}`).catch(()=>({jobs:[]}))));
+    let jobs=[];
+    sts.forEach((st,i)=>{(res[i].jobs||[]).forEach(j=>{if(!j.status)j.status=st;jobs.push(j);});});
+    _failedJobs=Object.fromEntries(jobs.map(j=>[j.id,j]));
+    const order={'dead-letter':0,failed:1,running:2,claimed:3,offered:4,queued:5};
+    jobs.sort((a,b)=>{const ao=order[a.status]??9,bo=order[b.status]??9;if(ao!==bo)return ao-bo;return (b.priority||0)-(a.priority||0);});
+    const cntEl=document.getElementById('failed-cnt');
+    if(cntEl)cntEl.textContent=`(${jobs.length})`;
+    const el=document.getElementById('failed-list');
+    if(!el)return;
+    el.innerHTML='';
+    if(!jobs.length){ el.innerHTML='<div class="failed-panel-empty">Queue empty — nothing in flight ✓</div>'; return; }
+    for(const j of jobs.slice(0,150)){
+      const r=j.result||{};
+      const reason=r.failure_reason||r.stderr||r.error||r.note||r.worker_error||r.summary||'';
+      const card=document.createElement('div');
+      card.className='failed-card tq-'+(j.status||'queued');
+      card.onclick=()=>showJobModal(j);
+      const jid=j.id, prio=j.priority||0;
+      const pcls=prio>=80?'pri-hi':(prio>=40?'pri-mid':'pri-lo');
+      const isTerminal=(j.status==='failed'||j.status==='dead-letter');
+      const acts=isTerminal?`<div class="fc-acts" onclick="event.stopPropagation()">
+          <button class="btn btn-ghost btn-sm" onclick="resubmitFailed('${jid}')">🔁 Resubmit</button>
+          <button class="btn btn-primary btn-sm" onclick="triageAndResubmit('${jid}')">🔍 Triage &amp; Resubmit</button>
+          <button class="btn btn-danger btn-sm" title="Dismiss" onclick="dismissFailed('${jid}',event)">✕</button>
+        </div>`:'';
+      card.innerHTML=`
+        <div class="fc-head">
+          <span class="tq-pri ${pcls}" title="priority level">P${prio}</span>
+          <span class="fc-kind">${esc(j.kind)}</span><span class="${badgeCls(j.status)}" title="job status" style="margin-left:.3em">${esc(j.status)}</span>
+          ${j.claimed_by?`<span class="dim" style="font-size:.75em">via ${esc(j.claimed_by.split(':').slice(2,4).join('@').slice(0,20))}</span>`:''}
+          <span class="dim" style="font-size:.75em;margin-left:auto">${relTime(j.ended_at||j.started_at||j.claimed_at)}</span>
+        </div>
+        <div class="fc-desc">${esc((j.description||'').slice(0,100))}</div>
+        ${reason?`<div class="fc-reason">${esc(String(reason).slice(0,250))}</div>`:''}
+        ${acts}`;
+      el.appendChild(card);
+    }
   }
-  for(const j of jobs){
-    const r=j.result||{};
-    const reason=r.failure_reason||r.stderr||r.error||r.summary||'(no failure detail)';
-    const card=document.createElement('div');
-    card.className='failed-card';
-    card.onclick=()=>showJobModal(j);
-    const jid=j.id;
-    card.innerHTML=`
-      <div class="fc-head">
-        <span class="fc-kind">${esc(j.kind)}</span><span class="${badgeCls(j.status)}" title="job status" style="margin-left:.3em">${esc(j.status)}</span>
-        <span class="dim" style="font-size:.75em">P${j.priority}</span>
-        ${j.claimed_by?`<span class="dim" style="font-size:.75em">via ${esc(j.claimed_by.split(':').slice(2,4).join('@').slice(0,20))}</span>`:''}
-        <span class="dim" style="font-size:.75em;margin-left:auto">${relTime(j.ended_at)}</span>
-      </div>
-      <div class="fc-desc">${esc((j.description||'').slice(0,100))}</div>
-      <div class="fc-reason">${esc(String(reason).slice(0,300))}</div>
-      <div class="fc-acts" onclick="event.stopPropagation()">
-        <button class="btn btn-ghost btn-sm" onclick="resubmitFailed('${jid}')">🔁 Resubmit</button>
-        <button class="btn btn-primary btn-sm" onclick="triageAndResubmit('${jid}')">🔍 Triage &amp; Resubmit</button>
-        <button class="btn btn-danger btn-sm" title="Dismiss" onclick="dismissFailed('${jid}',event)">✕</button>
-      </div>`;
-    el.appendChild(card);
-  }
-}
-
-function resubmitFailed(id){
+  function resubmitFailed(id){
   const j=_failedJobs[id];
   if(!j)return;
   // Pre-fill form but don't cancel the failed job on submit (it's already done)
@@ -1137,7 +1146,7 @@ async function refreshAll(){
     await Promise.all([
       refreshRunning(),refreshAgents(),refreshJobs(),refreshResults(),refreshCapBanner(),
       refreshFailed(),refreshCosts(),refreshWorkers(),refreshSchedules(),
-      refreshHosts(),refreshDoctor(),refreshGPU(),
+      refreshHosts(),refreshGPU(),
       refreshRemote(),
     ]);
   }catch(e){document.getElementById('meta-time').textContent='error: '+e;}
@@ -1176,7 +1185,6 @@ function initSSE(){
           refreshJobs().catch(()=>{});
         }
                 if(d.kind==='message' && (p.topic||'').startsWith('doctor.')){
-          refreshDoctor().catch(()=>{});
         }
         if(['job.claimed','job.running','job.started'].includes(d.kind)){
           refreshRunning().catch(()=>{});
