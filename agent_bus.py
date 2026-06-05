@@ -1210,6 +1210,7 @@ class JobCreate(BaseModel):
     required_capabilities: Optional[list[str]] = None  # worker must have ALL of these
     eligible_kinds: Optional[list[str]] = None         # restrict to agent kinds; null = any
     eligible_hosts: Optional[list[str]] = None         # restrict to agent hosts (e.g. ["cixmini"]); null = any
+    target_workspace: Optional[str] = None             # GRAEAE permanent-fix: bus-side first-class workspace (replaces worker KIND_WORKSPACE_MAP guessing)
     # #10 FIX (review 2026-05-23): project tag — separate from worker capabilities.
     # 'riskyeats'/'investorclaw' are PROJECTS, not capabilities. Workers don't gain/lose
     # the ability to do work because of a project label; the label is for filter+routing.
@@ -1986,6 +1987,43 @@ async def whoami(host: str, pid: int):
     }
 
 
+# GRAEAE permanent logjam-fix (consensus 1.0, 2026-06-04): bus-side first-class workspace
+# resolution mirroring the worker KIND_WORKSPACE_MAP (prefix -> workspace name).
+WORKSPACE_CATALOG_PREFIXES = {
+    "argonaut:": "florida-licenses", "fix:codex-pro-oauth-verify": "mnemos",
+    "feat:knemon": "mnemos", "fix:knemon": "mnemos", "feat:oracle-backend": "mnemos",
+    "fix:sync-provider-models": "mnemos", "fix:knemon-cost": "mnemos", "mnemos:": "mnemos",
+    "riskybiz:": "florida-licenses", "riskyeats:": "riskyeats",
+    "investorclaw:": "ic-engine", "ic-engine:": "ic-engine",
+    "ncz-os-zeroclaw:": "zeroclaw", "ncz-os-openclaw:": "openclaw", "ncz-os-": "ncz-installer",
+    "cixmini-os:": "cix-installer", "fleet-infra:": "fleet-ops",
+}
+WORKSPACE_NAMES = set(WORKSPACE_CATALOG_PREFIXES.values())
+ADMISSION_NONCOMMIT_PREFIXES = (
+    "review", "architecture", "triage", "docs:", "investigation", "track:", "ops:",
+    "diag:", "ping:", "hive-stats", "dream-walker", "research", "analysis", "design",
+)
+
+
+def resolve_workspace_shadow(kind, description, target_workspace, project):
+    """SHADOW admission: can the workspace be resolved at SUBMIT? Returns (ws_or_None, source).
+    source in {explicit, project, prefix-fallback, repo-hint, noncommit, UNRESOLVABLE}."""
+    k = kind or ""
+    if target_workspace:
+        return (target_workspace, "explicit")
+    if project and project in WORKSPACE_NAMES:
+        return (project, "project")
+    for prefix in sorted(WORKSPACE_CATALOG_PREFIXES, key=len, reverse=True):
+        if k.startswith(prefix):
+            return (WORKSPACE_CATALOG_PREFIXES[prefix], "prefix-fallback")
+    import re as _re
+    if _re.search(r"\brepo:\s*([A-Za-z0-9_./:\-]+)", description or "", _re.I):
+        return (None, "repo-hint")
+    if any(k.startswith(pp) for pp in ADMISSION_NONCOMMIT_PREFIXES):
+        return (None, "noncommit")
+    return (None, "UNRESOLVABLE")
+
+
 @app.post("/v1/jobs")
 async def create_job(req: JobCreate):
     """Submit work to the triage queue. No agent assignment — workers self-claim via /v1/jobs/next.
@@ -2068,6 +2106,19 @@ async def create_job(req: JobCreate):
                 f"registered_agent_kinds={sorted(registered_aliases)!r}",
             )
 
+    # GRAEAE permanent logjam-fix: SUBMIT-TIME WORKSPACE ADMISSION (SHADOW / log-only, 2026-06-04).
+    # Mode-1 jam = jobs (kind="code", no project/repo) whose workspace can't resolve -> worker
+    # declines -> dead-letter. Observe would-be 422s now; enforce after vocabulary stabilizes (~1wk).
+    try:
+        _ws, _wsrc = resolve_workspace_shadow(req.kind, req.description, req.target_workspace, req.project)
+        if _wsrc == "UNRESOLVABLE":
+            print(f"ADMISSION_SHADOW would-422 no_resolvable_workspace kind={req.kind!r} "
+                  f"project={req.project!r} submitter={req.submitter_urn}", flush=True)
+        elif _wsrc == "prefix-fallback":
+            print(f"ADMISSION_SHADOW deprecated_prefix_resolve kind={req.kind!r} -> ws={_ws} "
+                  f"(migrate submitter to target_workspace)", flush=True)
+    except Exception:
+        pass
     # RESULT-CACHE CHECK: identical (kind, description, max_cost_tier, required_caps) within TTL → return cached result, mark new job done immediately
     ck = cache_key_for(req.kind, req.description, max_cost_tier, req.required_capabilities)
     async with connect_db() as db:
