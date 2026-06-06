@@ -34,7 +34,7 @@ HIVE_URL = os.environ.get("HIVE_URL", "http://192.168.207.67:5005")
 MNEMOS_URL = os.environ.get("MNEMOS_URL", "http://192.168.207.67:5002")
 MNEMOS_TOKEN = os.environ.get(
     "MNEMOS_TOKEN",
-    "d3a3bc609583005f4a077b6ffd00154b4f03f70104d0cdbfbb019fceb28daca9")
+    "d4e7b2559a222980decfec838dc54ea67f281b67fe9702ab76640409f8d53a05")
 AGENT_HOST = os.environ.get("AGENT_HOST") or socket.gethostname().split(".")[0]
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "30"))
 HEARTBEAT_INTERVAL = float(os.environ.get("HEARTBEAT_INTERVAL", "15"))
@@ -59,7 +59,7 @@ NONCOMMIT_KIND_PREFIXES = (
     "research", "analysis", "design",
 )
 
-WORKSPACE_ROOT = Path(os.path.expanduser("~/codex-workspace"))
+WORKSPACE_ROOT = Path(os.path.expanduser("~/codex-workspace")) / f"inst{INSTANCE}"  # per-instance isolation
 WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
 
 # Codex = ADVERSARIAL/REVIEW stage only — NOT the implementer (operator
@@ -95,7 +95,8 @@ KIND_WORKSPACE_MAP = {
     "riskybiz:p1-sunbiz-entity-resolver": ("florida-licenses", None),
     "riskybiz:":        ("florida-licenses", None),
     "riskyeats:":       ("riskyeats",      "https://gitlab.com/perlowja/riskyeats.git"),
-    "investorclaw:":    ("InvestorClaw",   "https://gitlab.com/argonautsystems/InvestorClaw.git"),
+    "investorclaw:":    ("ic-engine",      "https://gitlab.com/argonautsystems/ic-engine.git"),
+    "ic-engine:":       ("ic-engine",      "https://gitlab.com/argonautsystems/ic-engine.git"),
     "ncz-os-zeroclaw:": ("zeroclaw",       "https://gitlab.com/nclawzero/zeroclaw.git"),
     "ncz-os-openclaw:": ("openclaw",       "https://gitlab.com/nclawzero/openclaw.git"),
     "ncz-os-":          ("ncz-installer",  "https://gitlab.com/nclawzero/ncz-installer.git"),
