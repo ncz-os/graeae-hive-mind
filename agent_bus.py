@@ -904,11 +904,67 @@ def job_agent_preference_score(job: dict[str, Any], agent: dict[str, Any]) -> in
     return score
 
 
+# ── Spark takeover (operator directive 2026-06-06) ─────────────────────────
+# The DGX Spark (NGC Enterprise Inference Hub — large non-metered pool, NOT the
+# operator's personal NVIDIA work account) may claim ANY codex- or claude-
+# eligible job regardless of project/workspace/cost-tier restrictions, and
+# chooses any model from its hub inventory. While the OAuth cap breaker is
+# OPEN (codex weekly/rolling allowance exhausted), codex/claude-eligible jobs
+# are RESERVED for Spark (not burned on metered deepseek) as long as a Spark
+# relay agent is online.
+SPARK_HOSTS = {"spark-0c53"}
+# NOTE: submit-time admission rewrites eligible_kinds=["codex"] -> ["zeroclaw"]
+# (codex is a CLI zeroclaw workers shell out to), so coding jobs reach the DB
+# as zeroclaw-eligible — the takeover set must include zeroclaw for Spark to
+# see them. Operator: "any type of codex or claude job ... override all".
+SPARK_TAKEOVER_KINDS = {"codex", "claude", "zeroclaw"}
+SPARK_ONLINE_TTL_SEC = 120.0
+_SPARK_LAST_SEEN: dict[str, float] = {}
+
+
+def note_spark_seen_urn(urn: str) -> None:
+    parts = (urn or "").split(":")
+    if len(parts) >= 4:
+        note_spark_seen(parts[3])
+
+
+def note_spark_seen(host: str) -> None:
+    h = _norm_str(host)
+    if h in SPARK_HOSTS:
+        _SPARK_LAST_SEEN[h] = time.time()
+
+
+def spark_online() -> bool:
+    now = time.time()
+    return any(now - t < SPARK_ONLINE_TTL_SEC for t in _SPARK_LAST_SEEN.values())
+
+
 def job_agent_eligible(job: dict[str, Any], agent: dict[str, Any]) -> tuple[bool, str]:
     agent_host = _norm_str(agent.get("host"))
     agent_caps = _norm_str_set(agent.get("capabilities"))
     eligible_aliases = _norm_str_set(agent.get("eligible_aliases"))
     j_kind = _norm_str(job.get("kind"))
+
+    j_kinds = _norm_str_set(job.get("eligible_kinds"))
+    spark_takeover_job = bool(j_kinds.intersection(SPARK_TAKEOVER_KINDS)) or "*" in j_kinds
+
+    # Spark override: any codex/claude-eligible job (or a job host-pinned to
+    # Spark) is claimable by the Spark relay, bypassing kind-affinity,
+    # narrow-host, capability, project and cost-tier checks. Operator 2026-06-06.
+    if agent_host in SPARK_HOSTS:
+        pin_hosts = _norm_str_set(job.get("eligible_hosts"))
+        if spark_takeover_job or agent_host in pin_hosts or "*" in pin_hosts:
+            return True, "spark takeover override (operator 2026-06-06)"
+
+    # While the OAuth cap breaker is open, reserve codex/claude-eligible jobs
+    # for Spark instead of burning metered fallback — but only when a Spark
+    # relay is actually online (no deadlock if the relay is down).
+    if spark_takeover_job and agent_host not in SPARK_HOSTS:
+        try:
+            if oauth_cap_state().get("capped") and spark_online():
+                return False, "reserved for Spark while OAuth allowance is capped (operator 2026-06-06)"
+        except Exception:
+            pass
 
     if agent_host in NARROW_HOSTS and not j_kind.startswith(NARROW_ALLOWLIST):
         return False, f"narrow host {agent_host} not allowed for kind {j_kind}"
@@ -1760,6 +1816,7 @@ async def register(req: AgentRegister):
 @app.post("/v1/agents/heartbeat")
 async def heartbeat(req: AgentHeartbeat):
     now = time.time()
+    note_spark_seen_urn(req.urn)
     status = (req.status or "online").lower()
     if status not in VALID_AGENT_STATUSES:
         raise HTTPException(422, f"agent status must be one of {sorted(VALID_AGENT_STATUSES)}, got {status!r}")
@@ -2261,6 +2318,7 @@ async def dequeue_next_job(agent_urn: str):
 
     Race-safe via SQLite immediate-mode UPDATE...WHERE rowid=(SELECT...LIMIT 1) under a transaction.
     """
+    note_spark_seen_urn(agent_urn)
     now = time.time()
     urn_parts = agent_urn.split(":")
     agent_host = (urn_parts[3] if len(urn_parts) > 3 else "").lower()
