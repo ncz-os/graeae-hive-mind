@@ -705,6 +705,18 @@ def route_chain(tier, kind, fallback):
     return fallback
 
 
+def is_oauth_alias(alias):
+    return alias in {"hive_codex", "hive_gpt", "hive_gpt_mini", "hive_gpt_heavy"}
+
+
+def report_oauth_success(alias):
+    try:
+        http("POST", "/v1/knemon/cap",
+             {"success": True, "model": alias, "reporter": AGENT_HOST}, timeout=3)
+    except Exception:
+        pass
+
+
 def process_job(urn, job):
     jid = job["id"]
     kind = job.get("kind", "") or ""
@@ -787,6 +799,12 @@ def process_job(urn, job):
                     log.info("  KHM: cooling alias=%s for %ds (hard-fail)", alias, int(ALIAS_COOLDOWN_SEC))
                 elif result.get("commits") or result.get("exit_code") == 0:
                     _ALIAS_COOLDOWN.pop(alias, None)
+                oauth_success = (
+                    is_oauth_alias(alias) and not throttled and not hard_fail
+                    and (result.get("commits") or result.get("exit_code") == 0)
+                )
+                if oauth_success:
+                    report_oauth_success(alias)
                 escalate = (throttled or hard_fail) and not result.get("commits")
                 if result.get("commits") or not escalate or idx == len(chain) - 1:
                     break

@@ -3121,6 +3121,9 @@ def knemon_bypass_active() -> bool:
 KNEMON_CAP_FILE = "/srv/agent-bus/knemon_oauth_cap.json"
 # ChatGPT-subscription codex/gpt allowance is a rolling ~5h window (operator/Gemini 2026-06-04).
 OAUTH_CAP_RESET_SEC = 5 * 3600
+# While the breaker is open, send a small share of eligible jobs through the
+# OAuth lead as half-open probes. PYTHIA cannot probe OpenAI locally.
+OAUTH_CAP_PROBE_RATE = 0.05
 
 
 def oauth_cap_state() -> dict:
@@ -3136,10 +3139,21 @@ def oauth_cap_state() -> dict:
         until = float(d.get("capped_until") or 0)
         now = _t.time()
         return {"capped": now < until, "capped_until": until, "hit_at": d.get("hit_at"),
-                "model": d.get("model"), "remaining_sec": max(0, int(until - now))}
+                "model": d.get("model"), "reporter": d.get("reporter"),
+                "verified": False, "remaining_sec": max(0, int(until - now))}
     except Exception:
         return {"capped": False, "capped_until": None, "hit_at": None,
-                "model": None, "remaining_sec": 0}
+                "model": None, "reporter": None, "verified": False, "remaining_sec": 0}
+
+
+def clear_oauth_cap() -> Optional[str]:
+    try:
+        os.remove(KNEMON_CAP_FILE)  # no exists() pre-check (avoid TOCTOU)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        return str(e)
+    return None
 
 
 @app.post("/v1/knemon/route")
@@ -3179,6 +3193,8 @@ async def knemon_route(req: Request):
     # HIVE-LEVEL BYPASS: when the flag is set, drop the codex/gpt sub-lead and
     # hand back the plain metered open-weight chain so all workers run direct.
     bypass = knemon_bypass_active()
+    cap = oauth_cap_state()
+    oauth_cap_probe = False
     if bypass:
         CODEX_SUB_LEAD = []
         chain = list(open_weight_chain)
@@ -3193,13 +3209,14 @@ async def knemon_route(req: Request):
         # do not waste two doomed deepseek attempts. Light jobs keep deepseek-first (cost).
         if ("code" in kl) or kl.startswith(("heavy:", "architecture", "design")):
             DEEPSEEK_FALLBACK = ["hive_xai_1", "hive_deepseek_pro_1", "hive_deepseek_1"]
-        cap = oauth_cap_state()
         if cap.get("capped"):
-            # OAuth lead is inside its ~5h cap window (a worker reported usage_limit): route
-            # deepseek ONLY (drop the codex lead) so no job wastes a doomed 429. The breaker
-            # auto-expires at capped_until; knemon then resumes codex-first, and THAT post-expiry
-            # codex attempt is the reset probe (a success -> /v1/knemon/cap/clear).
-            chain = list(DEEPSEEK_FALLBACK)
+            # Half-open breaker: most jobs use metered fallback, but a small share leads
+            # OAuth so routed traffic can prove recovery before the 5h stale-report TTL.
+            if CODEX_SUB_LEAD and secrets.randbelow(10000) < int(OAUTH_CAP_PROBE_RATE * 10000):
+                oauth_cap_probe = True
+                chain = list(CODEX_SUB_LEAD) + DEEPSEEK_FALLBACK
+            else:
+                chain = list(DEEPSEEK_FALLBACK)
         else:
             chain = list(CODEX_SUB_LEAD) + DEEPSEEK_FALLBACK
     return {
@@ -3207,7 +3224,9 @@ async def knemon_route(req: Request):
         "max_cost_tier": max_tier,
         "kind": kind,
         "knemon_bypass": bypass,
-        "oauth_cap": oauth_cap_state(),
+        "oauth_cap": cap,
+        "oauth_cap_probe": oauth_cap_probe,
+        "oauth_cap_probe_rate": OAUTH_CAP_PROBE_RATE if cap.get("capped") and CODEX_SUB_LEAD else 0.0,
         "sub_lead": CODEX_SUB_LEAD,
         # codex/gpt sub agent first ($0 unlimited), metered open-weights as fallback
         "chain": chain,
@@ -3256,8 +3275,11 @@ async def knemon_cap_get():
 
 @app.post("/v1/knemon/cap")
 async def knemon_cap_set(req: Request):
-    """A worker reports the codex/gpt lead hit usage_limit. POST {model?, reset_sec?}.
-    Opens the breaker: knemon_route leads deepseek for ~5h (codex kept last as probe)."""
+    """Workers report OAuth cap state.
+
+    POST {model?, reporter?, reset_sec?} opens the breaker on usage_limit.
+    POST {success:true, model?, reporter?} closes it after a successful OAuth completion.
+    """
     import json as _j
     import time as _t
     try:
@@ -3266,6 +3288,11 @@ async def knemon_cap_set(req: Request):
         body = {}
     if not isinstance(body, dict):
         body = {}
+    if body.get("success") is True:
+        err = clear_oauth_cap()
+        if err:
+            return {"ok": False, "error": err}
+        return {"ok": True, "cleared": True, "success": True, **oauth_cap_state()}
     # debounce the worker stampede: the first usage_limit opens the breaker for the full
     # window; concurrent reporters within the window are no-ops (don't churn/extend it).
     cur = oauth_cap_state()
@@ -3279,7 +3306,12 @@ async def knemon_cap_set(req: Request):
         reset = float(OAUTH_CAP_RESET_SEC)
     reset = max(60.0, min(reset, 86400.0))
     now = _t.time()
-    state = {"hit_at": now, "capped_until": now + reset, "model": str(body.get("model") or "")}
+    state = {
+        "hit_at": now,
+        "capped_until": now + reset,
+        "model": str(body.get("model") or ""),
+        "reporter": str(body.get("reporter") or body.get("worker") or body.get("host") or ""),
+    }
     try:
         tmp = KNEMON_CAP_FILE + ".tmp"
         with open(tmp, "w") as f:
@@ -3293,13 +3325,19 @@ async def knemon_cap_set(req: Request):
 @app.post("/v1/knemon/cap/clear")
 async def knemon_cap_clear():
     """Confirm OAuth reset (a codex/gpt probe succeeded). Closes the breaker."""
-    try:
-        os.remove(KNEMON_CAP_FILE)  # no exists() pre-check (avoid TOCTOU)
-    except FileNotFoundError:
-        pass
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+    err = clear_oauth_cap()
+    if err:
+        return {"ok": False, "error": err}
     return {"ok": True, **oauth_cap_state()}
+
+
+@app.post("/v1/knemon/cap/probe-ok")
+async def knemon_cap_probe_ok():
+    """Confirm a half-open OAuth probe succeeded. Closes the breaker."""
+    err = clear_oauth_cap()
+    if err:
+        return {"ok": False, "error": err}
+    return {"ok": True, "cleared": True, **oauth_cap_state()}
 
 
 @app.get("/v1/knemon/spend")

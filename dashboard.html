@@ -1127,17 +1127,20 @@ async function refreshHosts(){
   }
 }
 
-let _capUntil=0;
+let _capState=null;
 async function refreshCapBanner(){
-  try{const d=await api('GET','/v1/knemon/cap');_capUntil=d.capped?(d.capped_until||0):0;renderCapBanner();}catch(_){}
+  try{const d=await api('GET','/v1/knemon/cap');_capState=d.capped?d:null;renderCapBanner();}catch(_){}
 }
 function renderCapBanner(){
   const el=document.getElementById('cap-banner');if(!el)return;
-  const rem=Math.max(0,Math.round(_capUntil-Date.now()/1000));
+  const rem=Math.max(0,Math.round(((_capState&&_capState.capped_until)||0)-Date.now()/1000));
   if(rem<=0){el.style.display='none';return;}
   const h=Math.floor(rem/3600),m=Math.floor((rem%3600)/60),sc=rem%60;
+  const hit=_capState.hit_at?new Date(_capState.hit_at*1000).toLocaleTimeString():'unknown time';
+  const model=_capState.model?esc(_capState.model):'unknown model';
+  const reporter=_capState.reporter?(' by '+esc(_capState.reporter)):'';
   el.style.display='block';
-  el.innerHTML='\u23f3 <b>OpenAI OAuth allowance capped</b> \u2014 routing deepseek fallback. Reset probe in <b>'+h+'h '+String(m).padStart(2,'0')+'m '+String(sc).padStart(2,'0')+'s</b> (cleared early if a codex probe succeeds).';
+  el.innerHTML='\u23f3 <b>OpenAI OAuth cap reported, unverified</b> \u2014 '+model+reporter+' reported usage_limit at <b>'+esc(hit)+'</b>. Most jobs route fallback; ~5% are OAuth probes. Auto-clear in <b>'+h+'h '+String(m).padStart(2,'0')+'m '+String(sc).padStart(2,'0')+'s</b> unless a success report clears it first.';
 }
 setInterval(renderCapBanner,1000);
 async function refreshAll(){
