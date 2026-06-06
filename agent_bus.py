@@ -3502,6 +3502,20 @@ async def list_jobs(
     limit: int = 100,
 ):
     limit = clamp_limit(limit, default=100, max_limit=1000)
+    if status:
+        # Normalize separator variants (dead_letter -> dead-letter,
+        # failed-completion -> failed_completion) and reject unknown values
+        # with 400 instead of silently returning an empty list. A wrong
+        # separator previously made 82 dead-letter rows API-invisible
+        # (2026-06-06): the canonical spelling is hyphenated dead-letter
+        # while callers naturally write dead_letter.
+        normalized = status.strip().lower().replace("_", "-")
+        status = {"failed-completion": "failed_completion"}.get(normalized, normalized)
+        if status not in VALID_JOB_STATUSES:
+            raise HTTPException(
+                400,
+                f"unknown status {status!r}; valid: {sorted(VALID_JOB_STATUSES)}",
+            )
     sql = ("SELECT id, submitter_urn, parent_job_id, kind, description, priority, status, "
            "claimed_by, started_at, ended_at, result, estimated_cost_usd, "
            "required_capabilities, eligible_kinds, eligible_hosts FROM jobs WHERE 1=1")
@@ -3528,8 +3542,8 @@ async def list_jobs(
         cnt_sql += " AND started_at >= ?"
         args.append(since)
         cnt_args.append(since)
-    # For terminal statuses (done/failed/cancelled), sort by ended_at DESC so 'recent' actually means recently-finished.
-    if status in ("done", "failed", "cancelled"):
+    # For terminal statuses, sort by ended_at DESC so 'recent' actually means recently-finished.
+    if status in TERMINAL_JOB_STATUSES:
         sql += " ORDER BY COALESCE(ended_at, started_at) DESC LIMIT ?"
     else:
         sql += " ORDER BY priority DESC, started_at DESC LIMIT ?"
