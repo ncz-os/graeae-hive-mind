@@ -919,6 +919,10 @@ SPARK_HOSTS = {"spark-0c53"}
 # see them. Operator: "any type of codex or claude job ... override all".
 SPARK_TAKEOVER_KINDS = {"codex", "claude", "zeroclaw"}
 SPARK_ONLINE_TTL_SEC = 120.0
+# Kinds whose work is pro-grade (adversarial review, architecture, repo-wide
+# refactors) — routed Spark-first to preserve OAuth weekly allowance and keep
+# v4-PRO as the spark-offline last resort.
+SPARK_HEAVY_KIND_PREFIXES = ("review", "adversarial", "architecture", "design", "refactor")
 _SPARK_LAST_SEEN: dict[str, float] = {}
 
 
@@ -963,6 +967,22 @@ def job_agent_eligible(job: dict[str, Any], agent: dict[str, Any]) -> tuple[bool
         try:
             if oauth_cap_state().get("capped") and spark_online():
                 return False, "reserved for Spark while OAuth allowance is capped (operator 2026-06-06)"
+        except Exception:
+            pass
+
+    # Heavy/review work prefers Spark even when OAuth is healthy (GRAEAE
+    # consult a30d0c1f + operator 2026-06-06): it preserves the weekly OAuth
+    # allowance and keeps deepseek v4-PRO (66 burned in 2 days) as a true
+    # spark-offline last resort. Workers only see these kinds when no Spark
+    # relay is online.
+    if (
+        spark_takeover_job
+        and agent_host not in SPARK_HOSTS
+        and j_kind.startswith(SPARK_HEAVY_KIND_PREFIXES)
+    ):
+        try:
+            if spark_online():
+                return False, "heavy/review kind reserved for Spark while a relay is online (operator 2026-06-06)"
         except Exception:
             pass
 
