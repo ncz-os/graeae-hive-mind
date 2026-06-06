@@ -1215,6 +1215,33 @@ async def cache_lookup(db, cache_key: str) -> Optional[dict]:
     }
 
 
+def _cache_json(result: dict, limit: int = 32000) -> str:
+    """Serialize a job result for hive_cache without breaking JSON validity.
+
+    The old code sliced the serialized string to 32000 chars; any result
+    bigger than that (e.g. Spark agentic results carrying a format-patch)
+    became truncated NON-JSON and tripped the Oracle `result_json IS JSON`
+    check constraint -> every PATCH on the job 500'd (2026-06-06). Trim the
+    bulky FIELDS instead, and fall back to a stub if still oversized.
+    """
+    payload = json.dumps(result, default=str)
+    if len(payload) <= limit:
+        return payload
+    slim = dict(result)
+    for k in ("patch", "suggestion", "full_response", "context"):
+        v = slim.get(k)
+        if isinstance(v, str) and len(v) > 2000:
+            slim[k] = v[:2000] + f"...[cache-trimmed {len(v) - 2000} chars]"
+    payload = json.dumps(slim, default=str)
+    if len(payload) <= limit:
+        return payload
+    return json.dumps(
+        {"cache_truncated": True, "exit_code": result.get("exit_code"),
+         "status": result.get("status")},
+        default=str,
+    )
+
+
 async def cache_store(db, cache_key: str, source_job_id: str, result: dict,
                       result_mnemos_id: Optional[str], model: str, provider: str,
                       cost_for_save: float):
@@ -1227,7 +1254,7 @@ async def cache_store(db, cache_key: str, source_job_id: str, result: dict,
         "result_json=excluded.result_json, source_job_id=excluded.source_job_id, "
         "result_mnemos_id=excluded.result_mnemos_id, cached_at=excluded.cached_at, "
         "model=excluded.model, provider=excluded.provider",
-        (cache_key, json.dumps(result, default=str)[:32000], source_job_id,
+        (cache_key, _cache_json(result), source_job_id,
          result_mnemos_id, model, provider, now),
     )
 
