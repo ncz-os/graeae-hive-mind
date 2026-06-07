@@ -94,10 +94,15 @@ _PHASE_MODELS = {
     "fix": DOCTOR_FIX_MODEL,
 }
 # Open-weight OpenAI-compatible endpoint used for any non-codex phase model.
-# Defaults to DeepSeek direct (cheap, already keyed in ~/.zeroclaw/config.toml).
+# Default = NGC Enterprise Inference Hub via the .4 LiteLLM gateway (PYTHIA:4100
+# tunnel, $0 enterprise). DeepSeek is FORBIDDEN here (operator 2026-06-07:
+# deepseek is code-review / high-level-architecture fallback ONLY — the doctor
+# does triage reasoning, neither). nemotron-3-super = strong direct-prompt
+# reasoner (no agentic tool loop on this path).
 DOCTOR_OPENWEIGHT_BASE_URL = os.environ.get(
-    "DOCTOR_OPENWEIGHT_BASE_URL", "https://api.deepseek.com/v1").rstrip("/")
-DOCTOR_OPENWEIGHT_MODEL = os.environ.get("DOCTOR_OPENWEIGHT_MODEL", "deepseek-chat")
+    "DOCTOR_OPENWEIGHT_BASE_URL", "http://192.168.207.67:4100/v1").rstrip("/")
+DOCTOR_OPENWEIGHT_MODEL = os.environ.get(
+    "DOCTOR_OPENWEIGHT_MODEL", "nvidia/nvidia/nemotron-3-super-v3")
 DOCTOR_OPENWEIGHT_API_KEY = os.environ.get("DOCTOR_OPENWEIGHT_API_KEY", "")
 DOCTOR_OPENWEIGHT_TIMEOUT = int(os.environ.get("DOCTOR_OPENWEIGHT_TIMEOUT", "120"))
 
@@ -499,30 +504,28 @@ def _invoke_codex_cli(prompt: str) -> tuple[bool, str]:
 
 
 def _openweight_api_key() -> str:
-    """Resolve the open-weight API key: env override first, else the deepseek
-    key already provisioned in ~/.zeroclaw/config.toml (no extra secret store)."""
+    """Resolve the open-weight API key: env override, else the NGC LiteLLM
+    proxy key from /etc/nclawzero/ngc-review-env (the default endpoint is the
+    .4 NGC gateway). No deepseek fallback — review-only per operator 2026-06-07."""
     if DOCTOR_OPENWEIGHT_API_KEY:
         return DOCTOR_OPENWEIGHT_API_KEY
-    try:
-        cfg = os.path.expanduser("~/.zeroclaw/config.toml")
-        with open(cfg) as f:
-            content = f.read()
-        # First api_key under any [providers.models.deepseek.*] block.
-        m = re.search(
-            r"\[providers\.models\.deepseek\.[^\]]+\][^\[]*?api_key\s*=\s*\"([^\"]+)\"",
-            content, re.DOTALL)
-        if m:
-            return m.group(1)
-    except OSError:
-        pass
+    for envfile in ("/etc/nclawzero/ngc-review-env", "/etc/nclawzero/agent-env"):
+        try:
+            for line in open(envfile):
+                m = re.match(r"\s*(?:export\s+)?NGC_LITELLM_PROXY_KEY=(.*)", line)
+                if m:
+                    return m.group(1).strip().strip('"').strip("'")
+        except OSError:
+            continue
     return ""
 
 
 def _invoke_openweight(prompt: str, model_alias: str) -> tuple[bool, str]:
     """Run a non-codex (open-weight) phase via an OpenAI-compatible chat
     endpoint. Used for cheap phases like triage classification. Anthropic +
-    Together remain FORBIDDEN per CLAUDE.md — default endpoint is DeepSeek
-    direct. Returns (ok, text) with the same contract as the codex path."""
+    Together remain FORBIDDEN per CLAUDE.md; DeepSeek is review/architecture-
+    only (operator 2026-06-07) so the default endpoint is the NGC .4 gateway.
+    Returns (ok, text) with the same contract as the codex path."""
     api_key = _openweight_api_key()
     if not api_key:
         return False, (f"open-weight model {model_alias!r} requested but no API key "
