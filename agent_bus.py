@@ -1209,8 +1209,14 @@ async def cache_lookup(db, cache_key: str) -> Optional[dict]:
         r = await cur.fetchone()
     if not r:
         return None
+    _res = json.loads(r[0]) if r[0] else None
+    # Defensive: never SERVE a poisoned needs-review entry as a done answer,
+    # even if one slipped into the table before the store-side guard landed
+    # (spark orphan propagation, 2026-06-07).
+    if isinstance(_res, dict) and (_res.get("needs_review") or _res.get("status") == "needs-review"):
+        return None
     return {
-        "result": json.loads(r[0]) if r[0] else None,
+        "result": _res,
         "source_job_id": r[1], "result_mnemos_id": r[2],
         "hit_count": r[3], "cost_saved_usd": r[4],
         "model": r[5], "provider": r[6], "cached_at": r[7],
@@ -2843,7 +2849,16 @@ async def update_job(job_id: str, req: JobUpdate):
                                            json_list(reqcaps_json))
                         rdict = json.loads(result_j) if result_j else (req.result or {})
                         ec = (rdict or {}).get("exit_code")
-                        if ec == 0 or ec is None:
+                        # NEVER cache a non-terminal / unlanded result. A spark
+                        # needs-review result (work is a patch on spark-0c53, NOT
+                        # landed) has exit_code=None and would otherwise be served
+                        # as an instant fake-"done" to every matching resubmit
+                        # (the 73 orphaned FRI jobs, 2026-06-07). Only cache real
+                        # completed work: not needs_review, and either it carries
+                        # commits or it is a non-workspace job (no repo to commit).
+                        _nr = bool((rdict or {}).get("needs_review")) or \
+                              (rdict or {}).get("status") == "needs-review"
+                        if (ec == 0 or ec is None) and not _nr:
                             await cache_store(db, ck, job_id, rdict, req.result_mnemos_id,
                                               mdl_j or "unknown", prov_j or "unknown", cost_estimate or 0)
 
