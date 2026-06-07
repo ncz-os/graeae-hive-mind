@@ -3173,6 +3173,10 @@ KNEMON_PROVIDERS: list[dict[str, Any]] = [
     # tunnel). Enterprise allocation, no per-token bill -> tier A. Worker
     # agent = hive_ngc_1 (openai.ngc_nemotron, fleet-ops fe4d780).
     {"provider": "ngc-proxy", "model": "nemotron-3-super-v3",  "alias": "hive_ngc_1",         "tier": "A"},
+    # Bedrock Nova (funded AWS creds, worker agents shipped 2026-06-02):
+    # cheap metered fallbacks (lite 0.06/0.24, micro 0.035/0.14).
+    {"provider": "bedrock",   "model": "amazon.nova-lite-v1:0", "alias": "hive_nova_1",       "tier": "B"},
+    {"provider": "bedrock",   "model": "amazon.nova-micro-v1:0","alias": "hive_nova_2",       "tier": "B"},
 ]
 
 
@@ -3294,12 +3298,15 @@ async def knemon_route(req: Request):
     #   everything else (coding default) -> hive_gpt (gpt-5.4)
     kl = kind.lower()
     review_kind = any(kl.startswith(p) for p in ("review:", "codex", "doctor:codex-fix", "adversarial"))
-    # DEEPSEEK IS REVIEW-ONLY (operator directive 2026-06-07): the refreshed
-    # key may serve review/adversarial kinds only (codex-gate parity). It must
-    # NEVER appear in a job-model chain — strip its aliases for everything else.
-    if not review_kind:
-        cands = [c for c in cands if "deepseek" not in c["alias"]]
-        open_weight_chain = [a for a in open_weight_chain if "deepseek" not in a]
+    arch_kind = any(t in kl for t in ("architecture", "design")) or kl.startswith("heavy:")
+    # DEEPSEEK POLICY (operator directive 2026-06-07, refined same day):
+    # deepseek-v4-PRO = CODE REVIEW fallback or HIGH-LEVEL ARCHITECTURE
+    # fallback ONLY — never a general job model ($166 burn incident).
+    # deepseek-v4-FLASH (hive_deepseek_1) is UNRESTRICTED (~10x cheaper than
+    # pro). Strip only the PRO alias from non-review/non-arch kinds.
+    if not (review_kind or arch_kind):
+        cands = [c for c in cands if c["alias"] != "hive_deepseek_pro_1"]
+        open_weight_chain = [a for a in open_weight_chain if a != "hive_deepseek_pro_1"]
     if review_kind:
         CODEX_SUB_LEAD = ["hive_codex"]
     elif any(t in kl for t in ("architecture", "design")) or kl.startswith("heavy:"):
@@ -3324,10 +3331,16 @@ async def knemon_route(req: Request):
         #   job model — observed confabulating/failing heavy jobs AND now policy.
         if review_kind:
             # hive_ngc_1 first (NGC nemotron via .4 gateway, $0 enterprise);
-            # deepseek next (review-only sanction); grok last resort.
+            # deepseek next (review fallback sanction); grok last resort.
             METERED_FALLBACK = ["hive_ngc_1", "hive_deepseek_pro_1", "hive_deepseek_1", "hive_xai_1"]
+        elif arch_kind:
+            # High-level architecture: deepseek-PRO only (no flash — too weak
+            # for architecture), after free NGC, before grok.
+            METERED_FALLBACK = ["hive_ngc_1", "hive_deepseek_pro_1", "hive_xai_1"]
         else:
-            METERED_FALLBACK = ["hive_ngc_1", "hive_xai_1"]
+            # General jobs: free NGC, then flash (unrestricted cheap), then
+            # Nova lite (funded bedrock), grok last.
+            METERED_FALLBACK = ["hive_ngc_1", "hive_deepseek_1", "hive_nova_1", "hive_xai_1"]
         if cap.get("capped"):
             # Half-open breaker: most jobs use metered fallback, but a small share leads
             # OAuth so routed traffic can prove recovery before the 5h stale-report TTL.
