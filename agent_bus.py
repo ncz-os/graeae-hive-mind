@@ -3287,7 +3287,14 @@ async def knemon_route(req: Request):
     #   light/narrow (triage/docs/investigation) -> hive_gpt_mini (gpt-5.4-mini)
     #   everything else (coding default) -> hive_gpt (gpt-5.4)
     kl = kind.lower()
-    if any(kl.startswith(p) for p in ("review:", "codex", "doctor:codex-fix", "adversarial")):
+    review_kind = any(kl.startswith(p) for p in ("review:", "codex", "doctor:codex-fix", "adversarial"))
+    # DEEPSEEK IS REVIEW-ONLY (operator directive 2026-06-07): the refreshed
+    # key may serve review/adversarial kinds only (codex-gate parity). It must
+    # NEVER appear in a job-model chain — strip its aliases for everything else.
+    if not review_kind:
+        cands = [c for c in cands if "deepseek" not in c["alias"]]
+        open_weight_chain = [a for a in open_weight_chain if "deepseek" not in a]
+    if review_kind:
         CODEX_SUB_LEAD = ["hive_codex"]
     elif any(t in kl for t in ("architecture", "design")) or kl.startswith("heavy:"):
         CODEX_SUB_LEAD = ["hive_gpt"]  # gpt-5.5 (hive_gpt_heavy) OAuth allowance exhausted 2026-06-04 -> use gpt-5.4
@@ -3305,25 +3312,24 @@ async def knemon_route(req: Request):
         chain = list(open_weight_chain)
     else:
         # OAuth codex/gpt ($0) leads. Its allowance is a rolling ~5h window (operator/Gemini
-        # 2026-06-04) and caps under heavy job load (gpt-5.4/5.5/mini exhausted; only
-        # gpt-5.3-codex-spark live). When it 429s/usage_limit, fall through to deepseek-direct
-        # (working key in gateway env): v4-pro (main, cheapest after OpenAI) then v4-flash (light).
-        DEEPSEEK_FALLBACK = ["hive_deepseek_pro_1", "hive_deepseek_1", "hive_xai_1"]  # grok-4.3 = capable last-resort for heavy jobs deepseek cant finish (funded xai)
-        # Heavy code/architecture jobs: deepseek-v4 cannot complete them (observed: ~7min then
-        # fail, 0 commits) -> lead the capable grok-4.3 first among the metered fallbacks so we
-        # do not waste two doomed deepseek attempts. Light jobs keep deepseek-first (cost).
-        if ("code" in kl) or kl.startswith(("heavy:", "architecture", "design")):
-            DEEPSEEK_FALLBACK = ["hive_xai_1", "hive_deepseek_pro_1", "hive_deepseek_1"]
+        # 2026-06-04) and caps under heavy job load. When it 429s/usage_limit:
+        #   review kinds  -> deepseek (REVIEW-ONLY sanction, operator 2026-06-07) then grok
+        #   all job kinds -> grok-4.3 only (funded xai). Deepseek is FORBIDDEN as a
+        #   job model — observed confabulating/failing heavy jobs AND now policy.
+        if review_kind:
+            METERED_FALLBACK = ["hive_deepseek_pro_1", "hive_deepseek_1", "hive_xai_1"]
+        else:
+            METERED_FALLBACK = ["hive_xai_1"]
         if cap.get("capped"):
             # Half-open breaker: most jobs use metered fallback, but a small share leads
             # OAuth so routed traffic can prove recovery before the 5h stale-report TTL.
             if CODEX_SUB_LEAD and secrets.randbelow(10000) < int(OAUTH_CAP_PROBE_RATE * 10000):
                 oauth_cap_probe = True
-                chain = list(CODEX_SUB_LEAD) + DEEPSEEK_FALLBACK
+                chain = list(CODEX_SUB_LEAD) + METERED_FALLBACK
             else:
-                chain = list(DEEPSEEK_FALLBACK)
+                chain = list(METERED_FALLBACK)
         else:
-            chain = list(CODEX_SUB_LEAD) + DEEPSEEK_FALLBACK
+            chain = list(CODEX_SUB_LEAD) + METERED_FALLBACK
     return {
         "ok": True,
         "max_cost_tier": max_tier,
