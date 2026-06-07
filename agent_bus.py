@@ -1101,6 +1101,8 @@ LLM_RATES: dict[tuple[str, str], tuple[float, float]] = {
     ("groq",      "gpt-oss-120b"):          (0.15,  0.60),
     ("groq",      "gpt-oss-20b"):           (0.075, 0.30),
     ("groq",      "*"):                     (0.29,  0.59),
+    ("ngc-proxy", "nemotron-3-super-v3"):   (0.0,   0.0),
+    ("ngc-proxy", "*"):                     (0.0,   0.0),
     ("deepseek-direct", "deepseek-v4-pro"): (0.435, 0.87),
     ("deepseek-direct", "deepseek-v4-flash"): (0.14, 0.28),
     ("deepseek-direct", "*"):               (0.435, 0.87),
@@ -3167,6 +3169,10 @@ KNEMON_PROVIDERS: list[dict[str, Any]] = [
     {"provider": "together",  "model": "minimax-m2.7",         "alias": "hive_together_1",    "tier": "B"},
     {"provider": "xai",       "model": "grok-4.1-fast",        "alias": "hive_xai_1",         "tier": "B"},
     {"provider": "deepseek-direct","model": "deepseek-v4-pro", "alias": "hive_deepseek_pro_1","tier": "B"},
+    # NGC Enterprise Inference Hub via the .4 LiteLLM gateway (PYTHIA:4100
+    # tunnel). Enterprise allocation, no per-token bill -> tier A. Worker
+    # agent = hive_ngc_1 (openai.ngc_nemotron, fleet-ops fe4d780).
+    {"provider": "ngc-proxy", "model": "nemotron-3-super-v3",  "alias": "hive_ngc_1",         "tier": "A"},
 ]
 
 
@@ -3317,9 +3323,11 @@ async def knemon_route(req: Request):
         #   all job kinds -> grok-4.3 only (funded xai). Deepseek is FORBIDDEN as a
         #   job model — observed confabulating/failing heavy jobs AND now policy.
         if review_kind:
-            METERED_FALLBACK = ["hive_deepseek_pro_1", "hive_deepseek_1", "hive_xai_1"]
+            # hive_ngc_1 first (NGC nemotron via .4 gateway, $0 enterprise);
+            # deepseek next (review-only sanction); grok last resort.
+            METERED_FALLBACK = ["hive_ngc_1", "hive_deepseek_pro_1", "hive_deepseek_1", "hive_xai_1"]
         else:
-            METERED_FALLBACK = ["hive_xai_1"]
+            METERED_FALLBACK = ["hive_ngc_1", "hive_xai_1"]
         if cap.get("capped"):
             # Half-open breaker: most jobs use metered fallback, but a small share leads
             # OAuth so routed traffic can prove recovery before the 5h stale-report TTL.
