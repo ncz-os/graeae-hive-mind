@@ -730,6 +730,11 @@ KIND_HOST_AFFINITY: dict[str, list[str]] = {
 
 NARROW_HOSTS = {"cixmini", "bigpi", "clawpi", "zeropi"}
 NARROW_ALLOWLIST = ("cixmini-os:", "ncz-os-", "fleet-infra:")
+# Hosts the serve gate must NEVER hand a job to. PROTEUS (FreeBSD dev box)
+# has a BROKEN gateway: it claims jobs then 400s the WSS handshake in ~0.5s,
+# thrashing every job it touches (2026-06-07). Quarantine it bus-side instead
+# of tearing down another owner's host. Remove once its gateway is fixed.
+QUARANTINED_HOSTS = {"proteus"}
 
 # WORKSPACE AFFINITY — automatic required_capabilities injection + claim guard.
 # Workspace-scoped jobs must only be offered to workers that explicitly
@@ -948,6 +953,11 @@ def job_agent_eligible(job: dict[str, Any], agent: dict[str, Any]) -> tuple[bool
     agent_caps = _norm_str_set(agent.get("capabilities"))
     eligible_aliases = _norm_str_set(agent.get("eligible_aliases"))
     j_kind = _norm_str(job.get("kind"))
+
+    # Quarantined hosts (broken gateway/worker) never get served — they only
+    # thrash. Checked first so nothing else can override it.
+    if agent_host in QUARANTINED_HOSTS:
+        return False, f"host {agent_host} is quarantined (broken gateway)"
 
     j_kinds = _norm_str_set(job.get("eligible_kinds"))
     spark_takeover_job = bool(j_kinds.intersection(SPARK_TAKEOVER_KINDS)) or "*" in j_kinds
