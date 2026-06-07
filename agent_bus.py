@@ -1101,7 +1101,7 @@ LLM_RATES: dict[tuple[str, str], tuple[float, float]] = {
     ("groq",      "gpt-oss-120b"):          (0.15,  0.60),
     ("groq",      "gpt-oss-20b"):           (0.075, 0.30),
     ("groq",      "*"):                     (0.29,  0.59),
-    ("ngc-proxy", "gpt-oss-120b"):   (0.0,   0.0),
+    ("ngc-proxy", "gpt-5.5"):         (0.0,   0.0),
     ("ngc-proxy", "*"):                     (0.0,   0.0),
     ("deepseek-direct", "deepseek-v4-pro"): (0.435, 0.87),
     ("deepseek-direct", "deepseek-v4-flash"): (0.14, 0.28),
@@ -3187,7 +3187,7 @@ KNEMON_PROVIDERS: list[dict[str, Any]] = [
     # NGC Enterprise Inference Hub via the .4 LiteLLM gateway (PYTHIA:4100
     # tunnel). Enterprise allocation, no per-token bill -> tier A. Worker
     # agent = hive_ngc_1 (openai.ngc_nemotron, fleet-ops fe4d780).
-    {"provider": "ngc-proxy", "model": "gpt-oss-120b",       "alias": "hive_ngc_1",         "tier": "A"},
+    {"provider": "ngc-proxy", "model": "gpt-5.5",            "alias": "hive_ngc_1",         "tier": "A"},
     # Bedrock Nova (funded AWS creds, worker agents shipped 2026-06-02):
     # cheap metered fallbacks (lite 0.06/0.24, micro 0.035/0.14).
     {"provider": "bedrock",   "model": "amazon.nova-lite-v1:0", "alias": "hive_nova_1",       "tier": "B"},
@@ -3344,22 +3344,21 @@ async def knemon_route(req: Request):
         #   review kinds  -> deepseek (REVIEW-ONLY sanction, operator 2026-06-07) then grok
         #   all job kinds -> grok-4.3 only (funded xai). Deepseek is FORBIDDEN as a
         #   job model — observed confabulating/failing heavy jobs AND now policy.
-        # NOTE (2026-06-07): hive_ngc_1 (NGC gpt-oss/nemotron via .4 gateway) is
-        # an UNRELIABLE AGENTIC DRIVER in this gateway's prompt-tool harness —
-        # gpt-oss emits harmony channels / nemotron pseudo-XML that the harness
-        # does not consistently parse into tool calls (observed 0-tool no-op
-        # contract-breaches). NGC is great for DIRECT-PROMPT review (ngc-review
-        # CLI) but must NOT LEAD agentic chains. Proven tool-drivers
-        # (deepseek/grok) lead; hive_ngc_1 is a last-resort capacity fallback.
+        # hive_ngc_1 = azure/openai/gpt-5.5 via the .4 NGC gateway (operator
+        # 2026-06-07: gpt-5.5 ≈ codex quality, free NGC enterprise). It is a
+        # proper OpenAI tool-driver (native tool_calls, unlike the earlier
+        # gpt-oss/nemotron harmony/pseudo-XML no-ops) — so it LEADS the metered
+        # fallback: when OAuth codex/gpt is capped it is the best available
+        # driver AND $0. deepseek/nova/grok follow. (NGC nemotron stays as the
+        # ngc-review CLI's direct-prompt reviewer, separate from this chain.)
         if review_kind:
-            METERED_FALLBACK = ["hive_deepseek_pro_1", "hive_deepseek_1", "hive_xai_1", "hive_ngc_1"]
+            METERED_FALLBACK = ["hive_ngc_1", "hive_deepseek_pro_1", "hive_deepseek_1", "hive_xai_1"]
         elif arch_kind:
-            # High-level architecture: deepseek-PRO (sanctioned), then grok.
-            METERED_FALLBACK = ["hive_deepseek_pro_1", "hive_xai_1", "hive_ngc_1"]
+            # High-level architecture: gpt-5.5, then deepseek-PRO (sanctioned), grok.
+            METERED_FALLBACK = ["hive_ngc_1", "hive_deepseek_pro_1", "hive_xai_1"]
         else:
-            # General jobs: flash (unrestricted cheap, drives tools), Nova lite
-            # (funded bedrock), grok; NGC last (no-op risk).
-            METERED_FALLBACK = ["hive_deepseek_1", "hive_nova_1", "hive_xai_1", "hive_ngc_1"]
+            # General jobs: gpt-5.5 (codex-class, free), flash, Nova lite, grok.
+            METERED_FALLBACK = ["hive_ngc_1", "hive_deepseek_1", "hive_nova_1", "hive_xai_1"]
         if cap.get("capped"):
             # Half-open breaker: most jobs use metered fallback, but a small share leads
             # OAuth so routed traffic can prove recovery before the 5h stale-report TTL.
