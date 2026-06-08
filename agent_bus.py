@@ -38,6 +38,12 @@ ORACLE_DSN = os.environ.get("ORACLE_DSN", "oracle://mnemos:mnemos_dev@127.0.0.1:
 HEARTBEAT_REAP_INTERVAL = 30.0
 HEARTBEAT_STALE_AFTER = 90.0
 HEARTBEAT_OFFLINE_AFTER = 300.0
+# Hard-delete agents that have been offline this long. Every worker restart
+# registers a NEW session URN, so without this the agents table grows without
+# bound (10,930 rows / 10,882 offline observed 2026-06-08) and poisons the
+# dashboard worker panel + per-worker stats. 6h keeps a generous recent-history
+# window while reaping long-dead session rows.
+AGENT_PURGE_AFTER = float(os.environ.get("HIVE_AGENT_PURGE_AFTER", "21600"))
 EVENTS_RETAIN_HOURS = 168  # 7 days
 SSE_PING_INTERVAL = 15.0
 EVENT_QUEUE: dict[str, asyncio.Queue] = {}  # subscriber_id -> queue
@@ -473,6 +479,60 @@ def uuidv7() -> str:
 
 def make_urn(kind: str, host: str, session_id: str) -> str:
     return f"urn:agent:{kind}:{host}:{session_id}"
+
+
+def stable_worker_id(urn: str) -> str:
+    """Collapse a session URN to a stable per-worker identity for stats.
+
+    ``urn:agent:<kind>:<host>:<session_uuid>`` -> ``urn:agent:<kind>:<host>``.
+    The session segment changes on every worker restart, so keying worker
+    stats by the full URN fragments one worker's history across thousands of
+    rows (3,176 rows / 43 live workers observed 2026-06-08). Keying by the
+    stable prefix aggregates a worker's runs across restarts. Non-conforming
+    URNs are returned unchanged.
+    """
+    if not urn:
+        return urn
+    parts = urn.split(":")
+    # urn:agent:<kind>:<host>:<session> -> 5 parts; drop the trailing session.
+    # Drop ONLY the trailing session segment so colon-bearing hosts (IPv6) are
+    # preserved — splitting on ':' and keeping parts[:4] would corrupt them.
+    if len(parts) >= 5 and parts[0] == "urn" and parts[1] == "agent":
+        return urn.rsplit(":", 1)[0]
+    return urn
+
+
+MAX_REPORTED_TOKENS = 100_000_000  # sane ceiling; rejects absurd worker telemetry
+
+
+def _safe_nonneg_int(v, default: int = 0) -> int:
+    """Coerce an untrusted worker-reported value to a clamped non-negative int.
+
+    Worker result bodies are runtime/untrusted; a malformed token field
+    (``"12.5"``, ``{}``, ``None``, a negative, ``Infinity``/``NaN`` which JSON
+    can carry, a 100-digit string) must NOT raise on the hot job-completion
+    path, decrement cumulative counters, or overflow the numeric column."""
+    if isinstance(v, bool):  # bool is an int subclass — never a token count
+        return default
+    if isinstance(v, float) and (v != v or v in (float("inf"), float("-inf"))):
+        return default
+    try:
+        n = int(v)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    if n <= 0:
+        return 0
+    return min(n, MAX_REPORTED_TOKENS)
+
+
+def _safe_str(v, default: str = "unknown") -> str:
+    if v is None:
+        return default
+    try:
+        s = str(v).strip()
+        return s or default
+    except Exception:  # noqa: BLE001
+        return default
 
 
 async def emit_event(db, kind: str, payload: dict) -> None:
@@ -1446,6 +1506,28 @@ async def reaper_task(app: FastAPI):
                     await db.commit()
                     for urn in dead:
                         await emit_event(db, "agent.offline", {"urn": urn, "reason": "heartbeat_timeout"})
+
+                # 1b. AGENT PURGE: hard-delete agents offline beyond AGENT_PURGE_AFTER.
+                # Each worker restart registers a fresh session URN; without this the
+                # agents table grows unbounded (10,930 rows / 10,882 offline observed
+                # 2026-06-08) and poisons the dashboard worker panel. Done as a single
+                # SET-BASED delete that re-checks every safety condition AT DELETE TIME
+                # (status, heartbeat age, no in-flight claim) so an agent that heartbeats
+                # or claims work between a select and a delete cannot be removed — there
+                # is no select/delete window. Claim recovery (step 2) runs after, so the
+                # NOT EXISTS guard is the authoritative protection for actively-claimed
+                # URNs, not ordering.
+                purge_cutoff = now_ts - AGENT_PURGE_AFTER
+                pcur = await db.execute(
+                    "DELETE FROM agents WHERE status='offline' AND last_heartbeat < ? "
+                    "AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.claimed_by = agents.urn "
+                    "AND j.status IN ('offered','claimed','running'))",
+                    (purge_cutoff,),
+                )
+                purged = max(0, getattr(pcur, "rowcount", 0) or 0)  # some drivers report -1
+                if purged:
+                    await db.commit()
+                    print(f"agent purge: removed {purged} agents offline > {AGENT_PURGE_AFTER:.0f}s", flush=True)
                 # 2. ORPHAN CLAIM RECOVERY — jobs claimed by dead/stale workers go back to queue.
                 # REVIEW #2 fix: measure staleness against COALESCE(last_update_at, claimed_at)
                 # so steady PATCH progress keeps reaper at bay. Kind-specific cutoffs let
@@ -2822,8 +2904,11 @@ async def update_job(job_id: str, req: JobUpdate):
                 )
                 retried = True
 
-            # On done/failed/cancelled: roll per-worker per-kind stats (capability scoring)
-            if req.status in TERMINAL_JOB_STATUSES:
+            # On done/failed/cancelled: roll per-worker per-kind stats (capability scoring).
+            # Gate on a REAL non-terminal -> terminal transition: done->done /
+            # failed->failed are allowed (idempotent re-PATCH), so without this guard a
+            # duplicate terminal PATCH would double-count stats AND the usage_ledger cost.
+            if req.status in TERMINAL_JOB_STATUSES and old_status not in TERMINAL_JOB_STATUSES:
                 async with db.execute(
                     "SELECT kind, description, max_cost_tier, required_capabilities, "
                     "claimed_model, claimed_provider, claimed_by, result, started_at "
@@ -2832,7 +2917,40 @@ async def update_job(job_id: str, req: JobUpdate):
                     jrow = await cur2.fetchone()
                 if jrow:
                     kind_j, desc_j, mtier, reqcaps_json, mdl_j, prov_j, claimed_by_j, result_j, started_j = jrow
+                    # Workers carry real token usage + the ACTUAL gateway
+                    # model/provider INSIDE result, not as top-level PATCH
+                    # fields, so cost was never computed before (usage_ledger
+                    # stayed empty, worker_kind_stats.total_cost_usd stayed 0).
+                    # Parse the result once and recover them.
+                    try:
+                        _rd = json.loads(result_j) if result_j else (req.result or {})
+                    except Exception:
+                        _rd = req.result or {}
+                    if not isinstance(_rd, dict):
+                        _rd = {}
+                    rt_in = _safe_nonneg_int(req.tokens_in if req.tokens_in is not None else _rd.get("tokens_in"))
+                    rt_out = _safe_nonneg_int(req.tokens_out if req.tokens_out is not None else _rd.get("tokens_out"))
+                    rt_reason = _safe_nonneg_int(_rd.get("tokens_reasoning"))
+                    # Some workers report only a combined total — attribute to output.
+                    if rt_in == 0 and rt_out == 0 and _rd.get("tokens_total"):
+                        rt_out = _safe_nonneg_int(_rd.get("tokens_total"))
+                    eff_model = _safe_str(_rd.get("gateway_model") or mdl_j)
+                    eff_prov = _safe_str(_rd.get("gateway_provider") or prov_j)
+                    # Cost estimation must never break the hot completion path.
+                    try:
+                        job_cost = estimate_cost(eff_prov, eff_model, rt_in, rt_out) or 0
+                        if job_cost < 0:
+                            job_cost = 0
+                    except Exception as _ce:  # noqa: BLE001
+                        print(f"cost estimate skipped for {job_id}: {_ce}", flush=True)
+                        job_cost = 0
+                    if cost_estimate is None and job_cost:
+                        cost_estimate = job_cost
                     if claimed_by_j and kind_j:
+                        # Key stats by the STABLE worker identity (drop the
+                        # per-restart session segment) so a worker's history
+                        # aggregates across restarts instead of fragmenting.
+                        worker_key = stable_worker_id(claimed_by_j)
                         duration = (time.time() - (started_j or time.time())) if started_j else 0
                         col = {"done": "success_count", "failed": "fail_count", "cancelled": "cancelled_count"}[req.status]
                         await db.execute(
@@ -2847,13 +2965,37 @@ async def update_job(job_id: str, req: JobUpdate):
                             f"total_duration_sec = total_duration_sec + ?, "
                             f"last_run = ?",
                             (
-                                claimed_by_j, kind_j,
-                                int(req.tokens_in or 0), int(req.tokens_out or 0),
-                                cost_estimate or 0, duration, time.time(),
-                                int(req.tokens_in or 0), int(req.tokens_out or 0),
-                                cost_estimate or 0, duration, time.time(),
+                                worker_key, kind_j,
+                                rt_in, rt_out,
+                                job_cost or 0, duration, time.time(),
+                                rt_in, rt_out,
+                                job_cost or 0, duration, time.time(),
                             ),
                         )
+                        # Per-job cost ledger row (the hive cost tracker). Best-effort:
+                        # a ledger schema issue must never break job completion.
+                        try:
+                            # ts is TIMESTAMP WITH TIME ZONE — use SYSTIMESTAMP (not an
+                            # epoch float, which raises ORA-00932) as a SQL literal so it
+                            # is not a bind parameter.
+                            await db.execute(
+                                "INSERT INTO usage_ledger (provider, model, task_kind, tokens_in, "
+                                "tokens_out, tokens_reasoning, est_cost_usd, latency_ms, outcome, "
+                                "caller_subsystem, tier, ts, session_id, request_count, "
+                                "subscription_amortized, path_kind) "
+                                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, SYSTIMESTAMP, ?, ?, ?, ?)",
+                                (
+                                    eff_prov, eff_model, kind_j, rt_in, rt_out, rt_reason,
+                                    job_cost or 0, max(0, int(duration * 1000)),
+                                    # outcome is constrained to ('ok','err','timeout')
+                                    "ok" if req.status == "done" else "err",
+                                    "hive", (mtier or "A").upper(), claimed_by_j, 1,
+                                    1 if (eff_prov or "").lower() in SUBSCRIPTION_PROVIDERS else 0,
+                                    str(_rd.get("via") or "worker"),
+                                ),
+                            )
+                        except Exception as _le:
+                            print(f"usage_ledger write skipped for {job_id}: {_le}", flush=True)
                     if req.status == "done":
                         ck = cache_key_for(kind_j, desc_j, (mtier or "A").upper(),
                                            json_list(reqcaps_json))
