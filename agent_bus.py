@@ -794,7 +794,7 @@ NARROW_ALLOWLIST = ("cixmini-os:", "ncz-os-", "fleet-infra:")
 # has a BROKEN gateway: it claims jobs then 400s the WSS handshake in ~0.5s,
 # thrashing every job it touches (2026-06-07). Quarantine it bus-side instead
 # of tearing down another owner's host. Remove once its gateway is fixed.
-QUARANTINED_HOSTS = {"proteus"}
+QUARANTINED_HOSTS = {"proteus", "spark-0c53"}  # spark relay false-dones jobs (2026-06-08) — disabled until fixed
 
 # WORKSPACE AFFINITY — automatic required_capabilities injection + claim guard.
 # Workspace-scoped jobs must only be offered to workers that explicitly
