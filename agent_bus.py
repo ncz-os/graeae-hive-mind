@@ -596,7 +596,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   eligible_kinds TEXT,                          -- json array; agent kinds eligible (null = any)
   eligible_hosts TEXT,                          -- json array; agent hosts eligible (null = any); e.g. ["cixmini"]
   project TEXT,                                 -- #10 FIX: separate project tag from capabilities (riskyeats/investorclaw/etc)
-  status TEXT NOT NULL CHECK(status IN ('queued','offered','claimed','running','done','failed','failed_completion','cancelled','dead-letter')),
+  status TEXT NOT NULL CHECK(status IN ('queued','offered','claimed','running','done','failed','failed_completion','cancelled','dead-letter','needs-review')),
   claimed_by TEXT,                              -- worker urn (set on claim/dequeue)
   claimed_at REAL,
   started_at REAL NOT NULL,                     -- when job ENTERED queue
@@ -794,7 +794,7 @@ NARROW_ALLOWLIST = ("cixmini-os:", "ncz-os-", "fleet-infra:")
 # has a BROKEN gateway: it claims jobs then 400s the WSS handshake in ~0.5s,
 # thrashing every job it touches (2026-06-07). Quarantine it bus-side instead
 # of tearing down another owner's host. Remove once its gateway is fixed.
-QUARANTINED_HOSTS = {"proteus", "spark-0c53"}  # spark relay false-dones jobs (2026-06-08) — disabled until fixed
+QUARANTINED_HOSTS = {"proteus"}  # spark-0c53 un-quarantined 2026-06-11: DGX executor verified (canary 6s round-trip, model runs); build-poison closed by excluding build:* kinds from spark takeover (see job_agent_eligible).
 
 # WORKSPACE AFFINITY — automatic required_capabilities injection + claim guard.
 # Workspace-scoped jobs must only be offered to workers that explicitly
@@ -808,6 +808,13 @@ KIND_KIND_AFFINITY: dict[str, list[str]] = {
 }
 
 KIND_WORKSPACE_CAPABILITY: dict[str, str] = {
+    # Linux-compile jobs (rust cargo etc) -> only workers advertising linux-compile
+    # (ULTRA in-VM compile worker). Keeps compile OFF the macOS native authoring
+    # workers (which would fail to build linux targets). 2026-06-12.
+    "build:zeroclaw": "hard:linux-compile",
+    "zeroclaw:": "hard:linux-compile",
+    "ncz-os-zeroclaw:": "hard:linux-compile",
+    "compile:": "hard:linux-compile",
     "test:provider-bench-1-readme-fix-deepseek-pro": "workspace-riskybiz",
     "test:provider-bench-2-typo-deepseek-pro": "workspace-riskybiz",
     "test:provider-bench-": "workspace-riskybiz",
@@ -859,7 +866,7 @@ PROVIDER_COST_TIER: dict[str, str] = {
     "unknown":         "A",
 }
 COST_TIERS = ["A", "B", "C"]
-VALID_JOB_STATUSES = {"queued", "offered", "claimed", "running", "done", "failed", "failed_completion", "cancelled", "dead-letter"}
+VALID_JOB_STATUSES = {"queued", "offered", "claimed", "running", "done", "failed", "failed_completion", "cancelled", "dead-letter", "needs-review"}
 TERMINAL_JOB_STATUSES = {"done", "failed", "cancelled", "dead-letter"}
 # Skip releases (host_declines_kind/released_by_host/no_workspace_for_kind) are
 # legitimate "not me" routing signals. They must not burn the decline dead-letter
@@ -869,8 +876,9 @@ DECLINE_REASON_PREFIXES: tuple[str, ...] = ("no_workspace_for_kind", "no_workspa
 STATUS_TRANSITIONS: dict[str, set[str]] = {
     "queued": {"queued", "offered", "claimed", "cancelled"},
     "offered": {"queued", "claimed", "cancelled"},
-    "claimed": {"queued", "claimed", "running", "done", "failed", "cancelled"},
-    "running": {"queued", "running", "done", "failed", "cancelled"},
+    "claimed": {"queued", "claimed", "running", "done", "failed", "cancelled", "needs-review"},
+    "running": {"queued", "running", "done", "failed", "cancelled", "needs-review"},
+    "needs-review": {"needs-review", "done", "failed", "cancelled"},  # awaiting review; promotable
     "done": {"done", "cancelled"},  # allow cancelling fake/duplicate completions out of done
     "failed": {"failed"},
     "cancelled": {"cancelled"},
@@ -931,6 +939,16 @@ def agent_kind_aliases(kind: str, runtime: Optional[str]) -> set[str]:
         if kind in kinds:
             aliases.add(rt)
             aliases.update(kinds)
+    # ALL-EXECUTORS-ELIGIBLE (operator 2026-06-01): claude, codex, zeroclaw and
+    # opencode are MUTUALLY eligible for every executor job. They differ only at
+    # DISPATCH (zeroclaw routes per-model by complexity via KNEMON). A job marked
+    # for any one of them is claimable by all of them. This union was dropped in
+    # the 2026-06-06 spark-takeover refactor (regression mem_1780970182796) and is
+    # restored here so non-zeroclaw-kind executor workers can still claim the
+    # zeroclaw-eligible coding jobs that submit-time admission rewrites them into.
+    EXECUTOR_KINDS = {"claude", "codex", "zeroclaw", "opencode"}
+    if aliases & EXECUTOR_KINDS:
+        aliases |= EXECUTOR_KINDS
     aliases.discard("")
     return aliases
 
@@ -984,6 +1002,14 @@ SPARK_HOSTS = {"spark-0c53"}
 # see them. Operator: "any type of codex or claude job ... override all".
 SPARK_TAKEOVER_KINDS = {"codex", "claude", "zeroclaw"}
 SPARK_ONLINE_TTL_SEC = 120.0
+# Spark-takeover reservation grace (Q3 deadlock fix 2026-06-09): a takeover job
+# is reserved for Spark only while it has been queued < this many seconds. After
+# the grace expires any eligible worker may claim it, so a Spark relay that is
+# online-but-non-delivering (e.g. quarantined) cannot starve zeroclaw/codex/
+# claude jobs indefinitely. Preserves Spark-first preference for fresh jobs.
+# started_at is set at enqueue (NOT NULL) so a real job's age is always known
+# and crosses the grace; unknown/unparseable age fails CLOSED (stays reserved).
+SPARK_RESERVE_GRACE_SEC = 90.0
 # Kinds whose work is pro-grade (adversarial review, architecture, repo-wide
 # refactors) — routed Spark-first to preserve OAuth weekly allowance and keep
 # v4-PRO as the spark-offline last resort.
@@ -1005,7 +1031,34 @@ def note_spark_seen(host: str) -> None:
 
 def spark_online() -> bool:
     now = time.time()
-    return any(now - t < SPARK_ONLINE_TTL_SEC for t in _SPARK_LAST_SEEN.values())
+    # Snapshot via list() so a concurrent mutation of _SPARK_LAST_SEEN during
+    # iteration can't raise, and type-guard each value so a malformed heartbeat
+    # entry can't either (callers in job_agent_eligible are no longer wrapped in
+    # a broad except — a raise here would turn polling/claims into 500s).
+    return any(
+        isinstance(t, (int, float)) and now - t < SPARK_ONLINE_TTL_SEC
+        # A quarantined spark cannot take the work, so reserving zeroclaw/codex/
+        # claude jobs for it is pointless — exclude quarantined hosts so live
+        # workers claim immediately (auto-restores reservation on un-quarantine).
+        for h, t in list(_SPARK_LAST_SEEN.items())
+        if h not in QUARANTINED_HOSTS
+    )
+
+
+def _job_queued_age(job: dict[str, Any]) -> Optional[float]:
+    """Seconds since the job entered the queue, or None if unknown/unparseable.
+    Callers treat None as fail-CLOSED (job stays Spark-reserved) so a missing or
+    malformed timestamp can never release a job early; only a KNOWN age past the
+    grace releases it. started_at is set at enqueue, so real jobs always parse."""
+    raw = job.get("queued_at")
+    if raw is None:
+        raw = job.get("started_at")
+    if raw is None:
+        return None
+    try:
+        return max(0.0, time.time() - float(raw))
+    except (TypeError, ValueError):
+        return None
 
 
 def job_agent_eligible(job: dict[str, Any], agent: dict[str, Any]) -> tuple[bool, str]:
@@ -1019,8 +1072,20 @@ def job_agent_eligible(job: dict[str, Any], agent: dict[str, Any]) -> tuple[bool
     if agent_host in QUARANTINED_HOSTS:
         return False, f"host {agent_host} is quarantined (broken gateway)"
 
+    # Spark NEVER executes build:* jobs by ANY path (takeover, host-pin, or general
+    # eligibility): the DGX poller has no repo-mapping for a build: kind. Hard-deny
+    # so a build job can only be claimed by a real zeroclaw worker (zc_oneshot harness).
+    if agent_host in SPARK_HOSTS and j_kind.startswith("build:"):
+        return False, f"spark does not execute build kinds ({j_kind}); real zeroclaw workers only"
+
     j_kinds = _norm_str_set(job.get("eligible_kinds"))
-    spark_takeover_job = bool(j_kinds.intersection(SPARK_TAKEOVER_KINDS)) or "*" in j_kinds
+    spark_takeover_job = (bool(j_kinds.intersection(SPARK_TAKEOVER_KINDS)) or "*" in j_kinds)
+    # build:* jobs need the zc_oneshot harness on a real zeroclaw worker; the DGX
+    # Spark poller has no repo-mapping for a build: kind, so it must never take them
+    # (the 2026-06-08 "no repo mapping" needs-review poison). codex/claude coding
+    # jobs (non-build: kinds, also eligible_kinds=["zeroclaw"]) still route to Spark.
+    if j_kind.startswith("build:"):
+        spark_takeover_job = False
 
     # Spark override: any codex/claude-eligible job (or a job host-pinned to
     # Spark) is claimable by the Spark relay, bypassing kind-affinity,
@@ -1034,11 +1099,16 @@ def job_agent_eligible(job: dict[str, Any], agent: dict[str, Any]) -> tuple[bool
     # for Spark instead of burning metered fallback — but only when a Spark
     # relay is actually online (no deadlock if the relay is down).
     if spark_takeover_job and agent_host not in SPARK_HOSTS:
+        # Fail CLOSED: unknown age (None) keeps the job reserved; only a known
+        # age >= grace releases it to general workers.
+        age = _job_queued_age(job)
+        within_grace = age is None or age < SPARK_RESERVE_GRACE_SEC
         try:
-            if oauth_cap_state().get("capped") and spark_online():
-                return False, "reserved for Spark while OAuth allowance is capped (operator 2026-06-06)"
+            capped = bool(oauth_cap_state().get("capped"))
         except Exception:
-            pass
+            capped = False
+        if capped and spark_online() and within_grace:
+            return False, "reserved for Spark while OAuth allowance is capped (operator 2026-06-06; releases after grace)"
 
     # Heavy/review work prefers Spark even when OAuth is healthy (GRAEAE
     # consult a30d0c1f + operator 2026-06-06): it preserves the weekly OAuth
@@ -1050,11 +1120,11 @@ def job_agent_eligible(job: dict[str, Any], agent: dict[str, Any]) -> tuple[bool
         and agent_host not in SPARK_HOSTS
         and j_kind.startswith(SPARK_HEAVY_KIND_PREFIXES)
     ):
-        try:
-            if spark_online():
-                return False, "heavy/review kind reserved for Spark while a relay is online (operator 2026-06-06)"
-        except Exception:
-            pass
+        # Fail CLOSED on unknown age, as above.
+        age = _job_queued_age(job)
+        within_grace = age is None or age < SPARK_RESERVE_GRACE_SEC
+        if spark_online() and within_grace:
+            return False, "heavy/review kind reserved for Spark while a relay is online (operator 2026-06-06; releases after grace)"
 
     if agent_host in NARROW_HOSTS and not j_kind.startswith(NARROW_ALLOWLIST):
         return False, f"narrow host {agent_host} not allowed for kind {j_kind}"
@@ -1074,6 +1144,9 @@ def job_agent_eligible(job: dict[str, Any], agent: dict[str, Any]) -> tuple[bool
     labels = [_norm_str(c) for c in (job.get("required_capabilities") or []) if _norm_str(c)]
     if heavy_repo_required_for_kind(j_kind) and "heavy-repo" not in labels:
         labels.append("heavy-repo")
+    _wcap = workspace_capability_for_kind(j_kind)  # kind->capability (compile jobs -> linux-compile)
+    if _wcap and _wcap not in labels:
+        labels.append(_wcap)
     if labels:
         cap_match = queue_logic.match(labels, agent_caps)
         if not cap_match.eligible:
@@ -1520,8 +1593,12 @@ async def reaper_task(app: FastAPI):
                 purge_cutoff = now_ts - AGENT_PURGE_AFTER
                 pcur = await db.execute(
                     "DELETE FROM agents WHERE status='offline' AND last_heartbeat < ? "
-                    "AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.claimed_by = agents.urn "
-                    "AND j.status IN ('offered','claimed','running'))",
+                    # non-correlated NOT IN (was a correlated `agents.urn` subquery): the
+                    # sqlite->Oracle table-name rewrite only translates FROM/JOIN/ON positions,
+                    # so a table-qualified `agents.urn` survived untranslated and ORA-00904'd,
+                    # crashing the whole reaper every 30s. IS NOT NULL guards NOT-IN null-poison.
+                    "AND (urn IS NULL OR urn NOT IN (SELECT claimed_by FROM jobs "
+                    "WHERE claimed_by IS NOT NULL AND status IN ('offered','claimed','running')))",
                     (purge_cutoff,),
                 )
                 purged = max(0, getattr(pcur, "rowcount", 0) or 0)  # some drivers report -1
@@ -1540,7 +1617,13 @@ async def reaper_task(app: FastAPI):
                     "FROM jobs j "
                     "LEFT JOIN agents a ON a.urn = j.claimed_by "
                     "WHERE j.status IN ('claimed','running') "
+                    # j.claimed_at IS NULL = corrupt/phantom claim (an atomic claim always
+                    # writes claimed_at): without this the all-NULL-timestamp staleness
+                    # predicates below are UNKNOWN, so a phantom running job is never a
+                    # candidate and is un-reapable. Surfacing it lets the python filter
+                    # (latest=0) requeue it.
                     "AND ( a.status = 'offline' OR a.urn IS NULL OR "
+                    "      j.claimed_at IS NULL OR "
                     "      j.claim_lease_expires_at <= ? OR "
                     "      COALESCE(j.last_update_at, j.claimed_at) < ? )",
                     (now_ts, default_cutoff,)
@@ -2521,7 +2604,7 @@ async def dequeue_next_job(agent_urn: str):
             async with db.execute(
                 "SELECT id, submitter_urn, parent_job_id, kind, description, priority, deadline, "
                 "required_capabilities, eligible_kinds, eligible_hosts, project, max_cost_tier, "
-                "preferred_providers, preferred_models, mnemos_refs, depends_on, retry_backoff_until "
+                "preferred_providers, preferred_models, mnemos_refs, depends_on, retry_backoff_until, started_at "
                 "FROM jobs WHERE status IN ('queued','offered') "
                 "AND (retry_backoff_until IS NULL OR retry_backoff_until <= ?) "
                 "ORDER BY priority DESC, started_at ASC LIMIT 100",
@@ -2551,7 +2634,7 @@ async def dequeue_next_job(agent_urn: str):
                 (j_id, j_submitter, j_parent, j_kind, j_desc, j_priority, j_deadline,
                  j_caps_json, j_kinds_json, j_hosts_json, j_project, j_max_tier,
                  j_pref_providers, j_pref_models, j_mnemos_refs, j_deps_json,
-                 _j_retry_backoff_until) = r
+                 _j_retry_backoff_until, j_started_at) = r
                 deps = json_list(j_deps_json)
                 if deps:
                     ph = ",".join("?" * len(deps))
@@ -2571,6 +2654,7 @@ async def dequeue_next_job(agent_urn: str):
                     "max_cost_tier": j_max_tier,
                     "preferred_providers": json_list(j_pref_providers),
                     "preferred_models": json_list(j_pref_models),
+                    "queued_at": j_started_at,
                 }
                 eligible, _reason = job_agent_eligible(job, agent)
                 if not eligible:
@@ -3738,7 +3822,7 @@ async def claim_job(job_id: str, by: str):
         async with db.execute(
             "SELECT status, kind, required_capabilities, eligible_kinds, "
             "eligible_hosts, max_cost_tier, preferred_providers, preferred_models, "
-            "depends_on, retry_backoff_until "
+            "depends_on, retry_backoff_until, started_at "
             "FROM jobs WHERE id=?",
             (job_id,),
         ) as cur:
@@ -3747,7 +3831,7 @@ async def claim_job(job_id: str, by: str):
             raise HTTPException(404, f"job not found: {job_id}")
         (j_status, j_kind, j_caps_json, j_kinds_json, j_hosts_json, j_max_tier,
          j_pref_providers, j_pref_models, j_deps_json,
-         j_retry_backoff_until) = job_row
+         j_retry_backoff_until, j_started_at) = job_row
 
         urn_parts = by.split(":")
         agent_host = (urn_parts[3] if len(urn_parts) > 3 else "").lower()
@@ -3802,6 +3886,7 @@ async def claim_job(job_id: str, by: str):
             "max_cost_tier": j_max_tier,
             "preferred_providers": json_list(j_pref_providers),
             "preferred_models": json_list(j_pref_models),
+            "queued_at": j_started_at,
         }
         eligible, reason = job_agent_eligible(job, agent)
         if not eligible:
