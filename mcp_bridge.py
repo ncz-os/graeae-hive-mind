@@ -87,13 +87,13 @@ async def _mnemos(method: str, path: str, **kw) -> dict:
 @server.list_tools()
 async def handle_list_tools() -> list[Tool]:
     return [
-        Tool(name="hive.agent_list", description="List registered agents in the GRAEAE Hive Mind.",
+        Tool(name="hive_agent_list", description="List registered agents in the GRAEAE Hive Mind.",
              inputSchema={"type": "object", "properties": {
                  "kind": {"type": "string"},
                  "status": {"type": "string"},
                  "include_offline": {"type": "boolean"},
              }}),
-        Tool(name="hive.agent_register",
+        Tool(name="hive_agent_register",
              description="Register this session as an agent in the Hive. Returns urn + session_id. Bridge fills sensible defaults for runtime/model/provider/autonomy_level/auth_method so urn always populates.",
              inputSchema={"type": "object",
                           "properties": {
@@ -108,7 +108,7 @@ async def handle_list_tools() -> list[Tool]:
                               "autonomy_level": {"type": "string", "enum": ["autonomous", "confirm-risky", "interactive", "unknown"]},
                               "auth_method": {"type": "string", "enum": ["subscription", "api", "free", "unknown"]},
                           }, "required": ["kind", "host"]}),
-        Tool(name="hive.job_create",
+        Tool(name="hive_job_create",
              description="Submit work into the Hive Mind triage queue. Eligible agents self-claim.",
              inputSchema={"type": "object",
                           "properties": {
@@ -121,12 +121,12 @@ async def handle_list_tools() -> list[Tool]:
                               "deadline": {"type": "number"},
                               "parent_job_id": {"type": "string"},
                           }, "required": ["submitter_urn", "kind"]}),
-        Tool(name="hive.job_next",
+        Tool(name="hive_job_next",
              description="Atomic dequeue: claim highest-priority eligible job for this agent. Returns job or {204: no work}.",
              inputSchema={"type": "object",
                           "properties": {"agent_urn": {"type": "string"}},
                           "required": ["agent_urn"]}),
-        Tool(name="hive.job_list",
+        Tool(name="hive_job_list",
              description="List jobs in the Hive. Filter by status/agent/since.",
              inputSchema={"type": "object",
                           "properties": {
@@ -135,7 +135,7 @@ async def handle_list_tools() -> list[Tool]:
                               "since": {"type": "number"},
                               "limit": {"type": "integer", "default": 100},
                           }}),
-        Tool(name="hive.job_update",
+        Tool(name="hive_job_update",
              description="Update job status/result. Status: queued/claimed/running/done/failed/cancelled.",
              inputSchema={"type": "object",
                           "properties": {
@@ -144,7 +144,7 @@ async def handle_list_tools() -> list[Tool]:
                               "result": {"type": "object"},
                               "claimed_by": {"type": "string"},
                           }, "required": ["id", "status"]}),
-        Tool(name="hive.message_publish",
+        Tool(name="hive_message_publish",
              description="Publish a Hive message. to_urn=null for broadcast.",
              inputSchema={"type": "object",
                           "properties": {
@@ -154,7 +154,7 @@ async def handle_list_tools() -> list[Tool]:
                               "payload": {"type": "object"},
                               "in_reply_to": {"type": "string"},
                           }, "required": ["from_urn", "topic", "payload"]}),
-        Tool(name="hive.message_list",
+        Tool(name="hive_message_list",
              description="List Hive messages. Filter by recipient/topic.",
              inputSchema={"type": "object",
                           "properties": {
@@ -163,7 +163,7 @@ async def handle_list_tools() -> list[Tool]:
                               "since": {"type": "number"},
                               "limit": {"type": "integer", "default": 100},
                           }}),
-        Tool(name="mnemos.memory_search",
+        Tool(name="mnemos_memory_search",
              description="Search MNEMOS memory (PYTHIA). Semantic+keyword.",
              inputSchema={"type": "object",
                           "properties": {
@@ -172,7 +172,7 @@ async def handle_list_tools() -> list[Tool]:
                               "limit": {"type": "integer", "default": 10},
                               "min_score": {"type": "number"},
                           }, "required": ["query"]}),
-        Tool(name="mnemos.memory_create",
+        Tool(name="mnemos_memory_create",
              description="Save a memory to MNEMOS. Category: infrastructure/solutions/patterns/decisions/projects/standards.",
              inputSchema={"type": "object",
                           "properties": {
@@ -180,11 +180,11 @@ async def handle_list_tools() -> list[Tool]:
                               "category": {"type": "string"},
                               "tags": {"type": "array", "items": {"type": "string"}},
                           }, "required": ["content", "category"]}),
-        Tool(name="mnemos.memory_get",
+        Tool(name="mnemos_memory_get",
              description="Get a MNEMOS memory by id (mem_XXX).",
              inputSchema={"type": "object",
                           "properties": {"id": {"type": "string"}}, "required": ["id"]}),
-        Tool(name="graeae.consult",
+        Tool(name="graeae_consult",
              description="Submit a multi-LLM consensus consultation to GRAEAE (PYTHIA). Modes: auto/single/all/debate/majority.",
              inputSchema={"type": "object",
                           "properties": {
@@ -195,13 +195,13 @@ async def handle_list_tools() -> list[Tool]:
                               "limit_chars": {"type": "integer"},
                               "format": {"type": "string", "default": "full"},
                           }, "required": ["prompt"]}),
-        Tool(name="graeae.muses",
+        Tool(name="graeae_muses",
              description="List available GRAEAE muses (LLM providers + models).",
              inputSchema={"type": "object", "properties": {}}),
-        Tool(name="graeae.modes",
+        Tool(name="graeae_modes",
              description="List GRAEAE consultation modes + their descriptions.",
              inputSchema={"type": "object", "properties": {}}),
-        Tool(name="graeae.get",
+        Tool(name="graeae_get",
              description="Get a previous GRAEAE consultation by id.",
              inputSchema={"type": "object",
                           "properties": {"consultation_id": {"type": "string"}},
@@ -212,9 +212,9 @@ async def handle_list_tools() -> list[Tool]:
 @server.call_tool()
 async def handle_call_tool(name: str, args: dict[str, Any]) -> list[TextContent]:
     try:
-        if name == "hive.agent_list":
+        if name == "hive_agent_list":
             r = await _hive("GET", "/v1/agents", params={k: v for k, v in args.items() if v})
-        elif name == "hive.agent_register":
+        elif name == "hive_agent_register":
             # REVIEW #5 fix: ensure urn-populating defaults at the bridge layer
             # so MCP clients that omit runtime/model/autonomy still get a
             # valid urn back. Server-side already defaults missing fields to
@@ -233,32 +233,32 @@ async def handle_call_tool(name: str, args: dict[str, Any]) -> list[TextContent]
                     "error": "register-incomplete: agent_bus returned response without urn",
                     "raw_response": r,
                 }
-        elif name == "hive.job_create":
+        elif name == "hive_job_create":
             r = await _hive("POST", "/v1/jobs", json=args)
-        elif name == "hive.job_next":
+        elif name == "hive_job_next":
             r = await _hive("POST", f"/v1/jobs/next", params={"agent_urn": args["agent_urn"]})
-        elif name == "hive.job_list":
+        elif name == "hive_job_list":
             r = await _hive("GET", "/v1/jobs", params={k: v for k, v in args.items() if v})
-        elif name == "hive.job_update":
+        elif name == "hive_job_update":
             jid = args.pop("id")
             r = await _hive("PATCH", f"/v1/jobs/{jid}", json=args)
-        elif name == "hive.message_publish":
+        elif name == "hive_message_publish":
             r = await _hive("POST", "/v1/messages", json=args)
-        elif name == "hive.message_list":
+        elif name == "hive_message_list":
             r = await _hive("GET", "/v1/messages", params={k: v for k, v in args.items() if v})
-        elif name == "mnemos.memory_search":
+        elif name == "mnemos_memory_search":
             r = await _mnemos("POST", "/memories/search", json=args)
-        elif name == "mnemos.memory_create":
+        elif name == "mnemos_memory_create":
             r = await _mnemos("POST", "/memories", json=args)
-        elif name == "mnemos.memory_get":
+        elif name == "mnemos_memory_get":
             r = await _mnemos("GET", f"/memories/{args['id']}")
-        elif name == "graeae.consult":
+        elif name == "graeae_consult":
             r = await _mnemos("POST", "/v1/consultations", json=args)
-        elif name == "graeae.muses":
+        elif name == "graeae_muses":
             r = await _mnemos("GET", "/v1/consultations/muses")
-        elif name == "graeae.modes":
+        elif name == "graeae_modes":
             r = await _mnemos("GET", "/v1/consultations/modes")
-        elif name == "graeae.get":
+        elif name == "graeae_get":
             r = await _mnemos("GET", f"/v1/consultations/{args['consultation_id']}")
         else:
             return [TextContent(type="text", text=json.dumps({"error": f"unknown tool: {name}"}))]
