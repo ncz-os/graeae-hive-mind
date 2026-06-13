@@ -3971,7 +3971,11 @@ async def list_jobs(
     if status in TERMINAL_JOB_STATUSES:
         sql += " ORDER BY COALESCE(ended_at, started_at) DESC LIMIT ?"
     else:
-        sql += " ORDER BY priority DESC, started_at DESC LIMIT ?"
+        # Recency-first: without a status filter, "recent" must mean recently
+        # touched, not highest-priority. Priority-first ordering pushed recent
+        # low-priority jobs outside the LIMIT window -> API-invisible (a build
+        # job was lost this way 2026-06-13). Keep priority as the tiebreak.
+        sql += " ORDER BY COALESCE(ended_at, started_at) DESC, priority DESC LIMIT ?"
     args.append(limit)
     rows = []
     total = 0
@@ -3993,6 +3997,32 @@ async def list_jobs(
                     "eligible_hosts": json.loads(r[14]) if r[14] else None,
                 })
     return {"count": len(rows), "total": total, "jobs": rows}
+
+
+@app.get("/v1/jobs/{job_id}")
+async def get_job(job_id: str):
+    """Fetch a single job by id (previously 405 -> callers had to scan the list
+    or query the DB directly to find one job, e.g. a just-submitted build)."""
+    async with connect_db() as db:
+        async with db.execute(
+            "SELECT id, submitter_urn, parent_job_id, kind, description, priority, status, "
+            "claimed_by, started_at, ended_at, result, estimated_cost_usd, "
+            "required_capabilities, eligible_kinds, eligible_hosts FROM jobs WHERE id=?",
+            (job_id,)) as cur:
+            r = await cur.fetchone()
+    if not r:
+        raise HTTPException(404, f"job not found: {job_id}")
+    return {
+        "id": r[0], "submitter_urn": r[1], "parent_job_id": r[2],
+        "kind": r[3], "description": r[4], "priority": r[5],
+        "status": r[6], "claimed_by": r[7],
+        "started_at": r[8], "ended_at": r[9],
+        "result": json.loads(r[10]) if r[10] else None,
+        "estimated_cost_usd": r[11],
+        "required_capabilities": json.loads(r[12]) if r[12] else None,
+        "eligible_kinds": json.loads(r[13]) if r[13] else None,
+        "eligible_hosts": json.loads(r[14]) if r[14] else None,
+    }
 
 
 @app.post("/v1/messages")
