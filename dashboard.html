@@ -562,7 +562,10 @@ function showJobModal(job){
     if(r.stdout)texts.push('STDOUT\n'+r.stdout);
     if(r.stderr)texts.push('STDERR\n'+r.stderr);
     if(r.files_changed&&r.files_changed.length)texts.push('FILES CHANGED\n'+r.files_changed.join('\n'));
-    if(r.commits&&r.commits.length)texts.push('COMMITS\n'+r.commits.join('\n'));
+    if(r.commits&&r.commits.length)texts.push('COMMITS\n'+r.commits.map(c=>(c&&c.sha)?(c.sha.slice(0,10)+' '+(c.subject||'')):c).join('\n'));
+    if(r.review)texts.push('REVIEW: '+(r.review.verdict||'?')+(r.review.model?' ['+r.review.model+']':'')+'\n'+(r.review.text||''));
+    if(r.unreviewed)texts.push('\u26a0 UNREVIEWED: '+r.unreviewed);
+    if(r.pushed_branch)texts.push('PUSHED BRANCH\n'+r.pushed_branch+(r.pushed_remote?(' @ '+r.pushed_remote):''));
     if(r.failure_reason)texts.push('FAILURE\n'+r.failure_reason);
     if(r.exit_code!==undefined)texts.push('exit_code: '+r.exit_code);
     if(texts.length){
@@ -756,7 +759,7 @@ async function refreshRealWork(){
       const r = j.result || {};
       const cb = (j.claimed_by||'').split(':');
       const host = cb.length>=4 ? cb[3] : '?';
-      const sha = (r.commits||['-'])[0].slice(0,10);
+      const c0 = (r.commits||[])[0]; const sha = (c0 ? (c0.sha||c0) : '-').slice(0,10);
       const t = new Date((j.ended_at||0)*1000).toLocaleTimeString();
       return '<div>' + t + ' <span style="color:#7ee787">' + sha + '</span> ' + esc(host) + ' ' + esc(j.kind||'').slice(0,55) + '</div>';
     }).join('');
