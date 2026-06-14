@@ -6,3 +6,10 @@ mnemos/
 *.bak-*
 *.bak
 workspace_remotes.json
+*.pre-*
+*.RETIRED-*
+knemon_oauth_cap.json
+agents.db*
+*.sqlite*
+*.log
+*.wal
