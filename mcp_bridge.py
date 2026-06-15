@@ -36,6 +36,7 @@ from mcp.server.sse import SseServerTransport
 from mcp.types import Tool, TextContent, Resource, Prompt
 from starlette.applications import Starlette
 from starlette.routing import Mount, Route
+from starlette.responses import Response
 
 HIVE_URL = os.environ.get("HIVE_URL", "http://127.0.0.1:5005")
 MNEMOS_URL = os.environ.get("MNEMOS_URL", "http://192.168.207.67:5002")
@@ -298,6 +299,7 @@ async def handle_sse(request):
                 ),
             ),
         )
+    return Response()
 
 
 app = Starlette(
