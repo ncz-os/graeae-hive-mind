@@ -27,7 +27,7 @@ except ModuleNotFoundError:
 
 import queue_logic
 from hive.persistence.factory import get_hive_repository
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
@@ -43,6 +43,29 @@ SSE_PING_INTERVAL = 15.0
 EVENT_QUEUE: dict[str, asyncio.Queue] = {}  # subscriber_id -> queue
 SQLITE_BUSY_TIMEOUT_MS = int(os.environ.get("AGENT_BUS_SQLITE_BUSY_TIMEOUT_MS", "5000"))
 MAX_EVENT_SUBSCRIBERS = int(os.environ.get("AGENT_BUS_MAX_EVENT_SUBSCRIBERS", "100"))
+
+# ── transport auth (review C1: unauth RCE-by-design) ─────────────────────────
+# The bus had NO transport auth — any LAN host could GET/POST every endpoint, so
+# an attacker could self-register an "orchestrator" runtime, SUBMIT a job, and a
+# worker would claim+execute it as a shell agent. We now require a bearer token
+# on every /v1/* and /mcp request, in TWO tiers:
+#   * worker tier (HIVE_BUS_TOKENS)        — register/heartbeat/claim/next/patch/read
+#   * admin tier  (HIVE_BUS_ADMIN_TOKENS)  — SUBMIT jobs + /v1/admin/* + schedules
+# Admin tokens are a superset (also accepted as worker tokens). Job SUBMISSION
+# now requires the admin tier, so a self-declared `runtime` can no longer grant
+# submit rights — the caller must hold the orchestrator/admin secret. Tokens are
+# sourced from env (comma-separated), never baked into code.
+# FAIL-CLOSED: if NO tokens are configured the bus refuses all /v1 + /mcp traffic
+# (503) instead of serving it open.
+def _load_token_set(var: str) -> frozenset:
+    return frozenset(t.strip() for t in (os.environ.get(var, "") or "").split(",") if t.strip())
+
+
+HIVE_BUS_TOKENS = _load_token_set("HIVE_BUS_TOKENS")
+HIVE_BUS_ADMIN_TOKENS = _load_token_set("HIVE_BUS_ADMIN_TOKENS")
+# Never-authed paths: liveness probe + the dashboard HTML shell (its XHRs to
+# /v1/* still carry the token).
+_AUTH_EXEMPT_PATHS = frozenset({"/health", "/"})
 
 
 _TABLE_MAP = {
@@ -1639,7 +1662,69 @@ async def lifespan(app: FastAPI):
             await task
 
 
-app = FastAPI(title="GRAEAE Hive Mind", version="0.1.0", lifespan=lifespan)
+def _bearer_token(request: Request) -> str:
+    auth = request.headers.get("authorization") or ""
+    if auth[:7].lower() == "bearer ":
+        return auth[7:].strip()
+    # X-Hive-Token alternate header for clients that can't set Authorization.
+    return (request.headers.get("x-hive-token") or "").strip()
+
+
+def _token_matches(token: str, allowed: frozenset) -> bool:
+    # constant-time compare against each allowed token (avoid early-exit timing).
+    if not token:
+        return False
+    return any(secrets.compare_digest(token, a) for a in allowed)
+
+
+async def verify_bus_auth(request: Request) -> None:
+    """Global baseline auth: every /v1/* and /mcp request needs a worker- (or
+    admin-) tier bearer token. Stamps request.state.bus_tier for the admin check.
+    Fail-closed when no tokens are configured."""
+    path = request.url.path
+    if path in _AUTH_EXEMPT_PATHS or not (path.startswith("/v1/") or path == "/mcp"):
+        return
+    if not HIVE_BUS_TOKENS and not HIVE_BUS_ADMIN_TOKENS:
+        raise HTTPException(
+            status_code=503,
+            detail="bus auth not configured (set HIVE_BUS_TOKENS); refusing to serve unauthenticated",
+        )
+    token = _bearer_token(request)
+    is_admin = _token_matches(token, HIVE_BUS_ADMIN_TOKENS)
+    is_worker = is_admin or _token_matches(token, HIVE_BUS_TOKENS)
+    if not is_worker:
+        raise HTTPException(
+            status_code=401,
+            detail="missing/invalid bus token (Authorization: Bearer <HIVE_BUS_TOKEN>)",
+        )
+    request.state.bus_tier = "admin" if is_admin else "worker"
+
+
+async def require_bus_admin(request: Request) -> None:
+    """Privileged tier for job SUBMISSION + admin + schedule mutation. Closes the
+    self-declared-runtime escalation: submitting now requires the admin secret,
+    not a chosen `runtime` field. If no admin tier is configured, worker auth
+    (already enforced globally) suffices so single-token deployments still work."""
+    if not HIVE_BUS_ADMIN_TOKENS:
+        return
+    if getattr(request.state, "bus_tier", None) == "admin":
+        return
+    # ordering-independent fallback: re-check the presented token directly.
+    if _token_matches(_bearer_token(request), HIVE_BUS_ADMIN_TOKENS):
+        return
+    raise HTTPException(
+        status_code=403,
+        detail="this endpoint requires an admin bus token (HIVE_BUS_ADMIN_TOKENS)",
+    )
+
+
+app = FastAPI(
+    title="GRAEAE Hive Mind",
+    version="0.1.0",
+    lifespan=lifespan,
+    # C1: baseline transport auth on EVERY route (exemptions handled inside).
+    dependencies=[Depends(verify_bus_auth)],
+)
 
 
 # ---------- endpoints ----------
@@ -1986,7 +2071,7 @@ async def whoami(host: str, pid: int):
     }
 
 
-@app.post("/v1/jobs")
+@app.post("/v1/jobs", dependencies=[Depends(require_bus_admin)])
 async def create_job(req: JobCreate):
     """Submit work to the triage queue. No agent assignment — workers self-claim via /v1/jobs/next.
 
@@ -2692,7 +2777,7 @@ class RequeueRequest(BaseModel):
     job_ids: list[str]
     reason: str = "manual-requeue"
 
-@app.post("/v1/admin/jobs/requeue")
+@app.post("/v1/admin/jobs/requeue", dependencies=[Depends(require_bus_admin)])
 async def admin_requeue_jobs(req: RequeueRequest):
     """Force-requeue terminal (failed/cancelled) or any non-done jobs back to queued."""
     now = time.time()
@@ -2717,7 +2802,7 @@ async def admin_requeue_jobs(req: RequeueRequest):
             results["ok"].append(job_id)
     return results
 
-@app.post("/v1/schedules")
+@app.post("/v1/schedules", dependencies=[Depends(require_bus_admin)])
 async def create_schedule(req: ScheduleCreate):
     """Create a recurring scheduled job. Re-fires every `interval_seconds`.
     job_template is the JobCreate body that will be submitted each tick.
@@ -2765,7 +2850,7 @@ async def list_schedules():
     return {"count": len(rows), "schedules": rows}
 
 
-@app.patch("/v1/schedules/{sid}")
+@app.patch("/v1/schedules/{sid}", dependencies=[Depends(require_bus_admin)])
 async def patch_schedule(sid: str, enabled: Optional[bool] = None,
                          interval_seconds: Optional[int] = None):
     sets, args = [], []
@@ -2791,7 +2876,7 @@ async def patch_schedule(sid: str, enabled: Optional[bool] = None,
     return {"ok": True}
 
 
-@app.delete("/v1/schedules/{sid}")
+@app.delete("/v1/schedules/{sid}", dependencies=[Depends(require_bus_admin)])
 async def delete_schedule(sid: str):
     async with connect_db() as db:
         cur = await db.execute("DELETE FROM scheduled_jobs WHERE id=?", (sid,))
