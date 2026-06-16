@@ -59,6 +59,10 @@ from collections import deque
 from urllib.parse import quote
 
 HIVE_URL = os.environ.get("HIVE_URL", "http://192.168.207.67:5005")
+# C1: bus transport auth bearer token (env-sourced). The doctor SUBMITS jobs
+# (dispatch_codex_fix), so this token must satisfy the bus admin tier if one is
+# configured (HIVE_BUS_ADMIN_TOKENS); otherwise worker-tier auth suffices.
+HIVE_BUS_TOKEN = os.environ.get("HIVE_BUS_TOKEN", "")
 ZEROCLAW_BIN = os.environ.get("ZEROCLAW_BIN", "/usr/local/bin/zeroclaw")
 DOCTOR_AGENT_ALIAS = os.environ.get("DOCTOR_AGENT_ALIAS", "hive_doctor")
 AGENT_HOST = os.environ.get("AGENT_HOST", socket.gethostname().split(".")[0])
@@ -119,7 +123,13 @@ AUTO_TRIAGE_COOLDOWN = float(os.environ.get("AUTO_TRIAGE_COOLDOWN", "3600"))  # 
 _token_fix_attempts: dict[str, list[float]] = {}
 MAX_TOKEN_FIX_PER_HOST = int(os.environ.get("MAX_TOKEN_FIX_PER_HOST", "3"))
 TOKEN_FIX_WINDOW_SEC = float(os.environ.get("TOKEN_FIX_WINDOW_SEC", "3600"))  # 1 hour
-FLEET_LAN_TOKEN = os.environ.get("FLEET_LAN_TOKEN", "fleet-lan-token-2026-05-26")
+# SECURITY (review C2/H3): no baked-in default. The prior literal
+# ('fleet-lan-token-2026-05-26') was a committed shared LAN secret embedded into
+# generated gateway-token fix scripts. It is now env-only and compromised via git
+# history — rotate the gateway paired_tokens on every fleet host and purge it from
+# history. When unset, token-mismatch auto-fix escalates instead of emitting an
+# empty/placeholder token into gateway config.
+FLEET_LAN_TOKEN = os.environ.get("FLEET_LAN_TOKEN", "")
 # Known failure signatures → automatic dispatch (no LLM needed)
 KNOWN_FAILURE_SIGNATURES: list[tuple[re.Pattern, str]] = [
     (re.compile(r'no token for host', re.IGNORECASE), 'token_mismatch'),
@@ -193,8 +203,10 @@ signal.signal(signal.SIGINT, _signal)
 def _http(method: str, path: str, body: dict | None = None, timeout: float = 15.0) -> tuple[int, dict | None]:
     url = f"{HIVE_URL}{path}"
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(url, data=data, method=method,
-                                 headers={"content-type": "application/json"})
+    headers = {"content-type": "application/json"}
+    if HIVE_BUS_TOKEN:
+        headers["authorization"] = f"Bearer {HIVE_BUS_TOKEN}"
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             raw = r.read()
@@ -1153,6 +1165,19 @@ def _match_known_signature(job: dict, base_kind: str,
             log.warning("token-fix: host %s not in ALL_FLEET_HOSTS — "
                         "falling through to LLM", offending_host)
             return None
+
+        # SECURITY (review C2/H3): fail closed without a configured LAN token. The
+        # codex fix rewrites gateway-tokens.json / config.toml paired_tokens; with
+        # no FLEET_LAN_TOKEN we would bake an empty token and lock the gateway out.
+        if not FLEET_LAN_TOKEN:
+            log.warning("token-fix: FLEET_LAN_TOKEN unset — escalating instead of "
+                        "dispatching a fix that would write an empty token")
+            return {
+                "action_type": "escalate",
+                "confidence": 1.0,
+                "reason": ("token-mismatch on %s but FLEET_LAN_TOKEN is not "
+                           "configured; cannot safely auto-fix" % offending_host),
+            }
 
         _record_token_fix_attempt(offending_host)
         log.info("AUTO-DETECT signature=%s host=%s — bypassing LLM, "

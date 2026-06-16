@@ -27,6 +27,9 @@ sys.path.insert(0, str(Path(__file__).parent))
 import wss_driver  # noqa: E402
 
 HIVE_URL = os.environ.get("HIVE_URL", "http://192.168.207.67:5005")
+# C1: bus transport auth — every request carries this bearer token (the bus now
+# rejects unauthenticated /v1/* + /mcp). Sourced from env, never baked in.
+HIVE_BUS_TOKEN = os.environ.get("HIVE_BUS_TOKEN", "")
 # MNEMOS — the commit-DAG store. The worker records every meaningful completed
 # job + its commits here so OTHER agents can cross-reference prior work and
 # link future work (GRAEAE-blessed arch 2026-06-01). On the Spark this is the
@@ -256,8 +259,10 @@ log = logging.getLogger("wss-worker")
 def http(method, path, body=None, timeout=20):
     url = HIVE_URL + path
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(url, data=data, method=method,
-                                  headers={"content-type": "application/json"})
+    headers = {"content-type": "application/json"}
+    if HIVE_BUS_TOKEN:
+        headers["authorization"] = f"Bearer {HIVE_BUS_TOKEN}"
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             txt = r.read()
@@ -592,48 +597,14 @@ def _augment_task_for_wss(task, workspace, kind):
     return preamble
 
 
-def codex_cli_run(task, kind, workspace, timeout_sec=900.0):
-    """Scarce — only for codex/review:/doctor:codex-fix kinds."""
-    started = time.time()
-    try:
-        pre_head = _git(workspace, "rev-parse", "HEAD", timeout=10).stdout.strip()
-        proc = subprocess.run(
-            ["codex", "exec", "--skip-git-repo-check",
-             "--dangerously-bypass-approvals-and-sandbox",
-             "-m", "gpt-5.5", task[:4000]],
-            cwd=str(workspace), capture_output=True, text=True,
-            timeout=timeout_sec, stdin=subprocess.DEVNULL,
-        )
-        post_head = _git(workspace, "rev-parse", "HEAD", timeout=10).stdout.strip()
-        commits, files = [], []
-        if post_head and post_head != pre_head:
-            raw = _git(workspace, "log", "--format=%H",
-                       f"{pre_head}..{post_head}", timeout=15).stdout.strip().split("\n")
-            commits = [c for c in raw if c and _verify_commit(workspace, c)]
-            if commits:
-                fc = _git(workspace, "diff", "--name-only",
-                          f"{pre_head}..{post_head}", timeout=15).stdout
-                files = [f for f in fc.strip().split("\n") if f][:50]
-        return {
-            "exit_code": proc.returncode,
-            "commits": commits, "files_changed": files,
-            "duration_sec": round(time.time()-started, 2),
-            "via": "codex_cli", "workspace": str(workspace),
-            "pre_head": pre_head[:12], "post_head": post_head[:12],
-            "stdout_preview": (proc.stdout or "")[:1500],
-            "stderr_preview": (proc.stderr or "")[:500],
-            "error": None if proc.returncode == 0 else f"codex exit {proc.returncode}",
-        }
-    except subprocess.TimeoutExpired:
-        return {"exit_code": 124, "error": f"codex timeout {timeout_sec}s",
-                "via": "codex_cli", "commits": [], "files_changed": [],
-                "workspace": str(workspace)}
-    except FileNotFoundError:
-        return {"exit_code": 127, "error": "codex CLI not found",
-                "via": "codex_cli", "commits": [], "files_changed": []}
-    except Exception as e:
-        return {"exit_code": 1, "error": f"{type(e).__name__}: {e}",
-                "via": "codex_cli", "commits": [], "files_changed": []}
+# SECURITY (review H4): the former `codex_cli_run` helper was DEAD CODE — defined
+# but never called (CODE jobs now route to the native zc_native_build executor,
+# non-code jobs to wss_run). It carried a latent
+# `codex exec --dangerously-bypass-approvals-and-sandbox` invocation: a
+# fully-unsandboxed, auto-approved shell agent one call site away from being live.
+# Removed outright so the dangerous flag cannot be reintroduced by a future caller.
+# If a sandboxed codex path is ever needed, add it via zc_native_build
+# (level=supervised, sandbox_enabled=true), never with --dangerously-bypass.
 
 
 def wss_run(task, kind, workspace, alias, job_id, timeout_sec):

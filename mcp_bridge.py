@@ -38,6 +38,9 @@ from starlette.applications import Starlette
 from starlette.routing import Mount, Route
 
 HIVE_URL = os.environ.get("HIVE_URL", "http://127.0.0.1:5005")
+# C1: bus transport auth bearer token (env-sourced). Injected only on bus calls
+# (_hive), kept separate from the MNEMOS token used by _mnemos.
+HIVE_BUS_TOKEN = os.environ.get("HIVE_BUS_TOKEN", "")
 MNEMOS_URL = os.environ.get("MNEMOS_URL", "http://192.168.207.67:5002")
 # MNEMOS bearer token comes from env. No source-baked default — having a
 # token literal in source meant every clone of this repo carried a working
@@ -60,6 +63,10 @@ async def lifespan(app):
 
 
 async def _hive(method: str, path: str, **kw) -> dict:
+    if HIVE_BUS_TOKEN:
+        headers = dict(kw.pop("headers", {}) or {})
+        headers.setdefault("Authorization", f"Bearer {HIVE_BUS_TOKEN}")
+        kw["headers"] = headers
     r = await client.request(method, f"{HIVE_URL}{path}", **kw)
     r.raise_for_status()
     if r.status_code == 204:

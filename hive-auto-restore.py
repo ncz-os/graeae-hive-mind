@@ -21,6 +21,8 @@ import urllib.request
 from pathlib import Path
 
 HIVE_URL = os.environ.get("HIVE_URL", "http://192.168.207.67:5005")
+# C1: bus transport auth bearer token (env-sourced, never baked in).
+HIVE_BUS_TOKEN = os.environ.get("HIVE_BUS_TOKEN", "")
 STATE_DIR = Path("/var/lib/hive-auto-restore")
 STATE_FILE = STATE_DIR / "retry_counts.json"
 LOG_FILE = "/var/log/hive-auto-restore.log"
@@ -55,11 +57,14 @@ def save_state(state):
 def _http(method: str, path: str, body: dict | None = None, timeout: float = 15.0) -> tuple[int, dict | None]:
     url = f"{HIVE_URL}{path}"
     data = json.dumps(body).encode() if body is not None else None
+    headers = {"content-type": "application/json"}
+    if HIVE_BUS_TOKEN:
+        headers["authorization"] = f"Bearer {HIVE_BUS_TOKEN}"
     req = urllib.request.Request(
         url,
         data=data,
         method=method,
-        headers={"content-type": "application/json"},
+        headers=headers,
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
