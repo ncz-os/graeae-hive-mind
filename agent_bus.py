@@ -1564,6 +1564,17 @@ CLAIM_STALE_AFTER_BY_KIND = {
     "benchmark": 3600.0,
     "migration": 7200.0,  # multi-host db / fleet migrations need wide window
 }
+
+# Absolute, UN-REFRESHABLE claim ceiling (operator 2026-06-20). The lease +
+# last_update_at staleness checks are BOTH refreshed by any PATCH, so a worker
+# stuck re-attempting+failing the SAME job kept them fresh and a 51h 'running'
+# job never reaped (019ed7a4-7e33). This cap measures wall-clock since the FIRST
+# claim (claimed_at — never touched by PATCH), so a genuinely-stuck claim is
+# reaped no matter how often its claimant pokes it.
+CLAIM_HARD_MAX_AGE = float(os.environ.get("HIVE_CLAIM_HARD_MAX_AGE", "14400"))  # 4h
+CLAIM_HARD_MAX_AGE_BY_KIND = {
+    "migration": 21600.0,   # 6h — multi-host fleet migrations may legitimately run long
+}
 async def reaper_task(app: FastAPI):
     while True:
         await asyncio.sleep(HEARTBEAT_REAP_INTERVAL)
@@ -1652,6 +1663,7 @@ async def reaper_task(app: FastAPI):
                 # orchestration / investigation / migration jobs run longer than default 30min.
                 now_ts = time.time()
                 default_cutoff = now_ts - CLAIM_STALE_AFTER
+                hard_cutoff = now_ts - CLAIM_HARD_MAX_AGE
                 async with db.execute(
                     "SELECT j.id, j.kind, j.claimed_by, j.claimed_at, j.last_update_at, "
                     "j.claim_lease_expires_at "
@@ -1666,8 +1678,9 @@ async def reaper_task(app: FastAPI):
                     "AND ( a.status = 'offline' OR a.urn IS NULL OR "
                     "      j.claimed_at IS NULL OR "
                     "      j.claim_lease_expires_at <= ? OR "
+                    "      j.claimed_at < ? OR "
                     "      COALESCE(j.last_update_at, j.claimed_at) < ? )",
-                    (now_ts, default_cutoff,)
+                    (now_ts, hard_cutoff, default_cutoff,)
                 ) as cur:
                     candidates = [(r[0], r[1], r[2], r[3], r[4], r[5]) async for r in cur]
                 # Apply kind-specific override: keep job if its kind has a longer TTL
@@ -1675,6 +1688,13 @@ async def reaper_task(app: FastAPI):
                 orphans = []
                 for jid, jkind, claimer, c_at, u_at, lease_exp in candidates:
                     if lease_exp is not None and lease_exp <= now_ts:
+                        orphans.append((jid, claimer))
+                        continue
+                    # HARD CAP (un-refreshable): wall-clock since FIRST claim.
+                    # Defeats the retry-loop evasion where lease + last_update
+                    # stay fresh but the job never progresses.
+                    hard_ttl = CLAIM_HARD_MAX_AGE_BY_KIND.get(jkind, CLAIM_HARD_MAX_AGE)
+                    if c_at is not None and (now_ts - c_at) >= hard_ttl:
                         orphans.append((jid, claimer))
                         continue
                     kind_ttl = CLAIM_STALE_AFTER_BY_KIND.get(jkind, CLAIM_STALE_AFTER)

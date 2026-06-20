@@ -394,6 +394,10 @@ let _submitOpen = false;
 
 // ── helpers ──────────────────────────────────────────────────────────
 function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+// commit-shape normalizers — producers emit varying keys ({sha|hash|commit|id},{subject|message|title}); never render [object Object]
+function shaOf(c){if(typeof c==='string')return c;return (c&&(c.sha||c.hash||c.commit||c.id))||'';}
+function subjOf(c){if(typeof c==='string')return '';return (c&&(c.subject||c.message||c.title))||'';}
+function commitStr(c){const s=shaOf(c),sub=subjOf(c);if(s||sub)return (String(s).slice(0,10)+(sub?(' '+sub):'')).trim();try{const j=JSON.stringify(c);return (j&&j!=='{}'&&j!=='null')?j.slice(0,80):'(empty commit)';}catch(e){return '(unrenderable commit)';}}
 function td(html,cls=''){const t=document.createElement('td');t.className=cls;if(html instanceof Node)t.appendChild(html);else t.innerHTML=html;return t;}
 async function api(method,path,body){
   const opts={method,headers:{'Content-Type':'application/json'}};
@@ -562,7 +566,8 @@ function showJobModal(job){
     if(r.stdout)texts.push('STDOUT\n'+r.stdout);
     if(r.stderr)texts.push('STDERR\n'+r.stderr);
     if(r.files_changed&&r.files_changed.length)texts.push('FILES CHANGED\n'+r.files_changed.join('\n'));
-    if(r.commits&&r.commits.length)texts.push('COMMITS\n'+r.commits.map(c=>(c&&c.sha)?(c.sha.slice(0,10)+' '+(c.subject||'')):c).join('\n'));
+    if(r.commits&&r.commits.length)texts.push('COMMITS\n'+r.commits.map(commitStr).join('\n'));
+    if(r.author_model||r.author_provider)texts.push('AUTHORED BY: '+(r.author_model||'?')+(r.author_provider?(' ('+r.author_provider+')'):'')+(r.alias?(' [alias '+r.alias+']'):''));
     if(r.review)texts.push('REVIEW: '+(r.review.verdict||'?')+(r.review.model?' ['+r.review.model+']':'')+'\n'+(r.review.text||''));
     if(r.unreviewed)texts.push('\u26a0 UNREVIEWED: '+r.unreviewed);
     if(r.pushed_branch)texts.push('PUSHED BRANCH\n'+r.pushed_branch+(r.pushed_remote?(' @ '+r.pushed_remote):''));
@@ -759,9 +764,12 @@ async function refreshRealWork(){
       const r = j.result || {};
       const cb = (j.claimed_by||'').split(':');
       const host = cb.length>=4 ? cb[3] : '?';
-      const c0 = (r.commits||[])[0]; const sha = (c0 ? (c0.sha||c0) : '-').slice(0,10);
+      const c0 = (r.commits||[])[0]; const sha = (shaOf(c0)||'-').slice(0,10);
+      const am = r.author_model ? (MODEL_NAMES[r.author_model]||r.author_model) : (MODEL_NAMES[r.alias]||'');
+      const rm = (r.review&&r.review.model)?r.review.model:'';
+      const mb = (am?' <span class="rc-model" title="authored by">'+esc(am)+'</span>':'') + (rm?' <span class="rc-model" title="reviewed by" style="color:#ffb454">rev:'+esc(rm)+'</span>':'');
       const t = new Date((j.ended_at||0)*1000).toLocaleTimeString();
-      return '<div>' + t + ' <span style="color:#7ee787">' + sha + '</span> ' + esc(host) + ' ' + esc(j.kind||'').slice(0,55) + '</div>';
+      return '<div>' + t + ' <span style="color:#7ee787">' + sha + '</span> ' + esc(host) + ' ' + esc(j.kind||'').slice(0,55) + mb + '</div>';
     }).join('');
     if (!with_commits_h.length) recentEl.innerHTML = '<div class="dim">no commits in last hour</div>';
   } catch(e) { console.warn('realwork err', e); }
@@ -804,7 +812,7 @@ async function refreshRemote(){
   }catch(e){console.warn('remote err',e);}
 }
 
-const MODEL_NAMES={hive_gpt:'gpt-5.3-codex-spark',hive_gpt_mini:'gpt-5.3-codex-spark',hive_gpt_heavy:'gpt-5.3-codex-spark',hive_codex:'gpt-5.3-codex-spark',hive_deepseek_pro_1:'deepseek-v4-pro',hive_deepseek_1:'deepseek-v4-flash',hive_deepseek_pro_2:'deepseek-v4-pro',hive_deepseek_pro_3:'deepseek-v4-pro',hive_deepseek_pro_4:'deepseek-v4-pro',hive_deepseek_pro_5:'deepseek-v4-pro',hive_deepseek_pro_6:'deepseek-v4-pro',hive_deepseek_pro_7:'deepseek-v4-pro',hive_deepseek_pro_8:'deepseek-v4-pro',hive_deepseek_3:'deepseek-v4-flash',hive_deepseek_4:'deepseek-v4-flash',hive_deepseek_5:'deepseek-v4-flash',hive_deepseek_6:'deepseek-v4-flash',hive_deepseek_7:'deepseek-v4-flash',hive_deepseek_8:'deepseek-v4-flash',hive_groq_8b:'llama-3.1-8b',hive_groq_2:'qwen3-32b',hive_groq_3:'gpt-oss-120b',hive_groq_4:'llama-4-scout',hive_groq_5:'llama-3.3-70b',hive_groq_6:'llama-3.3-70b',hive_groq_7:'llama-3.3-70b',hive_groq_8:'llama-3.3-70b',hive_groq_1:'gpt-5.3-codex',hive_xai_1:'grok-4.3',hive_nvidia_1:'gpt-5.3-codex',hive_siliconflow_3:'qwen3-coder-30b',hive_siliconflow_8:'deepseek-v4-pro(sf)',hive_nvidia_2:'nemotron-120b',hive_nvidia_5:'qwen3-coder-480b',hive_nvidia_6:'qwen3-coder-480b',hive_nvidia_7:'qwen3-coder-480b',hive_nvidia_8:'qwen3-coder-480b',hive_together_2:'kimi-k2.6'};
+const MODEL_NAMES={hive_gpt:'gpt-5.3-codex-spark',hive_gpt_mini:'gpt-5.3-codex-spark',hive_gpt_heavy:'gpt-5.3-codex-spark',hive_codex:'gpt-5.3-codex-spark',hive_deepseek_pro_1:'deepseek-v4-pro',hive_deepseek_1:'deepseek-v4-flash',hive_deepseek_pro_2:'deepseek-v4-pro',hive_deepseek_pro_3:'deepseek-v4-pro',hive_deepseek_pro_4:'deepseek-v4-pro',hive_deepseek_pro_5:'deepseek-v4-pro',hive_deepseek_pro_6:'deepseek-v4-pro',hive_deepseek_pro_7:'deepseek-v4-pro',hive_deepseek_pro_8:'deepseek-v4-pro',hive_deepseek_3:'deepseek-v4-flash',hive_deepseek_4:'deepseek-v4-flash',hive_deepseek_5:'deepseek-v4-flash',hive_deepseek_6:'deepseek-v4-flash',hive_deepseek_7:'deepseek-v4-flash',hive_deepseek_8:'deepseek-v4-flash',hive_groq_8b:'llama-3.1-8b',hive_groq_2:'qwen3-32b',hive_groq_3:'gpt-oss-120b',hive_groq_4:'llama-4-scout',hive_groq_5:'llama-3.3-70b',hive_groq_6:'llama-3.3-70b',hive_groq_7:'llama-3.3-70b',hive_groq_8:'llama-3.3-70b',hive_groq_1:'gpt-5.3-codex',hive_xai_1:'grok-4.3',hive_ngc_1:'gpt-5.5',hive_ngc_2:'gpt-5.5',hive_nvidia_1:'gpt-5.3-codex',hive_siliconflow_3:'qwen3-coder-30b',hive_siliconflow_8:'deepseek-v4-pro(sf)',hive_nvidia_2:'nemotron-120b',hive_nvidia_5:'qwen3-coder-480b',hive_nvidia_6:'qwen3-coder-480b',hive_nvidia_7:'qwen3-coder-480b',hive_nvidia_8:'qwen3-coder-480b',hive_together_2:'kimi-k2.6'};
 async function refreshResults(){
   const d=await api('GET','/v1/jobs?status=done&limit=20');
   const jobs=(d.jobs||[]).sort((a,b)=>(b.ended_at||0)-(a.ended_at||0));
@@ -831,13 +839,18 @@ async function refreshResults(){
       preview=parts.length?parts.join('  ·  '):'(build, no detail)';
     }
     if(!preview)preview='(no text result)';
-    const _at=(r.alias_tried&&r.alias_tried.length)?r.alias_tried[r.alias_tried.length-1]:'';const prov=MODEL_NAMES[_at]||MODEL_NAMES[r.agent_alias]||_at||r.gateway_provider_reported||r.gateway_model||r.agent_alias||'';
+    const _at=(r.alias_tried&&r.alias_tried.length)?r.alias_tried[r.alias_tried.length-1]:'';
+    // prefer explicit author_model from producer; else map alias→model
+    const prov=r.author_model||MODEL_NAMES[r.alias]||MODEL_NAMES[_at]||MODEL_NAMES[r.agent_alias]||_at||r.gateway_provider_reported||r.gateway_model||r.alias||r.agent_alias||'';
+    const provName=MODEL_NAMES[prov]||prov;
+    const authProv=r.author_provider||'';
+    const revModel=(r.review&&r.review.model)?r.review.model:'';
     const isCodex=/codex/i.test(j.kind||'')||/codex/i.test(prov)||/codex/i.test(r.via||'')||/codex/i.test(r.gateway_provider||'')||r.runtime==='codex';
     let agentType=r.runtime||String(j.kind||'').split(':')[0]||'agent';
     const wkHost=(String(j.claimed_by||'').match(/:zeroclaw:([^:]+):/)||[])[1]||(String(j.claimed_by||'').split(':')[3])||'';
     if(isCodex)agentType='codex';
     if(isCodex)card.classList.add('rc-codexcard');
-    const commits=(r.commits&&r.commits.length)?`<div style="font-size:.74em;color:#7ee787;margin-top:.2em">commits: ${esc(r.commits.slice(0,3).join(', '))}</div>`:'';
+    const commits=(r.commits&&r.commits.length)?`<div style="font-size:.74em;color:#7ee787;margin-top:.2em">commits: ${esc(r.commits.slice(0,3).map(commitStr).join(', '))}</div>`:'';
     const _dur=r.duration_sec||(r.drive&&r.drive.duration_sec);
     const _rev=(r.review&&r.review.verdict)?r.review.verdict:(typeof r.review==='string'?r.review:'');
     const buildChips=isBuild?`<div style="font-size:.74em;margin-top:.2em;display:flex;gap:.45em;flex-wrap:wrap">`
@@ -855,7 +868,8 @@ async function refreshResults(){
         <span class="rc-agent${isCodex?' codex':''}" title="agent type">${esc(agentType)}</span>
         ${wkHost?`<span class="rc-host" title="host that ran the job">\ud83d\udda5\ufe0f ${esc(wkHost)}</span>`:''}
         <span class="${badgeCls(j.status)}">${esc(j.status)}</span>
-        ${prov?`<span class="rc-model" title="model/provider that did this job">${esc(prov)}</span>`:''}
+        ${provName?`<span class="rc-model" title="authored by${authProv?(' '+esc(authProv)):''}">${esc(provName)}${authProv?(' · '+esc(authProv)):''}</span>`:''}
+        ${revModel?`<span class="rc-model" title="reviewed by" style="color:#ffb454">rev:${esc(MODEL_NAMES[revModel]||revModel)}</span>`:''}
         <span class="rc-id">${esc(j.id.slice(0,10))}</span>
         <span class="dim" style="font-size:.75em;margin-left:auto">${relTime(j.ended_at)}</span>
       </div>
