@@ -3372,6 +3372,87 @@ async def admin_requeue_jobs(req: RequeueRequest):
             results["ok"].append(job_id)
     return results
 
+
+class PurgeRequest(BaseModel):
+    job_ids: list[str]
+    reason: str = "doctor-dlq-remove"
+
+@app.post("/v1/admin/jobs/purge")
+async def admin_purge_jobs(req: PurgeRequest):
+    """Permanently remove terminal dead-letter jobs (doctor 'remove' action).
+
+    Safety: ONLY purges jobs currently in 'dead-letter'. Anything else
+    (active, or other-terminal done/failed/cancelled) is refused so a stray or
+    buggy caller cannot delete live or historical work."""
+    results: dict = {"ok": [], "not_found": [], "skipped_not_dead_letter": []}
+    async with connect_db() as db:
+        for job_id in req.job_ids:
+            async with db.execute("SELECT status FROM jobs WHERE id=?", (job_id,)) as cur:
+                row = await cur.fetchone()
+            if not row:
+                results["not_found"].append(job_id)
+                continue
+            if row[0] != "dead-letter":
+                results["skipped_not_dead_letter"].append(job_id)
+                continue
+            await db.execute("DELETE FROM jobs WHERE id=? AND status='dead-letter'", (job_id,))
+            await db.commit()
+            results["ok"].append(job_id)
+    async with connect_db() as event_db:
+        for job_id in results["ok"]:
+            await emit_event(event_db, "job.purged", {"id": job_id, "reason": req.reason})
+    return results
+
+
+# Admin reclassify is an explicit override of the normal transition guard, so the
+# target is restricted to a small safe set (e.g. dead-letter -> needs-review for a
+# human). Used by the doctor for ambiguous dead-letter jobs.
+RECLASSIFY_ALLOWED_TARGETS = {"needs-review", "cancelled", "queued"}
+
+class ReclassifyRequest(BaseModel):
+    job_ids: list[str]
+    status: str
+    reason: str = "doctor-dlq-reclassify"
+
+@app.post("/v1/admin/jobs/reclassify")
+async def admin_reclassify_jobs(req: ReclassifyRequest):
+    """Admin override to move terminal (esp. dead-letter) jobs to a safe target
+    status, bypassing ALLOWED_TRANSITIONS. The doctor uses status='needs-review'
+    to surface ambiguous dead-letter jobs for a human."""
+    if req.status not in RECLASSIFY_ALLOWED_TARGETS:
+        raise HTTPException(422, f"status must be one of {sorted(RECLASSIFY_ALLOWED_TARGETS)}")
+    results: dict = {"ok": [], "not_found": [], "skipped_done": []}
+    async with connect_db() as db:
+        for job_id in req.job_ids:
+            async with db.execute("SELECT status FROM jobs WHERE id=?", (job_id,)) as cur:
+                row = await cur.fetchone()
+            if not row:
+                results["not_found"].append(job_id)
+                continue
+            if row[0] == "done":
+                results["skipped_done"].append(job_id)
+                continue
+            if req.status == "queued":
+                # full requeue semantics (reset claim + retry/backoff)
+                await db.execute(
+                    "UPDATE jobs SET status='queued', claimed_by=NULL, claimed_at=NULL, "
+                    "retry_count=0, retry_backoff_until=NULL WHERE id=?",
+                    (job_id,),
+                )
+            else:
+                await db.execute(
+                    "UPDATE jobs SET status=?, claimed_by=NULL, claimed_at=NULL WHERE id=?",
+                    (req.status, job_id),
+                )
+            await db.commit()
+            results["ok"].append(job_id)
+    async with connect_db() as event_db:
+        for job_id in results["ok"]:
+            await emit_event(event_db, "job.reclassified", {
+                "id": job_id, "new_status": req.status, "reason": req.reason})
+    return results
+
+
 @app.post("/v1/schedules")
 async def create_schedule(req: ScheduleCreate):
     """Create a recurring scheduled job. Re-fires every `interval_seconds`.
