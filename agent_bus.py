@@ -595,6 +595,10 @@ CREATE TABLE IF NOT EXISTS jobs (
   required_capabilities TEXT,                   -- json array; worker must have ALL
   eligible_kinds TEXT,                          -- json array; agent kinds eligible (null = any)
   eligible_hosts TEXT,                          -- json array; agent hosts eligible (null = any); e.g. ["cixmini"]
+  site TEXT,                                    -- git_sites.json key (github/gitlab-ncz/codeberg/internal)
+  repo TEXT,                                    -- owner/name path on that site
+  head_branch TEXT,                             -- branch / PR head to check out
+  pr_number INTEGER,                            -- PR/MR number (forge-specific ref scheme)
   project TEXT,                                 -- #10 FIX: separate project tag from capabilities (riskyeats/investorclaw/etc)
   status TEXT NOT NULL CHECK(status IN ('queued','offered','claimed','running','done','failed','failed_completion','cancelled','dead-letter','needs-review')),
   claimed_by TEXT,                              -- worker urn (set on claim/dequeue)
@@ -895,6 +899,12 @@ HOST_DENYLIST: set[str] = {
     if h.strip()
 }
 
+# Phase 2 provider-as-capability gate. When ON, an executor job (build / agent
+# coding kind) can only be claimed by a host advertising >=1 live llm-* cap, so a
+# host whose only LLM provider is dead self-excludes (no host denylist needed).
+# Default OFF until workers advertise llm-* fleet-wide (flip after Phase 4).
+LLM_CAP_GATE = os.environ.get("HIVE_LLM_CAP_GATE", "0").strip().lower() in ("1", "true", "yes", "on")
+
 
 def cost_tier_for(provider: str) -> str:
     return PROVIDER_COST_TIER.get((provider or "unknown").lower(), "C")
@@ -996,6 +1006,12 @@ def job_agent_preference_score(job: dict[str, Any], agent: dict[str, Any]) -> in
 # are RESERVED for Spark (not burned on metered deepseek) as long as a Spark
 # relay agent is online.
 SPARK_HOSTS = {"spark-0c53"}
+# spark-0c53 build-deny lift (2026-06-16): the false-done root was fixed
+# (poller declares an honest terminal status; commit-expecting kinds with no
+# commit/patch fail honest) and caps were narrowed off ["*"], so spark may now
+# be RELAYED build:* jobs. Reversible: set SPARK_ALLOW_BUILD=0 to restore the
+# hard-deny (and build takeover-disable) without code changes.
+SPARK_ALLOW_BUILD = os.environ.get("SPARK_ALLOW_BUILD", "1").strip().lower() not in ("0", "false", "no", "off")
 # NOTE: submit-time admission rewrites eligible_kinds=["codex"] -> ["zeroclaw"]
 # (codex is a CLI zeroclaw workers shell out to), so coding jobs reach the DB
 # as zeroclaw-eligible — the takeover set must include zeroclaw for Spark to
@@ -1075,7 +1091,7 @@ def job_agent_eligible(job: dict[str, Any], agent: dict[str, Any]) -> tuple[bool
     # Spark NEVER executes build:* jobs by ANY path (takeover, host-pin, or general
     # eligibility): the DGX poller has no repo-mapping for a build: kind. Hard-deny
     # so a build job can only be claimed by a real zeroclaw worker (zc_oneshot harness).
-    if agent_host in SPARK_HOSTS and j_kind.startswith("build:"):
+    if (not SPARK_ALLOW_BUILD) and agent_host in SPARK_HOSTS and j_kind.startswith("build:"):
         return False, f"spark does not execute build kinds ({j_kind}); real zeroclaw workers only"
 
     j_kinds = _norm_str_set(job.get("eligible_kinds"))
@@ -1084,7 +1100,7 @@ def job_agent_eligible(job: dict[str, Any], agent: dict[str, Any]) -> tuple[bool
     # Spark poller has no repo-mapping for a build: kind, so it must never take them
     # (the 2026-06-08 "no repo mapping" needs-review poison). codex/claude coding
     # jobs (non-build: kinds, also eligible_kinds=["zeroclaw"]) still route to Spark.
-    if j_kind.startswith("build:"):
+    if j_kind.startswith("build:") and not SPARK_ALLOW_BUILD:
         spark_takeover_job = False
 
     # Spark override: any codex/claude-eligible job (or a job host-pinned to
@@ -1151,6 +1167,15 @@ def job_agent_eligible(job: dict[str, Any], agent: dict[str, Any]) -> tuple[bool
         cap_match = queue_logic.match(labels, agent_caps)
         if not cap_match.eligible:
             return False, f"agent does not satisfy required_capabilities: {cap_match.reason}"
+
+    # Provider-as-capability gate (flag-gated; Phase 2). Executor jobs need a
+    # live LLM; a host advertising no llm-* provider is excluded here -- this
+    # is what replaces the manual HIVE_HOST_DENYLIST for dead-provider hosts.
+    if LLM_CAP_GATE:
+        _needs_llm = (j_kind.startswith("build:")
+                      or workspace_capability_for_kind(j_kind) is not None)
+        if _needs_llm and not any(c.startswith("llm-") for c in agent_caps):
+            return False, "agent has no live llm-* provider capability (kind %s needs an LLM)" % j_kind
 
     job_max_tier = (job.get("max_cost_tier") or "B").upper()
     agent_tier = (agent.get("cost_tier") or "C").upper()
@@ -1490,6 +1515,11 @@ class JobCreate(BaseModel):
     # DAG support:
     depends_on: Optional[list[str]] = None             # job ids that must be status='done' before this job is dequeueable
     idempotency_key: Optional[str] = None              # forced-rerun escape: a unique value is never coalesced
+    # PR-fix routing (operator 2026-06-17): forge + repo + branch/PR to check out.
+    site: Optional[str] = None                         # git_sites.json key (github/gitlab-ncz/codeberg/internal)
+    repo: Optional[str] = None                         # owner/name path on that site
+    head_branch: Optional[str] = None                  # branch / PR head to check out
+    pr_number: Optional[int] = None                    # PR/MR number (forge-specific ref scheme)
 
 
 class JobUpdate(BaseModel):
@@ -1847,6 +1877,10 @@ async def lifespan(app: FastAPI):
             ("jobs", "claim_lease_expires_at", "claim_lease_expires_at REAL"),
             # Thrash fix (2026-06-02): per-job count of worker-decline requeues.
             ("jobs", "decline_count", "decline_count INTEGER NOT NULL DEFAULT 0"),
+            ("jobs", "site", "site TEXT"),
+            ("jobs", "repo", "repo TEXT"),
+            ("jobs", "head_branch", "head_branch TEXT"),
+            ("jobs", "pr_number", "pr_number INTEGER"),
         )
         # Run CHECK-constraint rebuilds BEFORE additive column ALTERs: the
         # rebuild recreates the table from SCHEMA (sans drift columns), then the
@@ -1880,6 +1914,12 @@ async def lifespan(app: FastAPI):
                     rcur.execute(
                         "ALTER TABLE HIVE_JOBS ADD (decline_count NUMBER DEFAULT 0 NOT NULL)"
                     )
+                for _c, _d in (("SITE", "VARCHAR2(64)"), ("REPO", "VARCHAR2(512)"),
+                               ("HEAD_BRANCH", "VARCHAR2(512)"), ("PR_NUMBER", "NUMBER")):
+                    rcur.execute("SELECT COUNT(*) FROM user_tab_columns "
+                                 "WHERE table_name = 'HIVE_JOBS' AND column_name = :1", [_c])
+                    if not (rcur.fetchone())[0]:
+                        rcur.execute(f"ALTER TABLE HIVE_JOBS ADD ({_c} {_d})")
                 rcur.execute(
                     "SELECT search_condition_vc FROM user_constraints "
                     "WHERE table_name = 'HIVE_JOBS' AND constraint_name = 'CK_HIVE_JOBS_STATUS'"
@@ -2012,6 +2052,16 @@ async def register(req: AgentRegister):
     plan_cap_usd = req.plan_cap_usd if req.plan_cap_usd is not None else DEFAULT_PLAN_CAPS.get(auth_method, 50.0)
     provider = (req.provider or "unknown").lower()
     model = (req.model or "unknown").lower()
+    # EIH ban (operator 2026-06-18): the hive must never advertise EIH / gpt-5.5
+    # authoring labels. Unmanaged workers still default their register model to
+    # the legacy "gpt-5.5 (EIH via gateway :4100)" string; everything actually
+    # routes through the PYTHIA gateway (:4100) to MiniMax, so normalize any such
+    # label to the real served upstream and drop the openai provider so the
+    # registry reflects reality.
+    if "gpt-5.5" in model or "eih" in model:
+        model = "minimax-m2.7"
+        if provider == "openai":
+            provider = "minimax"
     tier = cost_tier_for(provider)
     # User directive 2026-05-26: allow opencode + codex to claim work at ALL
     # tiers (A/B/C) regardless of provider. They are flexible multi-provider
@@ -2615,8 +2665,8 @@ async def create_job(req: JobCreate):
             await db.execute(
                 "INSERT INTO jobs (id, submitter_urn, parent_job_id, kind, description, priority, deadline, "
                 "required_capabilities, eligible_kinds, eligible_hosts, project, max_cost_tier, preferred_providers, preferred_models, "
-                "mnemos_refs, depends_on, max_retries, dedup_hash, status, started_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
+                "mnemos_refs, depends_on, max_retries, dedup_hash, site, repo, head_branch, pr_number, status, started_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
                 (
                     job_id, req.submitter_urn, req.parent_job_id, req.kind, req.description,
                     req.priority, req.deadline,
@@ -2631,6 +2681,8 @@ async def create_job(req: JobCreate):
                     json.dumps(req.depends_on) if req.depends_on else None,
                     int(req.max_retries),
                     dedup_hash,
+                    req.site, req.repo, req.head_branch,
+                    (int(req.pr_number) if req.pr_number is not None else None),
                     now,
                 ),
             )
@@ -2727,7 +2779,8 @@ async def dequeue_next_job(agent_urn: str):
             async with db.execute(
                 "SELECT id, submitter_urn, parent_job_id, kind, description, priority, deadline, "
                 "required_capabilities, eligible_kinds, eligible_hosts, project, max_cost_tier, "
-                "preferred_providers, preferred_models, mnemos_refs, depends_on, retry_backoff_until, started_at "
+                "preferred_providers, preferred_models, mnemos_refs, depends_on, retry_backoff_until, started_at, "
+                "site, repo, head_branch, pr_number "
                 "FROM jobs WHERE status IN ('queued','offered') "
                 "AND (retry_backoff_until IS NULL OR retry_backoff_until <= ?) "
                 "ORDER BY priority DESC, started_at ASC LIMIT 100",
@@ -2757,7 +2810,8 @@ async def dequeue_next_job(agent_urn: str):
                 (j_id, j_submitter, j_parent, j_kind, j_desc, j_priority, j_deadline,
                  j_caps_json, j_kinds_json, j_hosts_json, j_project, j_max_tier,
                  j_pref_providers, j_pref_models, j_mnemos_refs, j_deps_json,
-                 _j_retry_backoff_until, j_started_at) = r
+                 _j_retry_backoff_until, j_started_at,
+                 j_site, j_repo, j_head_branch, j_pr_number) = r
                 deps = json_list(j_deps_json)
                 if deps:
                     ph = ",".join("?" * len(deps))
@@ -2808,6 +2862,10 @@ async def dequeue_next_job(agent_urn: str):
                     "preferred_providers": json_list(j_pref_providers),
                     "preferred_models": json_list(j_pref_models),
                     "mnemos_refs": json_list(j_mnemos_refs),
+                    "site": j_site,
+                    "repo": j_repo,
+                    "head_branch": j_head_branch,
+                    "pr_number": j_pr_number,
                     "status": "claimed",
                     "claimed_by": agent_urn,
                     "claimed_at": now,
@@ -3543,10 +3601,9 @@ KNEMON_PROVIDERS: list[dict[str, Any]] = [
     {"provider": "together",  "model": "minimax-m2.7",         "alias": "hive_together_1",    "tier": "B"},
     {"provider": "xai",       "model": "grok-4.1-fast",        "alias": "hive_xai_1",         "tier": "B"},
     {"provider": "deepseek-direct","model": "deepseek-v4-pro", "alias": "hive_deepseek_pro_1","tier": "B"},
-    # NGC Enterprise Inference Hub via the .4 LiteLLM gateway (PYTHIA:4100
-    # tunnel). Enterprise allocation, no per-token bill -> tier A. Worker
-    # agent = hive_ngc_1 (openai.ngc_nemotron, fleet-ops fe4d780).
-    {"provider": "ngc-proxy", "model": "gpt-5.5",            "alias": "hive_ngc_1",         "tier": "A"},
+    # REMOVED 2026-06-17 (operator: "remove ngc-review from all agents" +
+    # compute edict: EIH frontier forbidden). hive_ngc_1 (ngc-proxy gpt-5.5 via
+    # the .4 EIH gateway) is no longer a coding/review candidate for any agent.
     # Bedrock Nova (funded AWS creds, worker agents shipped 2026-06-02):
     # cheap metered fallbacks (lite 0.06/0.24, micro 0.035/0.14).
     {"provider": "bedrock",   "model": "amazon.nova-lite-v1:0", "alias": "hive_nova_1",       "tier": "B"},
@@ -3645,6 +3702,17 @@ def clear_oauth_cap() -> Optional[str]:
     return None
 
 
+@app.get("/v1/knemon/providers")
+async def knemon_providers():
+    """Provider denylist for the worker llm-* capability probe (Phase 2). A
+    family listed here is treated as globally dead; workers drop its llm-* cap.
+    Set HIVE_PROVIDER_DENYLIST=comma,list (e.g. nvidia,eih)."""
+    denied = [p.strip().lower()
+              for p in os.environ.get("HIVE_PROVIDER_DENYLIST", "").split(",")
+              if p.strip()]
+    return {"denied": denied}
+
+
 @app.post("/v1/knemon/route")
 async def knemon_route(req: Request):
     """Cost-aware routing. POST {max_cost_tier|tier, kind} -> ordered candidate
@@ -3661,6 +3729,8 @@ async def knemon_route(req: Request):
     if max_tier not in COST_TIERS:
         max_tier = "C"
     kind = str(body.get("kind") or "")
+    host = str(body.get("host") or "").lower()
+    lead_alias = str(body.get("lead_alias") or "").strip()
     cands = knemon_candidates(max_tier, kind)
     open_weight_chain = [c["alias"] for c in cands]
     # ── KNEMON sub-bucket dispatch (operator 2026-06-02): openai_codex sub is $0;
@@ -3681,14 +3751,13 @@ async def knemon_route(req: Request):
     if not (review_kind or arch_kind):
         cands = [c for c in cands if c["alias"] != "hive_deepseek_pro_1"]
         open_weight_chain = [a for a in open_weight_chain if a != "hive_deepseek_pro_1"]
+    # ADVERSARIAL-ONLY codex (operator 2026-06-17): codex/gpt OAuth leads ONLY
+    # review/adversarial kinds. Every other kind leads with the open-weight /
+    # local lineup (no OAuth lead) so coding goes local-first per the edict.
     if review_kind:
         CODEX_SUB_LEAD = ["hive_codex"]
-    elif any(t in kl for t in ("architecture", "design")) or kl.startswith("heavy:"):
-        CODEX_SUB_LEAD = ["hive_gpt"]  # gpt-5.5 (hive_gpt_heavy) OAuth allowance exhausted 2026-06-04 -> use gpt-5.4
-    elif any(kl.startswith(p) for p in ("triage", "docs:", "investigation")):
-        CODEX_SUB_LEAD = ["hive_gpt_mini"]
     else:
-        CODEX_SUB_LEAD = ["hive_gpt"]
+        CODEX_SUB_LEAD = []
     # HIVE-LEVEL BYPASS: when the flag is set, drop the codex/gpt sub-lead and
     # hand back the plain metered open-weight chain so all workers run direct.
     bypass = knemon_bypass_active()
@@ -3710,14 +3779,25 @@ async def knemon_route(req: Request):
         # fallback: when OAuth codex/gpt is capped it is the best available
         # driver AND $0. deepseek/nova/grok follow. (NGC nemotron stays as the
         # ngc-review CLI's direct-prompt reviewer, separate from this chain.)
+        # ngc/EIH removed 2026-06-17. Open-weight lineup leads (cheap flash first;
+        # minimax via hive_together_1 kept in chain -> promote to lead once the
+        # direct $200 MiniMax key is wired into the .4 gateway alias).
         if review_kind:
-            METERED_FALLBACK = ["hive_ngc_1", "hive_deepseek_pro_1", "hive_deepseek_1", "hive_xai_1"]
+            METERED_FALLBACK = ["hive_deepseek_pro_1", "hive_deepseek_1", "hive_groq_3", "hive_xai_1"]
         elif arch_kind:
-            # High-level architecture: gpt-5.5, then deepseek-PRO (sanctioned), grok.
-            METERED_FALLBACK = ["hive_ngc_1", "hive_deepseek_pro_1", "hive_xai_1"]
+            # High-level architecture: deepseek-PRO (sanctioned), gpt-oss-120b, grok.
+            METERED_FALLBACK = ["hive_deepseek_pro_1", "hive_groq_3", "hive_xai_1"]
         else:
-            # General jobs: gpt-5.5 (codex-class, free), flash, Nova lite, grok.
-            METERED_FALLBACK = ["hive_ngc_1", "hive_deepseek_1", "hive_nova_1", "hive_xai_1"]
+            # General coding rotation (operator 2026-06-19): deepseek-flash lead,
+            # then groq qwen3 (fast coder) + groq gpt-oss-120b, grok funded tail.
+            # MiniMax (hive_together_1) REMOVED from the fleet chain -- reserved
+            # for the sole MiniMax builder (minos) via the host override below.
+            METERED_FALLBACK = ["hive_deepseek_1", "hive_groq_2", "hive_groq_3", "hive_xai_1"]
+        # MINOS = sole MiniMax builder (operator 2026-06-19): only minos leads
+        # MiniMax ($200 plan key, TPM-limited @ 1 worker). Everyone else rotates
+        # the open-weight lineup above.
+        if "minos" in host and not review_kind:
+            METERED_FALLBACK = ["hive_together_1", "hive_deepseek_1", "hive_groq_2"]
         if cap.get("capped"):
             # Half-open breaker: most jobs use metered fallback, but a small share leads
             # OAuth so routed traffic can prove recovery before the 5h stale-report TTL.
@@ -3728,6 +3808,11 @@ async def knemon_route(req: Request):
                 chain = list(METERED_FALLBACK)
         else:
             chain = list(CODEX_SUB_LEAD) + METERED_FALLBACK
+    # JOB-SELECTABLE LEAD (operator 2026-06-19): a job may request a specific
+    # lead alias (e.g. a host-local GPU coder: hive_cerberus_1 / hive_rocm_*).
+    # Honor it as the chain head while keeping the rotation as fallback.
+    if lead_alias:
+        chain = [lead_alias] + [a for a in chain if a != lead_alias]
     return {
         "ok": True,
         "max_cost_tier": max_tier,
@@ -4066,7 +4151,7 @@ async def list_jobs(
             )
     sql = ("SELECT id, submitter_urn, parent_job_id, kind, description, priority, status, "
            "claimed_by, started_at, ended_at, result, estimated_cost_usd, "
-           "required_capabilities, eligible_kinds, eligible_hosts FROM jobs WHERE 1=1")
+           "required_capabilities, eligible_kinds, eligible_hosts, site, repo, head_branch, pr_number FROM jobs WHERE 1=1")
     args: list = []
     cnt_sql = "SELECT COUNT(*) FROM jobs WHERE 1=1"
     cnt_args: list = []
@@ -4118,6 +4203,8 @@ async def list_jobs(
                     "required_capabilities": json.loads(r[12]) if r[12] else None,
                     "eligible_kinds": json.loads(r[13]) if r[13] else None,
                     "eligible_hosts": json.loads(r[14]) if r[14] else None,
+                    "site": r[15], "repo": r[16],
+                    "head_branch": r[17], "pr_number": r[18],
                 })
     return {"count": len(rows), "total": total, "jobs": rows}
 
@@ -4130,7 +4217,7 @@ async def get_job(job_id: str):
         async with db.execute(
             "SELECT id, submitter_urn, parent_job_id, kind, description, priority, status, "
             "claimed_by, started_at, ended_at, result, estimated_cost_usd, "
-            "required_capabilities, eligible_kinds, eligible_hosts FROM jobs WHERE id=?",
+            "required_capabilities, eligible_kinds, eligible_hosts, site, repo, head_branch, pr_number FROM jobs WHERE id=?",
             (job_id,)) as cur:
             r = await cur.fetchone()
     if not r:
@@ -4145,6 +4232,8 @@ async def get_job(job_id: str):
         "required_capabilities": json.loads(r[12]) if r[12] else None,
         "eligible_kinds": json.loads(r[13]) if r[13] else None,
         "eligible_hosts": json.loads(r[14]) if r[14] else None,
+        "site": r[15], "repo": r[16],
+        "head_branch": r[17], "pr_number": r[18],
     }
 
 
