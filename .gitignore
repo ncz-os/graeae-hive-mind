@@ -13,3 +13,4 @@ agents.db*
 *.sqlite*
 *.log
 *.wal
+admission_shadow.jsonl
