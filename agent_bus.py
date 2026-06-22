@@ -45,6 +45,26 @@ HEARTBEAT_OFFLINE_AFTER = 300.0
 # window while reaping long-dead session rows.
 AGENT_PURGE_AFTER = float(os.environ.get("HIVE_AGENT_PURGE_AFTER", "21600"))
 EVENTS_RETAIN_HOURS = 168  # 7 days
+# Job retention sweep (housekeeping — the dashboard fills with test/duplicate
+# jobs fast). Conservative defaults; both windows env-overridable.
+#  - Terminal jobs (done/failed/failed_completion/cancelled/dead-letter) older
+#    than RETAIN_DONE_JOBS_DAYS are auto-deleted.
+#  - Obvious test/e2e jobs (description matches TEST_JOB_DESC_PATTERNS) terminal
+#    AND older than RETAIN_TEST_JOBS_DAYS are deleted sooner.
+# Active jobs (queued/offered/claimed/running/needs-review) are NEVER swept.
+RETAIN_DONE_JOBS_DAYS = float(os.environ.get("RETAIN_DONE_JOBS_DAYS", "7"))
+RETAIN_TEST_JOBS_DAYS = float(os.environ.get("RETAIN_TEST_JOBS_DAYS", "1"))
+# Statuses considered terminal & sweepable. needs-review is intentionally
+# EXCLUDED (it is a human-attention queue, not finished work).
+SWEEPABLE_STATUSES = ("done", "failed", "failed_completion", "cancelled", "dead-letter")
+# Active/in-flight statuses that delete endpoints + the sweep refuse to touch
+# (without explicit force/include_active) so an in-flight worker is never orphaned.
+ACTIVE_JOB_STATUSES = ("queued", "offered", "claimed", "running", "needs-review")
+# Substrings (case-insensitive) that mark a job description as obvious test junk.
+TEST_JOB_DESC_PATTERNS = (
+    "e2e", "testdispatch", "append a one-line", "dated comment",
+    "xfam", "validate native", "hive functional", "hive deploy e2e",
+)
 SSE_PING_INTERVAL = 15.0
 EVENT_QUEUE: dict[str, asyncio.Queue] = {}  # subscriber_id -> queue
 SQLITE_BUSY_TIMEOUT_MS = int(os.environ.get("AGENT_BUS_SQLITE_BUSY_TIMEOUT_MS", "5000"))
@@ -819,6 +839,12 @@ KIND_WORKSPACE_CAPABILITY: dict[str, str] = {
     "zeroclaw:": "hard:linux-compile",
     "ncz-os-zeroclaw:": "hard:linux-compile",
     "compile:": "hard:linux-compile",
+    # mnemos rust hot-path jobs -> rust+CI hosts only (cerberus/hydra/achilles).
+    # Most mnemos work has NO such requirement and stays claimable by any host;
+    # tag a job build:mnemos-rust / mnemos-rust: / compile:mnemos to gate it. 2026-06-21.
+    "build:mnemos-rust": "hard:linux-compile",
+    "mnemos-rust:": "hard:linux-compile",
+    "compile:mnemos": "hard:linux-compile",
     "test:provider-bench-1-readme-fix-deepseek-pro": "workspace-riskybiz",
     "test:provider-bench-2-typo-deepseek-pro": "workspace-riskybiz",
     "test:provider-bench-": "workspace-riskybiz",
@@ -870,8 +896,8 @@ PROVIDER_COST_TIER: dict[str, str] = {
     "unknown":         "A",
 }
 COST_TIERS = ["A", "B", "C"]
-VALID_JOB_STATUSES = {"queued", "offered", "claimed", "running", "done", "failed", "failed_completion", "cancelled", "dead-letter", "needs-review"}
-TERMINAL_JOB_STATUSES = {"done", "failed", "cancelled", "dead-letter"}
+VALID_JOB_STATUSES = {"queued", "offered", "claimed", "running", "done", "failed", "failed_completion", "cancelled", "dead-letter", "needs-review", "released"}
+TERMINAL_JOB_STATUSES = {"done", "failed", "cancelled", "dead-letter", "released"}
 # Skip releases (host_declines_kind/released_by_host/no_workspace_for_kind) are
 # legitimate "not me" routing signals. They must not burn the decline dead-letter
 # threshold; real execution failures use the failed/retry path.
@@ -1761,6 +1787,58 @@ async def reaper_task(app: FastAPI):
                 retain_cutoff = time.time() - EVENTS_RETAIN_HOURS * 3600
                 await db.execute("DELETE FROM events WHERE ts < ?", (retain_cutoff,))
                 await db.commit()
+                # 6. JOB RETENTION SWEEP (housekeeping — keeps the dashboard clean).
+                # Auto-delete OLD TERMINAL jobs (+ cascade job_audit_log). Two tiers:
+                #   (a) obvious test/e2e junk older than RETAIN_TEST_JOBS_DAYS
+                #   (b) any terminal job older than RETAIN_DONE_JOBS_DAYS
+                # Active statuses (queued/offered/claimed/running/needs-review) are
+                # NEVER candidates — the status filter excludes them, so an in-flight
+                # worker can never be reaped here. Conservative + logged. Age is taken
+                # from COALESCE(ended_at, started_at). Done as SELECT-then-cascade so
+                # the same single-id cascade helper handles audit-log rows on both
+                # backends; the re-check is implicit (status is in the SELECT predicate
+                # and terminal jobs do not transition back to active).
+                now_ts = time.time()
+                sweep_ids: list[str] = []
+                # (a) test/e2e junk — terminal + matches any test pattern + > test window
+                test_cutoff = now_ts - RETAIN_TEST_JOBS_DAYS * 86400
+                status_ph = ",".join("?" for _ in SWEEPABLE_STATUSES)
+                like_ph = " OR ".join(
+                    "LOWER(description) LIKE ?" for _ in TEST_JOB_DESC_PATTERNS
+                )
+                test_params: list[Any] = list(SWEEPABLE_STATUSES)
+                test_params += [f"%{p.lower()}%" for p in TEST_JOB_DESC_PATTERNS]
+                test_params.append(test_cutoff)
+                async with db.execute(
+                    f"SELECT id FROM jobs WHERE status IN ({status_ph}) "
+                    f"AND description IS NOT NULL AND ({like_ph}) "
+                    f"AND COALESCE(ended_at, started_at) < ?",
+                    tuple(test_params),
+                ) as cur:
+                    sweep_ids += [r[0] async for r in cur]
+                # (b) any terminal job older than the done-retention window
+                done_cutoff = now_ts - RETAIN_DONE_JOBS_DAYS * 86400
+                done_params: list[Any] = list(SWEEPABLE_STATUSES)
+                done_params.append(done_cutoff)
+                async with db.execute(
+                    f"SELECT id FROM jobs WHERE status IN ({status_ph}) "
+                    f"AND COALESCE(ended_at, started_at) < ?",
+                    tuple(done_params),
+                ) as cur:
+                    sweep_ids += [r[0] async for r in cur]
+                sweep_ids = list(dict.fromkeys(sweep_ids))  # de-dupe, keep order
+                if sweep_ids:
+                    # allow_active defaults False: the cascade re-checks status at
+                    # delete time, so a job that somehow flipped back to active
+                    # between SELECT and DELETE is left alone (atomic guard).
+                    swept = await _cascade_delete_jobs(db, sweep_ids)
+                    await db.commit()
+                    if swept:
+                        print(
+                            f"job retention sweep: removed {len(swept)} terminal "
+                            f"jobs (test<{RETAIN_TEST_JOBS_DAYS}d / done<{RETAIN_DONE_JOBS_DAYS}d)",
+                            flush=True,
+                        )
         except Exception as e:
             print(f"reaper error: {e}", flush=True)
 
@@ -3404,6 +3482,210 @@ async def admin_purge_jobs(req: PurgeRequest):
     return results
 
 
+# ---------------------------------------------------------------------------
+# Housekeeping delete/purge — single-job DELETE + filtered bulk purge.
+# Both paths cascade job_audit_log and use the file's `?`-placeholder convention
+# (the _translate_sql layer rewrites ? -> :bind and table names for Oracle), so
+# ONE SQL body works for both sqlite and oracle backends. All filters are bound
+# parameters (no string interpolation of caller input -> no SQL injection).
+# ---------------------------------------------------------------------------
+
+async def _cascade_delete_jobs(db, job_ids: list[str], *, allow_active: bool = False) -> list[str]:
+    """Delete the given jobs and their job_audit_log rows. ATOMIC active-job guard
+    (codex review #3): the job row is deleted with a compare-and-delete predicate
+    that re-checks status AT DELETE TIME, so a job that was queued/offered at SELECT
+    time but got CLAIMED by a worker before the delete is NOT removed (no orphaned
+    in-flight worker). Pass allow_active=True to bypass that guard (force / explicit
+    include_active). Audit-log rows are deleted only for jobs whose row is actually
+    gone (NOT EXISTS guard), so a job that survived the status race keeps its audit
+    history. Returns the ids actually deleted. Uses single-id executemany so the
+    per-backend (?->:bind) translation runs once and binds tuples — same shape as
+    the existing reaper deletes.
+    """
+    if not job_ids:
+        return []
+    rows = [(jid,) for jid in job_ids]
+    if allow_active:
+        await db.executemany("DELETE FROM jobs WHERE id=?", rows)
+    else:
+        active_ph = ",".join("?" for _ in ACTIVE_JOB_STATUSES)
+        await db.executemany(
+            f"DELETE FROM jobs WHERE id=? AND status NOT IN ({active_ph})",
+            [(jid, *ACTIVE_JOB_STATUSES) for jid in job_ids],
+        )
+    # Re-read which of the candidates still exist; everything missing was deleted.
+    # (Set-based existence check, no table-qualified columns -> Oracle-safe.)
+    survivors: set[str] = set()
+    for jid in job_ids:
+        async with db.execute("SELECT 1 FROM jobs WHERE id=?", (jid,)) as cur:
+            if await cur.fetchone() is not None:
+                survivors.add(jid)
+    deleted = [jid for jid in job_ids if jid not in survivors]
+    if deleted:
+        await db.executemany(
+            "DELETE FROM job_audit_log WHERE job_id=?",
+            [(jid,) for jid in deleted],
+        )
+    return deleted
+
+
+@app.delete("/v1/jobs/{job_id}")
+async def delete_job(job_id: str, force: bool = False):
+    """Delete ONE job record (+ cascade its job_audit_log rows).
+
+    Refuses to delete an in-flight job (status running/claimed) unless
+    ?force=true, so a live worker is never orphaned. Returns {deleted:1} or 404.
+    """
+    async with connect_db() as db:
+        async with db.execute("SELECT status FROM jobs WHERE id=?", (job_id,)) as cur:
+            row = await cur.fetchone()
+        if not row:
+            raise HTTPException(404, f"job {job_id} not found")
+        status = row[0]
+        if status in ("running", "claimed") and not force:
+            raise HTTPException(
+                409,
+                f"job {job_id} is {status} (in-flight); pass ?force=true to delete anyway",
+            )
+        # allow_active=force: without force, the cascade re-checks status at delete
+        # time, so a queued/offered job that got CLAIMED in the race window is left
+        # intact (deleted=0) rather than orphaning the worker (codex review #3).
+        deleted = await _cascade_delete_jobs(db, [job_id], allow_active=force)
+        await db.commit()
+    if not deleted:
+        # Lost the race: the job became active (claimed) between read and delete.
+        raise HTTPException(
+            409,
+            f"job {job_id} became in-flight during delete; pass ?force=true to override",
+        )
+    async with connect_db() as event_db:
+        await emit_event(event_db, "job.deleted",
+                         {"id": job_id, "prior_status": status, "forced": force})
+    return {"deleted": 1, "id": job_id, "prior_status": status}
+
+
+class JobPurgeRequest(BaseModel):
+    kind_prefix: Optional[str] = None
+    status: Optional[str] = None
+    statuses: Optional[list[str]] = None
+    description_contains: Optional[str] = None
+    submitter_urn: Optional[str] = None
+    older_than_seconds: Optional[float] = None
+    ids: Optional[list[str]] = None
+    include_active: bool = False
+    reason: str = "housekeeping-purge"
+
+
+@app.post("/v1/jobs/purge")
+async def purge_jobs(req: JobPurgeRequest):
+    """Bulk housekeeping purge. JSON-body filters are AND-combined; at least one
+    filter is REQUIRED (an unfiltered purge is refused so nothing can delete
+    every job). By default jobs in an active status (queued/offered/claimed/
+    running/needs-review) are excluded; pass include_active=true to override.
+
+    older_than_seconds compares against COALESCE(ended_at, started_at) so a job
+    that has not yet ended is aged from when it entered the queue.
+
+    Returns {deleted:N, matched_ids:[...]}.
+    """
+    wheres: list[str] = []
+    params: list[Any] = []
+
+    statuses: list[str] = []
+    if req.status:
+        statuses.append(req.status)
+    if req.statuses:
+        statuses.extend(req.statuses)
+
+    # "Narrow" selectors target a specific subset of jobs (a kind, a submitter, a
+    # description fragment, or explicit ids). Age/status are "broad" — on their own
+    # they can match nearly the whole table. include_active=true bypasses the
+    # in-flight guard, so it MUST be paired with at least one narrow selector
+    # (codex review #2 round 2): age/status-only + include_active could otherwise
+    # delete ~all jobs incl. running ones.
+    has_narrow = any([
+        req.kind_prefix, req.description_contains, req.submitter_urn, req.ids,
+    ])
+    if req.include_active and not has_narrow:
+        raise HTTPException(
+            422,
+            "include_active=true requires a narrow selector "
+            "(kind_prefix / description_contains / submitter_urn / ids); "
+            "a broad age/status-only purge may not target in-flight jobs",
+        )
+
+    has_filter = any([
+        req.kind_prefix, statuses, req.description_contains,
+        req.submitter_urn, req.older_than_seconds is not None,
+        req.ids,
+    ])
+    if not has_filter:
+        raise HTTPException(
+            422,
+            "refusing unfiltered purge: supply at least one of "
+            "kind_prefix/status(es)/description_contains/submitter_urn/"
+            "older_than_seconds/ids",
+        )
+
+    if req.older_than_seconds is not None and req.older_than_seconds <= 0:
+        # A non-positive window yields a future/now cutoff -> COALESCE(...) < cutoff
+        # matches essentially every job. Refuse it so older_than_seconds can never
+        # be a delete-all wildcard (codex review #2).
+        raise HTTPException(422, "older_than_seconds must be > 0")
+    if req.kind_prefix:
+        # Escape LIKE metacharacters so a literal '%'/'_' in the prefix cannot turn
+        # into a match-all wildcard (codex review #2). 'kind%' anchors the prefix.
+        kp = (req.kind_prefix
+              .replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_"))
+        wheres.append("kind LIKE ? ESCAPE '\\'")
+        params.append(kp + "%")
+    if statuses:
+        wheres.append("status IN (%s)" % ",".join("?" for _ in statuses))
+        params.extend(statuses)
+    if req.description_contains:
+        wheres.append("description LIKE ?")
+        # escape LIKE metacharacters in caller input so % / _ are literal
+        esc = (req.description_contains
+               .replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_"))
+        params.append("%" + esc + "%")
+        # NB: ESCAPE clause appended below for the description predicate only
+        wheres[-1] = "description LIKE ? ESCAPE '\\'"
+    if req.submitter_urn:
+        wheres.append("submitter_urn=?")
+        params.append(req.submitter_urn)
+    if req.older_than_seconds is not None:
+        wheres.append("COALESCE(ended_at, started_at) < ?")
+        params.append(time.time() - float(req.older_than_seconds))
+    if req.ids:
+        wheres.append("id IN (%s)" % ",".join("?" for _ in req.ids))
+        params.extend(req.ids)
+
+    # Active-job guard: unless explicitly included, never match in-flight work.
+    if not req.include_active:
+        wheres.append(
+            "status NOT IN (%s)" % ",".join("?" for _ in ACTIVE_JOB_STATUSES)
+        )
+        params.extend(ACTIVE_JOB_STATUSES)
+
+    select_sql = "SELECT id FROM jobs WHERE " + " AND ".join(wheres)
+    async with connect_db() as db:
+        async with db.execute(select_sql, tuple(params)) as cur:
+            matched = [r[0] async for r in cur]
+        deleted: list[str] = []
+        if matched:
+            # allow_active mirrors include_active: when not including active jobs the
+            # cascade re-checks status at delete time, so a job that got claimed
+            # between SELECT and DELETE is skipped (atomic guard, codex review #3).
+            deleted = await _cascade_delete_jobs(
+                db, matched, allow_active=req.include_active)
+            await db.commit()
+    if deleted:
+        async with connect_db() as event_db:
+            await emit_event(event_db, "jobs.purged",
+                             {"count": len(deleted), "reason": req.reason})
+    return {"deleted": len(deleted), "matched_ids": deleted}
+
+
 # Admin reclassify is an explicit override of the normal transition guard, so the
 # target is restricted to a small safe set (e.g. dead-letter -> needs-review for a
 # human). Used by the doctor for ambiguous dead-letter jobs.
@@ -4491,3 +4773,81 @@ async def mcp_rpc(body: dict):
             return await list_messages(**params)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=400)
+
+
+# ===== zerocode-gate: pre-submission gate preview + release (patch) =====
+@app.get("/v1/jobs/{job_id}/preview")
+async def zcgate_get_preview(job_id: str):
+    """Return the zerocode-gate PreviewBundle stored on a needs-review job."""
+    async with connect_db() as db:
+        async with db.execute(
+            "SELECT result, status, repo, head_branch, pr_number FROM jobs WHERE id=?",
+            (job_id,),
+        ) as cur:
+            r = await cur.fetchone()
+    if not r:
+        raise HTTPException(404, f"job not found: {job_id}")
+    result = json.loads(r[0]) if r[0] else {}
+    preview = result.get("preview")
+    if not preview:
+        raise HTTPException(404, f"no preview bundle on job {job_id}")
+    return {"job_id": job_id, "status": r[1], "repo": r[2],
+            "head_branch": r[3], "pr_number": r[4], "preview": preview}
+
+
+@app.post("/v1/jobs/{job_id}/release")
+async def zcgate_release(job_id: str):
+    """Human-gated 'Release & Push': enqueue a release:<repo> job that a worker
+    claims and runs `zc-gate release` on (push branch + open upstream PR)."""
+    async with connect_db() as db:
+        async with db.execute("SELECT result, status FROM jobs WHERE id=?", (job_id,)) as cur:
+            r = await cur.fetchone()
+    if not r:
+        raise HTTPException(404, f"job not found: {job_id}")
+    result = json.loads(r[0]) if r[0] else {}
+    preview = result.get("preview")
+    if not preview:
+        raise HTTPException(404, f"no preview bundle on job {job_id}")
+    if (preview.get("verdict") or "").lower() == "blocked":
+        raise HTTPException(409, "bundle verdict is blocked; not releasable")
+    if result.get("release_job_id"):
+        return {"ok": True, "already": True, "release_job_id": result["release_job_id"]}
+    async with connect_db() as db:
+        async with db.execute(
+            "SELECT urn FROM agents WHERE runtime IN ('mnemos','human','claude-code','claude') "
+            "AND status != 'offline' ORDER BY last_heartbeat DESC LIMIT 1"
+        ) as cur:
+            o = await cur.fetchone()
+    if not o:
+        raise HTTPException(503, "no active orchestrator to submit the release job")
+    submitter = o[0]
+    repo = preview.get("repo") or "zeroclaw-labs/zeroclaw"
+    rel = await create_job(JobCreate(
+        submitter_urn=submitter,
+        kind="release:zeroclaw",
+        description=job_id,
+        eligible_kinds=["zeroclaw"],
+        eligible_hosts=["zcgate-release-sink"],
+        priority=5,
+    ))
+    rel_id = rel.get("id") if isinstance(rel, dict) else None
+    result["release_job_id"] = rel_id
+    result["release_requested_at"] = time.time()
+    async with connect_db() as db:
+        await db.execute("UPDATE jobs SET result=? WHERE id=?",
+                         (json.dumps(result), job_id))
+        await db.commit()
+    return {"ok": True, "release_job_id": rel_id, "repo": repo, "submitter": submitter}
+# ===== end zerocode-gate patch =====
+
+
+# ===== zerocode-gate static mount =====
+try:
+    from fastapi.staticfiles import StaticFiles as _ZCStatic
+    import os as _zcos
+    _zcdir = "/srv/agent-bus/static"
+    _zcos.makedirs(_zcdir, exist_ok=True)
+    app.mount("/static", _ZCStatic(directory=_zcdir), name="zcstatic")
+except Exception as _zce:
+    print("zcgate static mount failed:", _zce, flush=True)
+# ===== end zerocode-gate static mount =====
