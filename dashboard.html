@@ -192,7 +192,47 @@ small.dim{font-size:.85em}
 </style>
 </head>
 <body>
-<h1>🐝 GRAEAE Hive Mind</h1>
+<link rel="stylesheet" href="/static/diff2html.min.css">
+<script src="/static/diff2html.min.js"></script>
+<style>
+#needsreview-panel h2{color:#d29922}
+#review-backdrop{display:none;position:fixed;inset:0;background:rgba(1,4,9,.92);-webkit-backdrop-filter:blur(3px);backdrop-filter:blur(3px);z-index:120;overflow-y:auto;padding:1em}
+#review-backdrop.open{display:flex;align-items:flex-start;justify-content:center}
+#review-modal{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:1em 1.2em;max-width:1150px;width:97%;margin:1em auto;position:relative;box-shadow:0 0 0 9999px rgba(1,4,9,.55),0 18px 60px rgba(0,0,0,.7)}
+#review-modal h3{color:#58a6ff;margin:.1em 2em .3em 0;font-size:1.05em}
+#review-modal .modal-close{position:absolute;top:.5em;right:.6em;background:none;border:none;color:#8b949e;font-size:1.3em;cursor:pointer}
+#review-modal .modal-meta{color:#8b949e;font-size:.85em;margin-bottom:.5em}
+/* position:relative is REQUIRED: diff2html's line-number gutters are
+   position:absolute with no positioned ancestor of their own, so inside the
+   position:relative #review-modal they anchor to the MODAL and escape this
+   scroll box (gutter bars bleed below the modal). Making this the containing
+   block keeps the absolute gutters clipped + scrolling with the diff. */
+.d2h-wrap{max-height:62vh;overflow:auto;border:1px solid #30363d;border-radius:6px;margin-top:.5em;background:#0d1117;position:relative}
+.d2h-wrap pre{margin:0}
+/* Single-author build preview: show only the new-line number (the old number is
+   noise here) and let it fill the native gutter. This also eliminates the
+   float-wrap "ghost" number, since there's now only one number per gutter. */
+.d2h-wrap .line-num1{display:none}
+.d2h-wrap .line-num2{float:none;width:100%;text-align:right}
+/* keep each changed-file header pinned while scrolling long hunks */
+.d2h-wrap .d2h-file-header{position:sticky;top:0;z-index:2;background:#161b22}
+.nr-leg{display:inline-block;padding:.1em .55em;margin:.12em;border-radius:10px;font-size:.8em;border:1px solid #30363d;background:#0d1117}
+.nr-pass{color:#7ee787;border-color:#238636}
+.nr-fail{color:#f85149;border-color:#f85149}
+.nr-warn{color:#d29922;border-color:#9e6a03}
+.nr-skip{color:#6e7681}
+.verdict-needs-review,.verdict-needsreview{color:#d29922;font-weight:bold}
+.verdict-green{color:#7ee787;font-weight:bold}
+.verdict-blocked{color:#f85149;font-weight:bold}
+.rc-issue{color:#58a6ff;text-decoration:none;font-weight:bold;margin:0 .3em}
+.rc-issue:hover{text-decoration:underline}
+.ci-table{width:100%;border-collapse:collapse;margin:.3em 0;font-size:.85em}
+.ci-table th,.ci-table td{text-align:left;padding:.25em .5em;border-bottom:1px solid #21262d;vertical-align:top}
+.ci-table th{color:#8b949e;font-weight:600}
+.ci-table summary{cursor:pointer;color:#58a6ff}
+.ci-out{margin:.3em 0 0;padding:.5em;background:#0d1117;border:1px solid #21262d;border-radius:6px;max-height:240px;overflow:auto;white-space:pre-wrap;color:#c9d1d9;font-size:.92em}
+</style>
+<h1>🐝 GRAEAE Hive Mind <span style="font-size:.4em;color:#6e7681;font-weight:normal;vertical-align:middle">ui rev 2026-06-21b</span></h1>
 <div id="cap-banner" style="display:none;margin:.4em 0;padding:.5em .8em;border-radius:6px;background:#3d2b00;border:1px solid #8a6d00;color:#ffd866;font-size:.9em"></div>
 <div class="meta">
   <span id="meta-time">connecting…</span>
@@ -286,6 +326,11 @@ small.dim{font-size:.85em}
 
 <!-- Main Grid -->
 <div class="grid">
+  <div class="panel full-width" id="needsreview-panel">
+    <h2>🔎 Needs Review — Pre-Submission Gate <span class="cnt" id="needsreview-cnt"></span></h2>
+    <div id="needsreview-list" style="font-size:.82em"></div>
+  </div>
+
   <div class="panel">
     <h2>Queue <span class="cnt" id="queue-cnt"></span></h2>
     <div style="max-height:420px;overflow-y:auto">
@@ -382,6 +427,21 @@ small.dim{font-size:.85em}
       <pre id="modal-raw"></pre>
     </div>
     <div class="modal-actions" id="modal-actions"></div>
+  </div>
+</div>
+
+<!-- PR Preview / Release Modal (zerocode-gate) -->
+<div id="review-backdrop" onclick="closeReview(event)">
+  <div id="review-modal" onclick="event.stopPropagation()">
+    <button class="modal-close" onclick="closeReviewBtn()">✕</button>
+    <h3 id="rv-title">PR Preview</h3>
+    <div class="modal-meta" id="rv-meta"></div>
+    <div id="rv-evidence"></div>
+    <div id="rv-diff" class="d2h-wrap"></div>
+    <div class="modal-actions" style="margin-top:.6em;display:flex;gap:.6em;align-items:center">
+      <button class="btn btn-primary" id="rv-release-btn" onclick="releaseCurrent()">🚀 Release &amp; Push (open PR)</button>
+      <span id="rv-status" style="font-size:.82em;color:#7ee787"></span>
+    </div>
   </div>
 </div>
 
@@ -1214,6 +1274,153 @@ function renderCapBanner(){
   el.innerHTML='\u23f3 <b>OpenAI OAuth cap reported, unverified</b> \u2014 '+model+reporter+' reported usage_limit at <b>'+esc(hit)+'</b>. Most jobs route fallback; ~5% are OAuth probes. Auto-clear in <b>'+h+'h '+String(m).padStart(2,'0')+'m '+String(sc).padStart(2,'0')+'s</b> unless a success report clears it first.';
 }
 setInterval(renderCapBanner,1000);
+// ── zerocode-gate: Needs Review queue + PR preview + release ──────────
+// DESIGNATED projects only: the pre-submission gate (needs-review queue, PR
+// preview, Release & Push) applies ONLY to these. Every other project is direct
+// commit/push and must NOT surface gate UI. Keep this in sync with the worker
+// no-push tail's GATED set.
+const GATED_PROJECTS=['zeroclaw'];
+// Interim hold (handoff 2026-06-21): these 7 drafts were reviewed-but-unbuilt
+// (review-only, no fix-in-place, steps=0). Block Release until they are re-run
+// through the fix-in-place loop + real ci-sim. 3 are security-sensitive.
+const BLOCKED_JOBS={
+  '019ee895-7409-7c7f-9d3f-91032ec03603':'#6157 nextcloud bot API (security)',
+  '019ee895-73c9-73fc-9ac9-97f790f56bee':'#7882 delegate await_sessions',
+  '019ee895-7382-7897-ba58-35502d59e966':'#6637 sse /api/events (security)',
+  '019ee895-7332-78be-b198-6edf02909396':'#7742 refresh prompt',
+  '019ee895-72f3-79d7-82ed-b88659a74d8c':'#7861 skills surface',
+  '019ee895-72ad-76f9-9249-9631904441f9':'#2091 telegram token mask (security)',
+  '019ee889-04f4-7c05-bafa-d9b177c0463d':'#2128 cron NO_REPLY'
+};
+function blockReason(id){ return BLOCKED_JOBS[id]||null; }
+function jobProject(j){
+  const k=(j&&j.kind||'');
+  if(k.indexOf(':')>=0){ const s=k.split(':').pop().trim().toLowerCase(); if(s) return s; }
+  const r=(j&&j.repo||''); if(r) return r.split('/').pop().toLowerCase();
+  return '';
+}
+function isGated(j){ return GATED_PROJECTS.indexOf(jobProject(j))>=0; }
+function parseIssue(text){
+  const s=String(text||'');
+  let m=s.match(/([A-Za-z0-9_.\-]+\/[A-Za-z0-9_.\-]+)#(\d+)/);
+  if(m) return {slug:m[1],num:m[2]};
+  m=s.match(/#(\d+)/);
+  if(m) return {slug:null,num:m[1]};
+  return null;
+}
+function issueInfo(p,j){
+  if(p&&p.source_issue_url) return {url:p.source_issue_url,num:p.source_issue,slug:p.repo_slug};
+  const slugHint=(p&&(p.repo_slug||p.repo))||(j&&j.repo)||'zeroclaw-labs/zeroclaw';
+  const pi=parseIssue((j&&j.description)||(p&&p.title)||'');
+  if(!pi||!pi.num) return null;
+  const slug=pi.slug||slugHint;
+  return {url:'https://github.com/'+slug+'/issues/'+pi.num,num:pi.num,slug:slug};
+}
+let _reviewJobId=null;
+function verdictCls(v){return 'verdict-'+String(v||'').toLowerCase().replace(/[^a-z]/g,'');}
+async function refreshNeedsReview(){
+  let d;
+  try{ d=await api('GET','/v1/jobs?status=needs-review&limit=100'); }catch(e){ d={jobs:[]}; }
+  let jobs=((d&&d.jobs)||(Array.isArray(d)?d:[])).filter(Boolean);
+  // Gate is scoped to designated projects; all others are direct commit/push.
+  jobs=jobs.filter(isGated);
+  const cntEl=document.getElementById('needsreview-cnt'); if(cntEl)cntEl.textContent='('+jobs.length+')';
+  const el=document.getElementById('needsreview-list'); if(!el)return;
+  if(!jobs.length){ el.innerHTML='<div class="dim">No designated-project builds awaiting review.</div>'; return; }
+  el.innerHTML='';
+  for(const j of jobs){
+    const res=j.result||{};
+    const hasPreview=!!(res&&res.preview);
+    const heldReason=blockReason(j.id);
+    const verdict=heldReason?'blocked':((res.preview&&res.preview.verdict)||res.verdict||'needs-review');
+    const released=res.release_job_id;
+    const ii=issueInfo(res.preview,j);
+    const card=document.createElement('div');
+    card.className='result-card';
+    card.innerHTML=`<div class="rc-head">
+      <span class="rc-kind">${esc(j.kind||'')}</span>
+      <span class="${verdictCls(verdict)}">${esc(verdict)}</span>
+      <span class="rc-id">${esc((j.id||'').slice(0,20))}</span>
+      ${ii?`<a class="rc-issue" href="${esc(ii.url)}" target="_blank" rel="noopener" title="${esc(ii.slug||'')}#${esc(ii.num)}" onclick="event.stopPropagation()">↗ #${esc(ii.num)}</a>`:''}
+      ${released?'<span class="dim">· release queued '+esc(String(released).slice(0,10))+'</span>':''}
+      <span style="flex:1"></span>
+      <span class="rc-time dim" title="build completed (hover: created)" data-created="${(j.created_at?new Date(j.created_at*1000).toLocaleString():'')}">${(j.ended_at||j.updated_at||j.created_at)?'🕑 '+new Date((j.ended_at||j.updated_at||j.created_at)*1000).toLocaleString():''}</span>
+      ${hasPreview?`<button class="btn btn-primary btn-sm" onclick="openReview('${esc(j.id)}');event.stopPropagation()">Preview</button>`:'<span class="dim">no preview bundle</span>'}
+    </div>
+    <div class="rc-body">${esc((j.description||'').slice(0,200))}</div>`;
+    el.appendChild(card);
+  }
+}
+async function openReview(id){
+  _reviewJobId=id;
+  document.getElementById('review-backdrop').className='open';
+  document.getElementById('rv-meta').textContent='loading…';
+  document.getElementById('rv-evidence').innerHTML='';
+  document.getElementById('rv-diff').innerHTML='';
+  document.getElementById('rv-status').textContent='';
+  let d;
+  try{ d=await api('GET','/v1/jobs/'+id+'/preview'); }
+  catch(e){ document.getElementById('rv-meta').textContent='error: '+e; return; }
+  const p=d.preview||{};
+  document.getElementById('rv-title').textContent='PR Preview · '+(p.repo||d.repo||'')+' · '+(p.base_branch||'')+' ← '+(p.head_branch||'');
+  const shownVerdict=blockReason(id)?'blocked':p.verdict;
+  let meta=`verdict <b class="${verdictCls(shownVerdict)}">${esc(shownVerdict)}</b> · stack ${esc(p.spec&&p.spec.stack)} · forge ${esc(p.spec&&p.spec.forge)} · mode ${esc(p.mode)}`;
+  const ii=issueInfo(p,null);
+  if(ii) meta+=` · source issue <a class="rc-issue" href="${esc(ii.url)}" target="_blank" rel="noopener">${esc(ii.slug||'')}#${esc(ii.num)}</a>`;
+  const rs=p.repo_slug||p.repo;
+  if(rs&&/.+\/.+/.test(rs)) meta+=` · <a class="rc-issue" href="https://github.com/${esc(rs)}" target="_blank" rel="noopener">repo ↗</a>`;
+  document.getElementById('rv-meta').innerHTML=meta;
+  const ev=p.evidence||{};
+  const steps=ev.steps||[];
+  let h='<div style="margin:.3em 0">';
+  for(const s of steps) h+=`<span class="nr-leg nr-${esc(s.status)}">${esc(s.name)}: ${esc(s.status)}${(s.exit_code!=null)?' ('+esc(s.exit_code)+')':''}</span>`;
+  if(ev.review_verdict) h+=`<span class="nr-leg">review: ${esc(ev.review_verdict)}</span>`;
+  if(ev.runtime_exercise) h+=`<span class="nr-leg nr-${esc(ev.runtime_exercise.status)}">runtime: ${esc(ev.runtime_exercise.status)}</span>`;
+  if(ev.regression) h+=`<span class="nr-leg nr-${esc(ev.regression.status)}">regression: ${esc(ev.regression.status)}</span>`;
+  h+=`<span class="nr-leg">conv-commit: ${ev.conventional_commit?'yes':'no'}</span>`;
+  h+=`<span class="nr-leg">privacy: ${ev.privacy_clean?'clean':'flag'}</span></div>`;
+  if(steps.length){
+    h+=`<div style="margin:.5em 0 .2em"><b>CI tests</b> <span class="dim">· ${steps.length} legs enforced locally by the gate</span></div>`;
+    h+='<table class="ci-table"><thead><tr><th>Leg</th><th>Status</th><th>Exit</th><th>Time</th><th>Detail</th></tr></thead><tbody>';
+    for(const s of steps){
+      const secs=(s.duration_ms!=null)?(Math.round(s.duration_ms/100)/10+'s'):'';
+      h+=`<tr><td>${esc(s.name)}</td><td class="nr-${esc(s.status)}">${esc(s.status)}</td><td>${esc(s.exit_code)}</td><td>${esc(secs)}</td>`+
+         `<td><details><summary>output</summary><div class="dim" style="font-family:monospace;font-size:.82em;margin:.2em 0">$ ${esc(s.command||'')}</div><pre class="ci-out">${esc(s.output_tail||'(no output captured)')}</pre></details></td></tr>`;
+    }
+    h+='</tbody></table>';
+  } else {
+    h+='<div class="dim" style="margin:.4em 0">No CI legs recorded (built before CI-leg capture, or CI disabled).</div>';
+  }
+  document.getElementById('rv-evidence').innerHTML=h;
+  const diffStr=p.patch||'';
+  const dv=document.getElementById('rv-diff');
+  try{
+    if(window.Diff2Html&&diffStr.trim()){
+      dv.innerHTML=Diff2Html.html(diffStr,{drawFileList:true,matching:'lines',outputFormat:'line-by-line',colorScheme:'dark'});
+    }else{
+      dv.innerHTML='<pre style="padding:.6em;white-space:pre-wrap;color:#c9d1d9">'+esc(diffStr||'(empty diff)')+'</pre>';
+    }
+  }catch(e){ dv.innerHTML='<pre style="padding:.6em;white-space:pre-wrap;color:#c9d1d9">'+esc(diffStr)+'</pre>'; }
+  const rb=document.getElementById('rv-release-btn');
+  const held=blockReason(id);
+  if(held){ rb.disabled=true; rb.textContent='Interim hold — rebuild pending ('+held+')'; }
+  else if(String(p.verdict||'').toLowerCase()==='blocked'){ rb.disabled=true; rb.textContent='Blocked — cannot release'; }
+  else{ rb.disabled=false; rb.innerHTML='🚀 Release &amp; Push (open PR)'; }
+}
+async function releaseCurrent(){
+  if(!_reviewJobId)return;
+  const rb=document.getElementById('rv-release-btn'), st=document.getElementById('rv-status');
+  if(!confirm('Release & Push: pushes the branch and opens an upstream PR for human merge. Continue?'))return;
+  rb.disabled=true; st.textContent='releasing…';
+  try{
+    const r=await api('POST','/v1/jobs/'+_reviewJobId+'/release');
+    st.textContent='release queued: '+(r.release_job_id||'ok');
+    refreshNeedsReview().catch(()=>{});
+  }catch(e){ st.textContent='error: '+e; rb.disabled=false; }
+}
+function closeReview(e){ if(e&&e.target===document.getElementById('review-backdrop'))closeReviewBtn(); }
+function closeReviewBtn(){ document.getElementById('review-backdrop').className=''; }
+
 async function refreshAll(){
   document.getElementById('meta-time').textContent=`last refresh ${new Date().toLocaleTimeString()} · auto 8s`;
   try{
@@ -1221,7 +1428,7 @@ async function refreshAll(){
       refreshRunning(),refreshAgents(),refreshJobs(),refreshResults(),refreshCapBanner(),
       refreshFailed(),refreshCosts(),refreshWorkers(),refreshSchedules(),
       refreshHosts(),refreshGPU(),
-      refreshRemote(),
+      refreshRemote(),refreshNeedsReview(),
     ]);
   }catch(e){document.getElementById('meta-time').textContent='error: '+e;}
 }
