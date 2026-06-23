@@ -153,7 +153,14 @@ small.dim{font-size:.85em}
 .worker-card .wc-kind-badge{background:#1a4d2e;color:#7ee787;padding:.05em .35em;border-radius:3px;font-size:.75em}
 .worker-card .wc-job{font-size:.8em;color:#a5d6ff;font-weight:600;margin-bottom:.15em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .worker-card .wc-desc{font-size:.75em;color:#8b949e;max-height:2.8em;overflow:hidden;line-height:1.4}
-.worker-card .wc-meta{font-size:.72em;color:#6e7681;margin-top:.3em;display:flex;gap:.5em}
+.worker-card .wc-meta{font-size:.72em;color:#6e7681;margin-top:.3em;display:flex;gap:.5em;flex-wrap:wrap}
+.worker-card .wc-jobs{margin:.2em 0 .1em;display:flex;flex-direction:column;gap:.18em}
+.worker-card .wc-jobline{font-size:.74em;display:flex;gap:.4em;align-items:baseline;overflow:hidden}
+.worker-card .wc-jk{color:#a5d6ff;font-weight:600;flex:none}
+.worker-card .wc-jr{color:#d2a8ff;font-family:monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.worker-card .wc-jm{color:#7ee787;margin-left:auto;flex:none}
+.worker-card .wc-jp{color:#6e7681}
+.worker-card .wc-models{color:#7ee787}
 .worker-card .wc-dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#238636;animation:pulse 1.5s infinite}
 .worker-card.idle .wc-dot{background:#6e7681;animation:none}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
@@ -751,7 +758,7 @@ async function refreshRunning(){
     const h=hosts[host]||(hosts[host]={host,total:0,busy:0,jobs:[]});
     h.total++;
     const j=byClaimer[a.urn];
-    if(j){ h.busy++; h.jobs.push(j); }
+    if(j){ h.busy++; j._model=a.model||(j.result&&(j.result.alias||j.result.model))||'?'; j._provider=a.provider||''; h.jobs.push(j); }
   }
   let list=Object.values(hosts);
   let degraded=false;
@@ -765,7 +772,7 @@ async function refreshRunning(){
       if(parts[2]!=='zeroclaw') continue;
       const host=parts[3]||'?';
       const h=hg[host]||(hg[host]={host,total:0,busy:0,jobs:[]});
-      h.total++; h.busy++; h.jobs.push(j);
+      h.total++; h.busy++; j._model=(j.result&&(j.result.alias||j.result.model))||'?'; j._provider=(j.result&&j.result.provider)||''; h.jobs.push(j);
     }
     list=Object.values(hg);
   }
@@ -783,13 +790,22 @@ async function refreshRunning(){
     const card=document.createElement('div');
     card.className='worker-card'+(h.busy?'':' idle');
     if(h.busy){ const j0=h.jobs[0]; card.onclick=()=>showJobModal(j0); }
-    const jobKinds=h.jobs.map(j=>esc(j.kind||'?')).join(', ');
+    const jobRows=h.jobs.map(j=>{
+      const repo=esc(String(j.repo||(j.result&&j.result.repo)||'\u2014'));
+      const model=esc(j._model||'?');
+      const prov=j._provider?` <span class="wc-jp">${esc(j._provider)}</span>`:'';
+      return `<div class="wc-jobline" title="${esc((j.kind||'?')+' \u00b7 '+(j.repo||'\u2014')+' \u00b7 '+(j._model||'?'))}">`+
+             `<span class="wc-jk">${esc(j.kind||'?')}</span>`+
+             `<span class="wc-jr">${repo}</span>`+
+             `<span class="wc-jm">${model}${prov}</span></div>`;
+    }).join('');
+    const models=[...new Set(h.jobs.map(j=>j._model).filter(m=>m&&m!=='?'))];
     card.innerHTML=`
       <div class="wc-agent"><span class="wc-dot"></span>
         <span class="wc-kind-badge">zeroclaw</span> ${esc(h.host)}</div>
       <div class="wc-job">${h.busy}/${h.total} active</div>
-      <div class="wc-desc${h.busy?'':' dim'}">${h.busy?jobKinds:'all idle \u00b7 waiting for work'}</div>
-      <div class="wc-meta"><span>${h.total} worker${h.total===1?'':'s'}</span><span>${h.busy} busy</span></div>`;
+      ${h.busy?`<div class="wc-jobs">${jobRows}</div>`:`<div class="wc-desc dim">all idle \u00b7 waiting for work</div>`}
+      <div class="wc-meta"><span>${h.total} worker${h.total===1?'':'s'}</span><span>${h.busy} busy</span>${models.length?`<span class="wc-models" title="models in use">\u2699 ${esc(models.join(', '))}</span>`:''}</div>`;
     grid.appendChild(card);
   }
 }
