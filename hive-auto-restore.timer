@@ -1,0 +1,12 @@
+[Unit]
+Description=Run hive auto-restore every 5 minutes
+After=multi-user.target
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=10sec
+Unit=hive-auto-restore.service
+
+[Install]
+WantedBy=timers.target

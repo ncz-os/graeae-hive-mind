@@ -1,0 +1,8 @@
+__pycache__/
+*.db
+*.pyc
+*.pyo
+mnemos/
+*.bak-*
+*.bak
+workspace_remotes.json
