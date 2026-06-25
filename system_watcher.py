@@ -32,6 +32,7 @@ import urllib.error
 import signal
 
 HIVE_URL = os.environ.get("HIVE_URL", "http://192.168.207.67:5005")
+HIVE_BUS_TOKEN = os.environ.get("HIVE_BUS_TOKEN", "").strip()
 AGENT_HOST = os.environ.get("AGENT_HOST", socket.gethostname().split(".")[0])
 HEARTBEAT_INTERVAL = float(os.environ.get("HEARTBEAT_INTERVAL", "15"))
 CLAIM_JOBS = os.environ.get("CLAIM_JOBS", "0") == "1"
@@ -53,7 +54,10 @@ signal.signal(signal.SIGINT, _signal)
 def _http(method: str, path: str, body: dict | None = None) -> tuple[int, dict | None]:
     url = f"{HIVE_URL}{path}"
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(url, data=data, method=method, headers={"content-type": "application/json"})
+    headers = {"content-type": "application/json"}
+    if HIVE_BUS_TOKEN:
+        headers["authorization"] = f"Bearer {HIVE_BUS_TOKEN}"
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
             raw = r.read()

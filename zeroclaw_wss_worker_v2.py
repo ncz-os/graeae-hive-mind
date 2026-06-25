@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 import wss_driver  # noqa: E402
 
 HIVE_URL = os.environ.get("HIVE_URL", "http://192.168.207.67:5005")
+HIVE_BUS_TOKEN = os.environ.get("HIVE_BUS_TOKEN", "").strip()
 # MNEMOS — the commit-DAG store. The worker records every meaningful completed
 # job + its commits here so OTHER agents can cross-reference prior work and
 # link future work (GRAEAE-blessed arch 2026-06-01). On the Spark this is the
@@ -256,8 +257,10 @@ log = logging.getLogger("wss-worker")
 def http(method, path, body=None, timeout=20):
     url = HIVE_URL + path
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(url, data=data, method=method,
-                                  headers={"content-type": "application/json"})
+    headers = {"content-type": "application/json"}
+    if HIVE_BUS_TOKEN:
+        headers["authorization"] = f"Bearer {HIVE_BUS_TOKEN}"
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             txt = r.read()

@@ -44,6 +44,38 @@ EVENT_QUEUE: dict[str, asyncio.Queue] = {}  # subscriber_id -> queue
 SQLITE_BUSY_TIMEOUT_MS = int(os.environ.get("AGENT_BUS_SQLITE_BUSY_TIMEOUT_MS", "5000"))
 MAX_EVENT_SUBSCRIBERS = int(os.environ.get("AGENT_BUS_MAX_EVENT_SUBSCRIBERS", "100"))
 
+# ---- Bus authentication (defense-in-depth) -------------------------------
+# The LAN is trusted, but the mutating surface (register / job create / claim /
+# message / schedule) is also the trigger for the auto-approving WSS worker
+# path — an off-LAN or compromised host reaching :5005 can inject a job that
+# executes arbitrary code on a worker. Lock writes behind a bearer token.
+#
+# Mirrors the mcp_bridge MNEMOS_TOKEN convention: NO source-baked default. When
+# unset the bus stays fully open (Phase-1 behavior) so deploying this code
+# changes nothing until a token is rolled out to clients and set here. Accept a
+# comma-separated list (via HIVE_BUS_TOKEN and/or HIVE_BUS_TOKENS) so tokens can
+# be rotated without a flag-day — old and new are valid simultaneously.
+def _load_bus_tokens() -> set[str]:
+    raw = os.environ.get("HIVE_BUS_TOKEN", "") + "," + os.environ.get("HIVE_BUS_TOKENS", "")
+    return {t.strip() for t in raw.split(",") if t.strip()}
+
+
+HIVE_BUS_TOKENS = _load_bus_tokens()
+# Read-only verbs stay open so the dashboard + SSE stream keep working on the
+# trusted LAN without distributing a token to browsers; every state-changing
+# verb requires the bearer token.
+_BUS_AUTH_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+_BUS_AUTH_EXEMPT_PATHS = frozenset({"/health", "/"})
+if not HIVE_BUS_TOKENS:
+    print(
+        "[agent_bus] WARNING: HIVE_BUS_TOKEN unset — mutating endpoints "
+        "(register/job/claim/message/schedule) are UNAUTHENTICATED. Safe on a "
+        "trusted LAN; set HIVE_BUS_TOKEN (and roll it to clients) before the "
+        "bus is reachable off-LAN.",
+        file=sys.stderr,
+        flush=True,
+    )
+
 
 _TABLE_MAP = {
     "agents": "hive_agents",
@@ -1640,6 +1672,29 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="GRAEAE Hive Mind", version="0.1.0", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def _bus_auth_middleware(request: Request, call_next):
+    """Require a bearer token for state-changing requests when HIVE_BUS_TOKENS
+    is configured. No-op when unset (open Phase-1 behavior). Read-only verbs
+    and /health + / (dashboard) stay open."""
+    if (
+        HIVE_BUS_TOKENS
+        and request.method not in _BUS_AUTH_SAFE_METHODS
+        and request.url.path not in _BUS_AUTH_EXEMPT_PATHS
+    ):
+        authz = request.headers.get("authorization", "")
+        token = authz[7:].strip() if authz[:7].lower() == "bearer " else ""
+        if not token or not any(secrets.compare_digest(token, t) for t in HIVE_BUS_TOKENS):
+            return JSONResponse(
+                {
+                    "detail": "unauthorized: missing or invalid Hive bus token "
+                    "(send Authorization: Bearer <HIVE_BUS_TOKEN>)"
+                },
+                status_code=401,
+            )
+    return await call_next(request)
 
 
 # ---------- endpoints ----------

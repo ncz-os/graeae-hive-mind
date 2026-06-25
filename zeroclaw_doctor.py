@@ -59,6 +59,7 @@ from collections import deque
 from urllib.parse import quote
 
 HIVE_URL = os.environ.get("HIVE_URL", "http://192.168.207.67:5005")
+HIVE_BUS_TOKEN = os.environ.get("HIVE_BUS_TOKEN", "").strip()
 ZEROCLAW_BIN = os.environ.get("ZEROCLAW_BIN", "/usr/local/bin/zeroclaw")
 DOCTOR_AGENT_ALIAS = os.environ.get("DOCTOR_AGENT_ALIAS", "hive_doctor")
 AGENT_HOST = os.environ.get("AGENT_HOST", socket.gethostname().split(".")[0])
@@ -193,8 +194,10 @@ signal.signal(signal.SIGINT, _signal)
 def _http(method: str, path: str, body: dict | None = None, timeout: float = 15.0) -> tuple[int, dict | None]:
     url = f"{HIVE_URL}{path}"
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(url, data=data, method=method,
-                                 headers={"content-type": "application/json"})
+    headers = {"content-type": "application/json"}
+    if HIVE_BUS_TOKEN:
+        headers["authorization"] = f"Bearer {HIVE_BUS_TOKEN}"
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             raw = r.read()

@@ -24,6 +24,7 @@ Tools:
 from __future__ import annotations
 import json
 import os
+import secrets
 import sys
 from contextlib import asynccontextmanager
 from typing import Any
@@ -35,6 +36,7 @@ from mcp.server.models import InitializationOptions
 from mcp.server.sse import SseServerTransport
 from mcp.types import Tool, TextContent, Resource, Prompt
 from starlette.applications import Starlette
+from starlette.responses import JSONResponse
 from starlette.routing import Mount, Route
 
 HIVE_URL = os.environ.get("HIVE_URL", "http://127.0.0.1:5005")
@@ -46,6 +48,16 @@ MNEMOS_URL = os.environ.get("MNEMOS_URL", "http://192.168.207.67:5002")
 # EnvironmentFile or container env); when missing, calls to /v1/memories/*
 # return a clear MCP tool error instead of being silently unauthenticated.
 MNEMOS_TOKEN = os.environ.get("MNEMOS_TOKEN", "")
+# Hive bus bearer token (see agent_bus.py). Forwarded upstream to the locked
+# bus AND enforced on this bridge's own inbound message POSTs, so the bridge is
+# not an unauthenticated bypass of the bus lock. No source-baked default; when
+# unset the bridge stays open (Phase-1 behavior) and nothing changes.
+HIVE_BUS_TOKEN = os.environ.get("HIVE_BUS_TOKEN", "").strip()
+HIVE_BUS_TOKENS = {
+    t.strip()
+    for t in (HIVE_BUS_TOKEN + "," + os.environ.get("HIVE_BUS_TOKENS", "")).split(",")
+    if t.strip()
+}
 
 server = Server("graeae-hive-mind")
 client = httpx.AsyncClient(timeout=15.0)
@@ -60,7 +72,10 @@ async def lifespan(app):
 
 
 async def _hive(method: str, path: str, **kw) -> dict:
-    r = await client.request(method, f"{HIVE_URL}{path}", **kw)
+    headers = kw.pop("headers", {})
+    if HIVE_BUS_TOKEN:
+        headers["Authorization"] = f"Bearer {HIVE_BUS_TOKEN}"
+    r = await client.request(method, f"{HIVE_URL}{path}", headers=headers, **kw)
     r.raise_for_status()
     if r.status_code == 204:
         return {"_status": 204, "_note": "no eligible job"}
@@ -308,6 +323,22 @@ app = Starlette(
         Mount("/messages/", app=sse.handle_post_message),
     ],
 )
+
+
+@app.middleware("http")
+async def _bridge_auth_middleware(request, call_next):
+    """Require the Hive bus bearer token on inbound message POSTs when
+    HIVE_BUS_TOKENS is configured. No-op when unset. The /sse GET stream stays
+    open (it carries no tool calls); tool invocations arrive via POST."""
+    if HIVE_BUS_TOKENS and request.method not in ("GET", "HEAD", "OPTIONS"):
+        authz = request.headers.get("authorization", "")
+        token = authz[7:].strip() if authz[:7].lower() == "bearer " else ""
+        if not token or not any(secrets.compare_digest(token, t) for t in HIVE_BUS_TOKENS):
+            return JSONResponse(
+                {"detail": "unauthorized: missing or invalid Hive bus token"},
+                status_code=401,
+            )
+    return await call_next(request)
 
 
 if __name__ == "__main__":
