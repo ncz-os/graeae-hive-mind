@@ -78,6 +78,13 @@ CODEX_REVIEW_KINDS_PREFIXES = ("codex", "review:", "doctor:codex-fix")
 # Back-compat alias (older name); same value — codex is review-only either way.
 CODEX_KINDS_PREFIXES = CODEX_REVIEW_KINDS_PREFIXES
 
+# zeroclaw-family worker aliases that, like the literal "zeroclaw" kind,
+# have no orchestrator handler here. Stripped from eligible_kinds when a
+# worker with no workspace handler releases a job back to a claude/codex
+# orchestrator (see the no-handler release path below). Defining this fixes
+# a latent NameError on that path (ruff F821).
+_ZEROCLAW_PROVIDER_ALIASES = frozenset({"zoder"})
+
 # kind-prefix → (subdir under ~/codex-workspace, git_url-or-None)
 KIND_WORKSPACE_MAP = {
     "argonaut:dbpr-site-scaffold-single-multivertical": ("florida-licenses", None),
