@@ -23,6 +23,7 @@ from pathlib import Path
 HIVE_URL = os.environ.get("HIVE_URL", "http://192.168.207.67:5005")
 # C1: bus transport auth bearer token (env-sourced, never baked in).
 HIVE_BUS_TOKEN = os.environ.get("HIVE_BUS_TOKEN", "")
+HIVE_BUS_ADMIN_TOKEN = os.environ.get("HIVE_BUS_ADMIN_TOKEN", HIVE_BUS_TOKEN)
 STATE_DIR = Path("/var/lib/hive-auto-restore")
 STATE_FILE = STATE_DIR / "retry_counts.json"
 LOG_FILE = "/var/log/hive-auto-restore.log"
@@ -54,12 +55,14 @@ def save_state(state):
     tmp.write_text(json.dumps(state))
     tmp.replace(STATE_FILE)
 
-def _http(method: str, path: str, body: dict | None = None, timeout: float = 15.0) -> tuple[int, dict | None]:
+def _http(method: str, path: str, body: dict | None = None, timeout: float = 15.0,
+          *, admin: bool = False) -> tuple[int, dict | None]:
     url = f"{HIVE_URL}{path}"
     data = json.dumps(body).encode() if body is not None else None
     headers = {"content-type": "application/json"}
-    if HIVE_BUS_TOKEN:
-        headers["authorization"] = f"Bearer {HIVE_BUS_TOKEN}"
+    token = HIVE_BUS_ADMIN_TOKEN if admin else HIVE_BUS_TOKEN
+    if token:
+        headers["authorization"] = f"Bearer {token}"
     req = urllib.request.Request(
         url,
         data=data,
@@ -89,23 +92,22 @@ def fetch_failed_jobs(limit: int = 1000) -> list[dict]:
     jobs.sort(key=lambda j: j.get("ended_at") or 0, reverse=True)
     return jobs
 
-def restore_job(jid: str) -> tuple[bool, str]:
-    body = {
-        "status": "queued",
-        "claimed_by": None,
-        "claimed_at": None,
-        "claimed_runtime": None,
-        "claimed_model": None,
-        "claimed_provider": None,
-        "claimed_cost_tier": None,
-        "claim_lease_expires_at": None,
-        "ended_at": None,
-        "retry_backoff_until": None,
-    }
-    code, resp = _http("PATCH", f"/v1/jobs/{urllib.parse.quote(jid, safe='')}", body, timeout=15.0)
-    if code in (200, 204):
-        return True, ""
-    return False, f"http={code} resp={str(resp)[:200]}"
+def restore_jobs(job_ids: list[str]) -> tuple[dict[str, str], str]:
+    code, resp = _http(
+        "POST",
+        "/v1/admin/jobs/requeue",
+        {"job_ids": job_ids, "reason": "auto-restore"},
+        timeout=15.0,
+        admin=True,
+    )
+    if code == 200 and isinstance(resp, dict):
+        results = {
+            jid: outcome
+            for outcome in ("ok", "not_found", "skipped_done")
+            for jid in (resp.get(outcome) or [])
+        }
+        return results, ""
+    return {}, f"http={code} resp={str(resp)[:200]}"
 
 def main():
     state = load_state()
@@ -118,6 +120,7 @@ def main():
     failed = fetch_failed_jobs()
     log(f"poll: {len(failed)} failed jobs to consider")
 
+    candidates: list[tuple[dict, dict]] = []
     for job in failed:
         jid = job.get("id") or ""
         kind = job.get("kind") or ""
@@ -136,8 +139,13 @@ def main():
             skipped_backoff += 1
             continue
 
-        ok, err = restore_job(jid)
-        if ok:
+        candidates.append((job, entry))
+
+    restore_results, restore_error = restore_jobs([job["id"] for job, _entry in candidates]) if candidates else ({}, "")
+    for job, entry in candidates:
+        jid = job["id"]
+        kind = job.get("kind") or ""
+        if restore_results.get(jid) == "ok":
             restored += 1
             entry["count"] = entry.get("count", 0) + 1
             entry["next_at"] = now + BACKOFF_BASE * (2 ** (entry["count"] - 1))
@@ -145,7 +153,8 @@ def main():
             state[jid] = entry
             log(f"restored {jid[:13]} kind={kind[:40]} attempt={entry['count']}/{MAX_RETRIES}")
         else:
-            log(f"err restoring {jid[:13]}: {err}")
+            outcome = restore_results.get(jid, "missing_result")
+            log(f"err restoring {jid[:13]}: {restore_error or outcome}")
 
     save_state(state)
     log(f"summary: restored={restored} skipped_capped={skipped_capped} skipped_backoff={skipped_backoff} skipped_too_fresh={skipped_too_fresh}")

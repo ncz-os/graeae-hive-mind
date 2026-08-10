@@ -288,11 +288,9 @@ def register():
     body = {
         "host": AGENT_HOST, "kind": "zeroclaw", "runtime": "zeroclaw",
         "autonomy_level": "interactive", "auth_method": "api",
-        # '*' = claim ANY job regardless of required_capabilities / workspace
-        # capability (operator architecture 2026-06-01: all executors eligible
-        # for all jobs; job-type -> KNEMON picks the model). The named caps stay
-        # for display/scoring; '*' is what bypasses the claim-time cap gate.
-        "capabilities": ["*", "code-edit","build","test","debug","refactor",
+        # '*' accepts jobs with bare/soft capability labels. Hard labels still
+        # require an exact named capability, so advertise codex explicitly.
+        "capabilities": ["*", "codex", "code-edit","build","test","debug","refactor",
                          "python","bash","docker","linux",
                          "wss-driven","workspace-aware","open-weights-first"],
         "model": "wss-via-gateway+codex-fallback",

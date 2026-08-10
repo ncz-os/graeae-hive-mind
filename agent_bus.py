@@ -585,6 +585,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   depends_on TEXT,                              -- json array of job ids
   retry_count INTEGER NOT NULL DEFAULT 0,
   max_retries INTEGER NOT NULL DEFAULT 2,
+  dedup_hash TEXT,
   retry_backoff_until REAL,
   last_update_at REAL,
   claim_lease_expires_at REAL
@@ -1436,7 +1437,14 @@ async def reaper_task(app: FastAPI):
                 retain_cutoff = time.time() - EVENTS_RETAIN_HOURS * 3600
                 await db.execute("DELETE FROM events WHERE ts < ?", (retain_cutoff,))
                 await db.commit()
+            app.state.reaper_last_success = time.time()
+            app.state.reaper_last_error = None
+            app.state.reaper_consecutive_failures = 0
         except Exception as e:
+            app.state.reaper_last_error = type(e).__name__
+            app.state.reaper_consecutive_failures = (
+                getattr(app.state, "reaper_consecutive_failures", 0) + 1
+            )
             print(f"reaper error: {e}", flush=True)
 
 
@@ -1567,6 +1575,7 @@ async def lifespan(app: FastAPI):
             ("jobs", "depends_on", "depends_on TEXT"),
             ("jobs", "retry_count", "retry_count INTEGER NOT NULL DEFAULT 0"),
             ("jobs", "max_retries", "max_retries INTEGER NOT NULL DEFAULT 2"),
+            ("jobs", "dedup_hash", "dedup_hash TEXT"),
             ("jobs", "retry_backoff_until", "retry_backoff_until REAL"),
             ("jobs", "last_update_at", "last_update_at REAL"),
             ("jobs", "claim_lease_expires_at", "claim_lease_expires_at REAL"),
@@ -1596,38 +1605,38 @@ async def lifespan(app: FastAPI):
             try:
                 raw = db._conn
                 rcur = raw.cursor()
-                rcur.execute(
+                await rcur.execute(
                     "SELECT COUNT(*) FROM user_tab_columns "
                     "WHERE table_name = 'HIVE_JOBS' AND column_name = 'DECLINE_COUNT'"
                 )
-                has_col = (rcur.fetchone())[0]
+                has_col = (await rcur.fetchone())[0]
                 if not has_col:
-                    rcur.execute(
+                    await rcur.execute(
                         "ALTER TABLE HIVE_JOBS ADD (decline_count NUMBER DEFAULT 0 NOT NULL)"
                     )
-                rcur.execute(
+                await rcur.execute(
                     "SELECT search_condition_vc FROM user_constraints "
                     "WHERE table_name = 'HIVE_JOBS' AND constraint_name = 'CK_HIVE_JOBS_STATUS'"
                 )
-                crow = rcur.fetchone()
+                crow = await rcur.fetchone()
                 cond = str(crow[0]) if crow and crow[0] is not None else ""
                 if crow is not None and "dead-letter" not in cond:
-                    rcur.execute("ALTER TABLE HIVE_JOBS DROP CONSTRAINT CK_HIVE_JOBS_STATUS")
-                    rcur.execute(
+                    await rcur.execute("ALTER TABLE HIVE_JOBS DROP CONSTRAINT CK_HIVE_JOBS_STATUS")
+                    await rcur.execute(
                         "ALTER TABLE HIVE_JOBS ADD CONSTRAINT CK_HIVE_JOBS_STATUS "
                         "CHECK (status IN ('queued','offered','claimed','running',"
                         "'done','failed','failed_completion','cancelled','dead-letter'))"
                     )
-                rcur.close()
-                db._conn.commit()
+                await rcur.close()
+                await db.commit()
             except Exception as e:
                 # FATAL: the runtime decline/dead-letter path REQUIRES both the
                 # decline_count column and the relaxed status CHECK. If this DDL
                 # fails, every subsequent decline PATCH would error (invalid
                 # identifier / CHECK violation), so refuse to start rather than
                 # serve a half-migrated bus.
-                print(f"oracle dead-letter migration skipped (non-fatal): {e}", flush=True)
-                # non-fatal: runtime dead-letter UPDATE falls back to requeue if CHECK not relaxed
+                print(f"oracle dead-letter migration failed: {e}", flush=True)
+                raise
         # Idempotent index re-creates (in case live DB pre-dates an index).
         live_indexes = (
             "CREATE INDEX IF NOT EXISTS idx_agents_status      ON agents(status)",
@@ -1644,6 +1653,8 @@ async def lifespan(app: FastAPI):
             "CREATE INDEX IF NOT EXISTS idx_jobs_claimed_tier      ON jobs(claimed_cost_tier)",
             "CREATE INDEX IF NOT EXISTS idx_jobs_backoff           ON jobs(retry_backoff_until)",
             "CREATE INDEX IF NOT EXISTS idx_jobs_claim_lease       ON jobs(claim_lease_expires_at)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS jobs_active_dedup_uq ON jobs(dedup_hash) "
+            "WHERE dedup_hash IS NOT NULL AND status IN ('queued','offered','claimed','running')",
             "CREATE TABLE IF NOT EXISTS job_audit_log ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL, ts REAL NOT NULL, "
             "actor_urn TEXT, old_status TEXT, new_status TEXT, old_claimed_by TEXT, "
@@ -1653,7 +1664,11 @@ async def lifespan(app: FastAPI):
         for stmt in live_indexes:
             await db.execute(stmt)
         await db.commit()
+    app.state.reaper_last_success = time.time()
+    app.state.reaper_last_error = None
+    app.state.reaper_consecutive_failures = 0
     task = asyncio.create_task(reaper_task(app))
+    app.state.reaper_task = task
     try:
         yield
     finally:
@@ -1731,7 +1746,45 @@ app = FastAPI(
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "ts": time.time(), "service": "graeae-hive-mind", "version": "0.1.0"}
+    checks: dict[str, str] = {}
+
+    async def _check_database() -> None:
+        sql = "SELECT 1 FROM dual" if HIVE_BACKEND == "oracle" else "SELECT 1"
+        async with connect_db() as db:
+            async with db.execute(sql) as cur:
+                row = await cur.fetchone()
+            if not row or row[0] != 1:
+                raise RuntimeError("database probe returned an unexpected result")
+
+    try:
+        await asyncio.wait_for(_check_database(), timeout=2.0)
+        checks["database"] = "ok"
+    except Exception as exc:
+        checks["database"] = f"error:{type(exc).__name__}"
+
+    task = getattr(app.state, "reaper_task", None)
+    last_success = getattr(app.state, "reaper_last_success", None)
+    reaper_failures = getattr(app.state, "reaper_consecutive_failures", 0)
+    if task is None or task.done():
+        checks["reaper"] = "stopped"
+    elif reaper_failures >= 2:
+        checks["reaper"] = f"error:{getattr(app.state, 'reaper_last_error', 'unknown')}"
+    elif last_success is None or time.time() - last_success > HEARTBEAT_REAP_INTERVAL * 2 + 5:
+        checks["reaper"] = "stale"
+    else:
+        checks["reaper"] = "ok"
+
+    healthy = all(value == "ok" for value in checks.values())
+    payload = {
+        "status": "healthy" if healthy else "degraded",
+        "ts": time.time(),
+        "service": "graeae-hive-mind",
+        "version": "0.1.0",
+        "checks": checks,
+    }
+    if healthy:
+        return payload
+    return JSONResponse(status_code=503, content=payload)
 
 
 @app.get("/")
@@ -2794,6 +2847,8 @@ async def admin_requeue_jobs(req: RequeueRequest):
                 continue
             await db.execute(
                 """UPDATE jobs SET status='queued', claimed_by=NULL, claimed_at=NULL,
+                   claimed_runtime=NULL, claimed_model=NULL, claimed_provider=NULL,
+                   claimed_cost_tier=NULL, claim_lease_expires_at=NULL, ended_at=NULL,
                    retry_count=0, retry_backoff_until=NULL
                    WHERE id=?""",
                 (job_id,),

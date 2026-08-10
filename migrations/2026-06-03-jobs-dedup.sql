@@ -10,16 +10,16 @@
 -- SELECT-then-INSERT coalesce cannot.
 
 -- ── Oracle (ORCLPDB1) ────────────────────────────────────────────────────
-ALTER TABLE jobs ADD (dedup_hash VARCHAR2(64));
+ALTER TABLE HIVE_JOBS ADD (dedup_hash VARCHAR2(64));
 
-CREATE UNIQUE INDEX jobs_active_dedup_uq ON jobs (
+CREATE UNIQUE INDEX jobs_active_dedup_uq ON HIVE_JOBS (
   CASE WHEN status IN ('queued', 'offered', 'claimed', 'running')
        THEN dedup_hash END
 );
 
 -- Rollback:
 --   DROP INDEX jobs_active_dedup_uq;
---   ALTER TABLE jobs DROP COLUMN dedup_hash;
+--   ALTER TABLE HIVE_JOBS DROP COLUMN dedup_hash;
 
 -- ── SQLite (dev / fallback) equivalent ───────────────────────────────────
 -- ALTER TABLE jobs ADD COLUMN dedup_hash TEXT;
