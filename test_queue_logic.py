@@ -1,8 +1,15 @@
 """Plain-python tests for queue_logic (pure stdlib; run: python3 test_queue_logic.py)."""
 import sys
 import importlib.util
+from pathlib import Path
 
-spec = importlib.util.spec_from_file_location("queue_logic", sys.argv[1] if len(sys.argv) > 1 else "queue_logic.py")
+source_path = (
+    Path(sys.argv[1])
+    if len(sys.argv) > 1 and not sys.argv[1].startswith("-")
+    else Path(__file__).with_name("queue_logic.py")
+)
+spec = importlib.util.spec_from_file_location("queue_logic", source_path)
+assert spec is not None and spec.loader is not None
 m = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = m
 spec.loader.exec_module(m)

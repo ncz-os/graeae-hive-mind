@@ -20,10 +20,7 @@ from contextlib import asynccontextmanager
 from contextlib import suppress
 from typing import Optional, Any, Literal
 
-try:
-    import aiosqlite
-except ModuleNotFoundError:
-    from hive.persistence import _sqlite_async as aiosqlite
+from hive.persistence import _sqlite_async as aiosqlite
 
 import queue_logic
 from hive.persistence.factory import get_hive_repository

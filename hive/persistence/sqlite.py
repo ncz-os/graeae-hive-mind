@@ -7,10 +7,7 @@ import os
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
 
-try:
-    import aiosqlite
-except ModuleNotFoundError:
-    from . import _sqlite_async as aiosqlite
+from . import _sqlite_async as aiosqlite
 
 from .base import HiveMindRepository, Transaction
 
