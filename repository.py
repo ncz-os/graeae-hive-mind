@@ -93,6 +93,7 @@ class HiveMindRepository(Protocol):
                          preferred_models: Optional[list[str]],
                          mnemos_refs: Optional[list[str]],
                          depends_on: Optional[list[str]],
+                         execution: Optional[dict[str, Any]] = None,
                          max_retries: int,
                          started_at: float) -> None:
         ...

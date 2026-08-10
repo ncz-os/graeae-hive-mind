@@ -16,6 +16,14 @@ Env:
   LOAD_THRESHOLD            max 1-min load_avg before refusing new jobs (default 0.75 × cpu_count)
   HEARTBEAT_INTERVAL        seconds (default 15)
   CLAIM_JOBS                if "1", actively claim eligible jobs and dispatch to local executor (default "0" = passive monitor only)
+  JOB_WORK_ROOT             root containing allowed relative execution.cwd paths (default /srv)
+  SYSTEM_WATCHER_JOB_KINDS  comma-separated kinds this worker may claim (default build,compile,render)
+  SYSTEM_WATCHER_ALLOWED_EXECUTABLES comma-separated executable basename allowlist
+  SYSTEM_WATCHER_ALLOWED_JOB_ENV comma-separated job-provided environment variable allowlist
+  SYSTEM_WATCHER_PASSTHROUGH_ENV parent environment names exposed to child processes
+  JOB_LEASE_RENEW_INTERVAL  seconds between running patches (default 300)
+  JOB_TIMEOUT_MAX           hard per-process timeout ceiling in seconds (default 21600)
+  ALLOW_CLAIM_WITHOUT_LOAD  development-only opt-out for unavailable load metrics (default 0)
 """
 from __future__ import annotations
 import json
@@ -30,6 +38,8 @@ import time
 import urllib.request
 import urllib.error
 import signal
+import tempfile
+import urllib.parse
 
 HIVE_URL = os.environ.get("HIVE_URL", "http://192.168.207.67:5005")
 # C1: bus transport auth bearer token (env-sourced, never baked in).
@@ -37,6 +47,35 @@ HIVE_BUS_TOKEN = os.environ.get("HIVE_BUS_TOKEN", "")
 AGENT_HOST = os.environ.get("AGENT_HOST", socket.gethostname().split(".")[0])
 HEARTBEAT_INTERVAL = float(os.environ.get("HEARTBEAT_INTERVAL", "15"))
 CLAIM_JOBS = os.environ.get("CLAIM_JOBS", "0") == "1"
+LOAD_THRESHOLD = float(os.environ.get(
+    "LOAD_THRESHOLD", str(0.75 * max(os.cpu_count() or 1, 1))
+))
+ALLOW_CLAIM_WITHOUT_LOAD = os.environ.get("ALLOW_CLAIM_WITHOUT_LOAD", "0") == "1"
+JOB_POLL_INTERVAL = float(os.environ.get("JOB_POLL_INTERVAL", "5"))
+JOB_LEASE_RENEW_INTERVAL = float(os.environ.get("JOB_LEASE_RENEW_INTERVAL", "300"))
+JOB_TIMEOUT_MAX = int(os.environ.get("JOB_TIMEOUT_MAX", "21600"))
+JOB_WORK_ROOT = os.path.realpath(os.environ.get("JOB_WORK_ROOT", "/srv"))
+JOB_KINDS = tuple(
+    item.strip() for item in os.environ.get(
+        "SYSTEM_WATCHER_JOB_KINDS", "build,compile,render"
+    ).split(",") if item.strip()
+)
+ALLOWED_EXECUTABLES = frozenset(
+    item.strip() for item in os.environ.get(
+        "SYSTEM_WATCHER_ALLOWED_EXECUTABLES",
+        "make,ninja,cmake,cargo,go,npm,pnpm,yarn,docker,podman,blender",
+    ).split(",") if item.strip()
+)
+ALLOWED_JOB_ENV = frozenset(
+    item.strip() for item in os.environ.get(
+        "SYSTEM_WATCHER_ALLOWED_JOB_ENV", "CI,BUILD_TYPE,CMAKE_BUILD_TYPE"
+    ).split(",") if item.strip()
+)
+PASSTHROUGH_ENV = frozenset(
+    item.strip() for item in os.environ.get(
+        "SYSTEM_WATCHER_PASSTHROUGH_ENV", "PATH,HOME,LANG,LC_ALL,TMPDIR,TEMP,TMP"
+    ).split(",") if item.strip()
+)
 
 _urn: str = ""
 _running = True
@@ -462,6 +501,7 @@ def capabilities_from_specs(specs: dict) -> list[str]:
     if specs.get("cpu_count", 0) >= 32: caps.append("cpu-32t+")
     if specs.get("os") == "Darwin":  caps.append("macos")
     if specs.get("arch") == "arm64" or specs.get("arch") == "aarch64": caps.append("arm64")
+    if CLAIM_JOBS: caps.append("local-process")
     return caps
 
 
@@ -496,8 +536,8 @@ def register():
         sys.exit(1)
 
 
-def heartbeat():
-    load = dynamic_load()
+def heartbeat(load: dict | None = None):
+    load = load or dynamic_load()
     # Push fresh load into agent metadata so /v1/hosts always has current data.
     # Heartbeat endpoint merges {"load": load} into existing metadata (server-side update).
     _http("POST", "/v1/agents/heartbeat", {
@@ -509,14 +549,262 @@ def heartbeat():
     # telemetry). The load is already in agent metadata via heartbeat above
     # and /v1/hosts surfaces it; SSE listeners can subscribe to agent.metadata
     # events instead. Broadcast removed 2026-05-26.
+    return load
+
+
+def load_allows_claim(load: dict) -> tuple[bool, str]:
+    """Fail closed when the load sample is absent or exceeds the configured gate."""
+    value = load.get("load_1min")
+    if value is None:
+        if ALLOW_CLAIM_WITHOUT_LOAD:
+            return True, "load_1min unavailable; development opt-out enabled"
+        return False, "load_1min unavailable"
+    try:
+        current = float(value)
+    except (TypeError, ValueError):
+        return False, f"load_1min is invalid: {value!r}"
+    if current > LOAD_THRESHOLD:
+        return False, f"load_1min={current:.2f} exceeds threshold={LOAD_THRESHOLD:.2f}"
+    return True, f"load_1min={current:.2f} threshold={LOAD_THRESHOLD:.2f}"
+
+
+def claim_next_job() -> dict | None:
+    query = urllib.parse.urlencode({
+        "agent_urn": _urn,
+        "execution_type": "local-process",
+        "job_kinds": ",".join(JOB_KINDS),
+    })
+    code, resp = _http("POST", f"/v1/jobs/next?{query}")
+    if code == 200 and isinstance(resp, dict) and resp.get("id"):
+        return resp
+    if code not in {0, 204}:
+        print(f"[sysw] claim failed code={code} resp={resp}", flush=True)
+    return None
+
+
+def patch_job(job_id: str, status: str, result: dict | None = None) -> bool:
+    body = {"status": status, "claimed_by": _urn}
+    if result is not None:
+        body["result"] = result
+    code, resp = _http("PATCH", f"/v1/jobs/{job_id}", body)
+    if code not in {200, 201, 204}:
+        print(f"[sysw] job patch failed id={job_id} status={status} code={code} resp={resp}", flush=True)
+        return False
+    return True
+
+
+def _validated_process(job: dict) -> tuple[list[str], str, dict[str, str], int]:
+    spec = job.get("execution")
+    if not isinstance(spec, dict) or spec.get("type") != "local-process":
+        raise ValueError("job has no execution.type='local-process' specification")
+    argv = spec.get("argv")
+    if not isinstance(argv, list) or not argv or len(argv) > 256:
+        raise ValueError("execution.argv must contain 1..256 arguments")
+    if any(not isinstance(arg, str) or "\x00" in arg or len(arg) > 8192 for arg in argv):
+        raise ValueError("execution.argv contains an invalid argument")
+    executable = argv[0]
+    if os.path.basename(executable) != executable or executable not in ALLOWED_EXECUTABLES:
+        raise ValueError(
+            f"executable {executable!r} is not allowed; configure SYSTEM_WATCHER_ALLOWED_EXECUTABLES"
+        )
+    resolved_executable = shutil.which(executable)
+    if not resolved_executable:
+        raise ValueError(f"allowed executable {executable!r} is not installed or not on PATH")
+
+    relative_cwd = spec.get("cwd", ".")
+    if not isinstance(relative_cwd, str) or not relative_cwd or os.path.isabs(relative_cwd):
+        raise ValueError("execution.cwd must be a non-empty path relative to JOB_WORK_ROOT")
+    cwd = os.path.realpath(os.path.join(JOB_WORK_ROOT, relative_cwd))
+    try:
+        inside_root = os.path.commonpath([JOB_WORK_ROOT, cwd]) == JOB_WORK_ROOT
+    except ValueError:
+        inside_root = False
+    if not inside_root or not os.path.isdir(cwd):
+        raise ValueError(
+            f"execution.cwd resolves outside JOB_WORK_ROOT or is not a directory: {relative_cwd!r}"
+        )
+
+    requested_env = spec.get("env", {})
+    if not isinstance(requested_env, dict):
+        raise ValueError("execution.env must be an object")
+    rejected = sorted(set(requested_env) - ALLOWED_JOB_ENV)
+    if rejected:
+        raise ValueError(
+            f"execution.env contains disallowed names {rejected}; configure SYSTEM_WATCHER_ALLOWED_JOB_ENV"
+        )
+    if any(
+        not isinstance(key, str) or not isinstance(value, str)
+        or "\x00" in key or "\x00" in value or len(value) > 32768
+        for key, value in requested_env.items()
+    ):
+        raise ValueError("execution.env contains an invalid name or value")
+    env = {key: os.environ[key] for key in PASSTHROUGH_ENV if key in os.environ}
+    env.update(requested_env)
+
+    timeout = spec.get("timeout_seconds") or JOB_TIMEOUT_MAX
+    if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout < 1:
+        raise ValueError("execution.timeout_seconds must be a positive integer")
+    timeout = min(timeout, JOB_TIMEOUT_MAX)
+    return [resolved_executable, *argv[1:]], cwd, env, timeout
+
+
+def _stop_process(proc: subprocess.Popen) -> None:
+    if proc.poll() is not None:
+        return
+    try:
+        if os.name == "posix":
+            os.killpg(proc.pid, signal.SIGTERM)
+        else:
+            proc.terminate()
+        proc.wait(timeout=10)
+    except Exception:
+        try:
+            if os.name == "posix":
+                os.killpg(proc.pid, signal.SIGKILL)
+            else:
+                proc.kill()
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+
+
+def execute_job(job: dict) -> tuple[str, dict]:
+    """Run one validated process while renewing its claim lease."""
+    job_id = str(job.get("id") or "")
+    started = time.time()
+    try:
+        argv, cwd, env, timeout = _validated_process(job)
+    except Exception as exc:
+        return "failed", {"exit_code": -2, "worker_error": "invalid_execution_spec", "error": str(exc)}
+
+    if not patch_job(job_id, "running", {"phase": "starting", "executor": "local-process"}):
+        return "failed", {
+            "exit_code": -3,
+            "worker_error": "running_transition_failed",
+            "error": "refused to execute because the claimed job could not transition to running",
+        }
+
+    print(f"[sysw] executing job={job_id} executable={os.path.basename(argv[0])} cwd={cwd}", flush=True)
+    with tempfile.TemporaryFile(mode="w+b") as stdout_file, tempfile.TemporaryFile(
+        mode="w+b"
+    ) as stderr_file:
+        try:
+            proc = subprocess.Popen(
+                argv,
+                cwd=cwd,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                start_new_session=(os.name == "posix"),
+            )
+        except Exception as exc:
+            return "failed", {"exit_code": -1, "worker_error": "spawn_failed", "error": str(exc)}
+
+        lease_interval = JOB_LEASE_RENEW_INTERVAL
+        try:
+            initial_lease_remaining = float(job.get("claim_lease_expires_at")) - time.time()
+            if initial_lease_remaining > 0:
+                lease_interval = min(lease_interval, max(1.0, initial_lease_remaining / 3.0))
+        except (TypeError, ValueError):
+            pass
+        next_lease = time.monotonic() + lease_interval
+        next_heartbeat = time.monotonic() + HEARTBEAT_INTERVAL
+        stop_reason = ""
+        while proc.poll() is None:
+            now_monotonic = time.monotonic()
+            elapsed = time.time() - started
+            if not _running:
+                stop_reason = "worker_shutdown"
+                break
+            if elapsed >= timeout:
+                stop_reason = "timeout"
+                break
+            if now_monotonic >= next_heartbeat:
+                heartbeat()
+                next_heartbeat = now_monotonic + HEARTBEAT_INTERVAL
+            if now_monotonic >= next_lease:
+                renewed = patch_job(job_id, "running", {
+                    "phase": "running", "executor": "local-process", "elapsed_sec": round(elapsed, 1),
+                })
+                if not renewed:
+                    stop_reason = "lease_renewal_failed"
+                    break
+                next_lease = now_monotonic + lease_interval
+            time.sleep(0.25)
+
+        if stop_reason:
+            _stop_process(proc)
+        return_code = proc.poll()
+        stdout_file.seek(0, os.SEEK_END)
+        stdout_size = stdout_file.tell()
+        stdout_file.seek(max(0, stdout_size - 12000))
+        stdout = stdout_file.read().decode("utf-8", errors="replace")
+        stderr_file.seek(0, os.SEEK_END)
+        stderr_size = stderr_file.tell()
+        stderr_file.seek(max(0, stderr_size - 4000))
+        stderr = stderr_file.read().decode("utf-8", errors="replace")
+
+    result = {
+        "exit_code": return_code if return_code is not None else -1,
+        "stdout": stdout,
+        "stderr": stderr,
+        "duration_sec": round(time.time() - started, 1),
+        "executor": "local-process",
+        "executable": os.path.basename(argv[0]),
+        "cwd": os.path.relpath(cwd, JOB_WORK_ROOT),
+    }
+    if stop_reason == "worker_shutdown":
+        result["worker_error"] = stop_reason
+        return "queued", result
+    if stop_reason:
+        result["worker_error"] = stop_reason
+        return "failed", result
+    return ("done" if return_code == 0 else "failed"), result
+
+
+def _sleep_while_running(seconds: float) -> None:
+    deadline = time.monotonic() + max(0, seconds)
+    while _running and time.monotonic() < deadline:
+        time.sleep(min(0.25, deadline - time.monotonic()))
 
 
 def main():
-    print(f"[sysw] starting on {AGENT_HOST} HIVE_URL={HIVE_URL} CLAIM_JOBS={CLAIM_JOBS}", flush=True)
+    if CLAIM_JOBS:
+        if LOAD_THRESHOLD < 0:
+            raise SystemExit("LOAD_THRESHOLD must be non-negative")
+        if JOB_POLL_INTERVAL <= 0 or JOB_LEASE_RENEW_INTERVAL <= 0 or JOB_TIMEOUT_MAX <= 0:
+            raise SystemExit(
+                "JOB_POLL_INTERVAL, JOB_LEASE_RENEW_INTERVAL, and JOB_TIMEOUT_MAX must be positive"
+            )
+        if not JOB_KINDS:
+            raise SystemExit("SYSTEM_WATCHER_JOB_KINDS must name at least one job kind")
+        if not ALLOWED_EXECUTABLES:
+            raise SystemExit("SYSTEM_WATCHER_ALLOWED_EXECUTABLES must not be empty")
+        if not os.path.isdir(JOB_WORK_ROOT):
+            raise SystemExit(f"JOB_WORK_ROOT is not a directory: {JOB_WORK_ROOT}")
+    print(
+        f"[sysw] starting on {AGENT_HOST} HIVE_URL={HIVE_URL} CLAIM_JOBS={CLAIM_JOBS} "
+        f"LOAD_THRESHOLD={LOAD_THRESHOLD:.2f}",
+        flush=True,
+    )
     register()
     while _running:
-        heartbeat()
-        time.sleep(HEARTBEAT_INTERVAL)
+        load = heartbeat()
+        delay = HEARTBEAT_INTERVAL
+        if CLAIM_JOBS:
+            allowed, reason = load_allows_claim(load)
+            if allowed:
+                job = claim_next_job()
+                if job:
+                    status, result = execute_job(job)
+                    patch_job(job["id"], status, result)
+                    delay = 0
+                else:
+                    delay = JOB_POLL_INTERVAL
+            else:
+                print(f"[sysw] claim gated: {reason}", flush=True)
+        _sleep_while_running(delay)
     print("[sysw] clean shutdown", flush=True)
 
 

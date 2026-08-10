@@ -84,8 +84,146 @@ class AgentBusDefectTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await task
 
+    async def test_system_claim_filter_only_claims_structured_execution_jobs(self):
+        async with agent_bus.lifespan(agent_bus.app):
+            now = agent_bus.time.time()
+            submitter = "urn:agent:human:execution-test:session"
+            worker = "urn:agent:system:execution-test:session"
+            async with agent_bus.connect_db() as db:
+                await db.execute(
+                    "INSERT OR REPLACE INTO agents (urn, kind, host, session_id, started_at, "
+                    "last_heartbeat, status, runtime, capabilities, provider, cost_tier) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (submitter, "human", "execution-test", "session", now, now,
+                     "online", "human", None, "local", "A"),
+                )
+                await db.execute(
+                    "INSERT OR REPLACE INTO agents (urn, kind, host, session_id, started_at, "
+                    "last_heartbeat, status, runtime, capabilities, provider, cost_tier) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (worker, "system", "execution-test", "session", now, now,
+                     "online", "system", json.dumps(["local-process"]), "local", "A"),
+                )
+                await db.commit()
+
+            ordinary = await agent_bus.create_job(agent_bus.JobCreate(
+                submitter_urn=submitter,
+                kind="build",
+                description="ordinary higher-priority build",
+                priority=100,
+                idempotency_key="f8-ordinary",
+            ))
+            async with agent_bus.connect_db() as db:
+                await db.executemany(
+                    "INSERT INTO jobs (id, submitter_urn, kind, description, priority, "
+                    "status, started_at, max_cost_tier) VALUES (?, ?, 'build', ?, 100, 'queued', ?, 'B')",
+                    [
+                        (f"f8-ordinary-{index}", submitter, f"ordinary backlog {index}", now + index / 1000)
+                        for index in range(105)
+                    ],
+                )
+                await db.commit()
+            executable = await agent_bus.create_job(agent_bus.JobCreate(
+                submitter_urn=submitter,
+                kind="build",
+                description="structured lower-priority build",
+                priority=1,
+                execution=agent_bus.LocalProcessExecution(
+                    argv=["make", "release"], cwd="project-a", timeout_seconds=60,
+                ),
+                idempotency_key="f8-executable",
+            ))
+
+            claimed = await agent_bus.dequeue_next_job(
+                worker, execution_type="local-process", job_kinds="build,compile,render"
+            )
+            self.assertEqual(claimed["id"], executable["id"])
+            self.assertEqual(claimed["execution"]["argv"], ["make", "release"])
+            self.assertIn("hard:local-process", claimed["required_capabilities"])
+            async with agent_bus.connect_db() as db:
+                async with db.execute(
+                    "SELECT status, execution_spec FROM jobs WHERE id=?", (ordinary["id"],)
+                ) as cur:
+                    ordinary_row = await cur.fetchone()
+            self.assertEqual(ordinary_row[0], "queued")
+            self.assertIsNone(ordinary_row[1])
+
+    def test_execution_spec_participates_in_cache_identity(self):
+        base = agent_bus.cache_key_for("build", "release", "A", ["local-process"])
+        first = agent_bus.cache_key_for(
+            "build", "release", "A", ["local-process"],
+            {"type": "local-process", "argv": ["make", "one"], "cwd": ".", "env": {}, "timeout_seconds": 60},
+        )
+        second = agent_bus.cache_key_for(
+            "build", "release", "A", ["local-process"],
+            {"type": "local-process", "argv": ["make", "two"], "cwd": ".", "env": {}, "timeout_seconds": 60},
+        )
+        self.assertNotEqual(base, first)
+        self.assertNotEqual(first, second)
+
 
 class WorkerAndRestoreDefectTests(unittest.TestCase):
+    def test_system_watcher_load_gate_fails_closed(self):
+        watcher = _load_script("system_watcher_load_test", "system_watcher.py")
+        watcher.LOAD_THRESHOLD = 2.0
+        watcher.ALLOW_CLAIM_WITHOUT_LOAD = False
+        self.assertFalse(watcher.load_allows_claim({})[0])
+        self.assertFalse(watcher.load_allows_claim({"load_1min": 2.1})[0])
+        self.assertTrue(watcher.load_allows_claim({"load_1min": 2.0})[0])
+
+    def test_system_watcher_executes_and_renews_lease(self):
+        watcher = _load_script("system_watcher_execution_test", "system_watcher.py")
+        executable = Path(os.sys.executable).name
+        watcher.JOB_WORK_ROOT = str(Path.cwd())
+        watcher.ALLOWED_EXECUTABLES = frozenset({executable})
+        watcher.ALLOWED_JOB_ENV = frozenset()
+        watcher.JOB_LEASE_RENEW_INTERVAL = 0.01
+        watcher.HEARTBEAT_INTERVAL = 60
+        watcher._running = True
+        patches = []
+
+        def fake_patch(job_id, status, result=None):
+            patches.append((job_id, status, result))
+            return True
+
+        watcher.patch_job = fake_patch
+        status, result = watcher.execute_job({
+            "id": "job-f8",
+            "execution": {
+                "type": "local-process",
+                "argv": [executable, "-c", "import time; print('ok'); time.sleep(0.35)"],
+                "cwd": ".",
+                "env": {},
+                "timeout_seconds": 5,
+            },
+        })
+        self.assertEqual(status, "done")
+        self.assertEqual(result["exit_code"], 0)
+        self.assertIn("ok", result["stdout"])
+        self.assertGreaterEqual(sum(status == "running" for _, status, _ in patches), 2)
+
+    def test_system_watcher_rejects_path_escape_and_unlisted_executable(self):
+        watcher = _load_script("system_watcher_validation_test", "system_watcher.py")
+        watcher.JOB_WORK_ROOT = str(Path.cwd())
+        watcher.ALLOWED_EXECUTABLES = frozenset({"make"})
+        with self.assertRaisesRegex(ValueError, "not allowed"):
+            watcher._validated_process({
+                "execution": {"type": "local-process", "argv": ["sh", "-c", "true"], "cwd": "."}
+            })
+        executable = Path(os.sys.executable).name
+        watcher.ALLOWED_EXECUTABLES = frozenset({executable})
+        watcher.PASSTHROUGH_ENV = frozenset({"PATH"})
+        os.environ["HIVE_BUS_TOKEN"] = "must-not-reach-child"
+        _, _, child_env, _ = watcher._validated_process({
+            "execution": {"type": "local-process", "argv": [executable], "cwd": "."}
+        })
+        self.assertNotIn("HIVE_BUS_TOKEN", child_env)
+        os.environ.pop("HIVE_BUS_TOKEN", None)
+        with self.assertRaisesRegex(ValueError, "outside JOB_WORK_ROOT"):
+            watcher._validated_process({
+                "execution": {"type": "local-process", "argv": [executable], "cwd": "../"}
+            })
+
     def test_zeroclaw_worker_advertises_hard_codex_capability(self):
         worker = _load_script("zeroclaw_worker_for_test", "zeroclaw_wss_worker_v2.py")
         captured = {}
@@ -129,11 +267,17 @@ class MigrationDefectTests(unittest.TestCase):
 
     def test_oracle_required_migration_is_fatal(self):
         source = Path("agent_bus.py").read_text()
-        handler = source.split("oracle dead-letter migration failed", 1)[1].split(
+        handler = source.split("oracle required schema migration failed", 1)[1].split(
             "# Idempotent index", 1
         )[0]
         self.assertIn("raise", handler)
         self.assertNotIn("non-fatal", handler)
+
+    def test_system_execution_migration_targets_canonical_oracle_table(self):
+        sql = Path("migrations/2026-08-10-system-job-execution.sql").read_text()
+        self.assertIn("ALTER TABLE HIVE_JOBS", sql)
+        self.assertIn("column_name = 'EXECUTION_SPEC'", sql)
+        self.assertNotIn("ALTER TABLE jobs ADD", sql.split("SQLite", 1)[0])
 
 
 if __name__ == "__main__":

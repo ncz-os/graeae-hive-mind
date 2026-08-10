@@ -34,6 +34,7 @@ class SqliteHiveRepository(HiveMindRepository):
                 await db.executescript(schema)
             await self._ensure_column(db, "jobs", "dedup_hash", "dedup_hash TEXT")
             await self._ensure_column(db, "jobs", "decline_count", "decline_count INTEGER NOT NULL DEFAULT 0")
+            await self._ensure_column(db, "jobs", "execution_spec", "execution_spec TEXT")
             await db.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS jobs_active_dedup_uq ON jobs (dedup_hash) "
                 "WHERE dedup_hash IS NOT NULL AND status IN ('queued', 'offered', 'claimed', 'running')"
@@ -139,8 +140,8 @@ class SqliteHiveRepository(HiveMindRepository):
                 await db.execute(
                     "INSERT INTO jobs (id, submitter_urn, parent_job_id, kind, description, priority, deadline, "
                     "required_capabilities, eligible_kinds, eligible_hosts, project, max_cost_tier, preferred_providers, "
-                    "preferred_models, mnemos_refs, depends_on, max_retries, dedup_hash, status, started_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
+                    "preferred_models, mnemos_refs, depends_on, execution_spec, max_retries, dedup_hash, status, started_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
                     (
                         fields["id"], fields["submitter_urn"], fields.get("parent_job_id"), fields["kind"],
                         fields.get("description"), fields.get("priority", 0), fields.get("deadline"),
@@ -148,6 +149,7 @@ class SqliteHiveRepository(HiveMindRepository):
                         fields.get("eligible_hosts_json"), fields.get("project"), fields.get("max_cost_tier"),
                         fields.get("preferred_providers_json"), fields.get("preferred_models_json"),
                         fields.get("mnemos_refs_json"), fields.get("depends_on_json"),
+                        fields.get("execution_spec_json"),
                         int(fields.get("max_retries", 2)), fields.get("dedup_hash"), fields["started_at"],
                     ),
                 )

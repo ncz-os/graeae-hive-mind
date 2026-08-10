@@ -18,7 +18,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from contextlib import suppress
-from typing import Optional, Any
+from typing import Optional, Any, Literal
 
 try:
     import aiosqlite
@@ -583,6 +583,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   claimed_host_caps TEXT,                       -- json
   tags TEXT,                                    -- json array
   depends_on TEXT,                              -- json array of job ids
+  execution_spec TEXT,                          -- structured local-process request (json)
   retry_count INTEGER NOT NULL DEFAULT 0,
   max_retries INTEGER NOT NULL DEFAULT 2,
   dedup_hash TEXT,
@@ -1130,7 +1131,8 @@ def hallucination_check(result: dict) -> Optional[str]:
 
 
 # RESULT CACHE — Nemotron killer feature 2026-05-23.
-# Memoize (kind, description, max_cost_tier, sorted-required-capabilities) → result.
+# Memoize (kind, description, max_cost_tier, sorted-required-capabilities,
+# optional execution specification) → result.
 # When identical job submitted, return cached result instantly. Cuts LLM spend
 # 30-70% on repetitive work + avoids NGC 429 storms from duplicate dispatches.
 import hashlib as _hashlib
@@ -1138,10 +1140,13 @@ CACHE_TTL_SECONDS = 24 * 3600  # 24h default; idempotent work like compiles/lint
 
 
 def cache_key_for(kind: str, description: Optional[str], max_cost_tier: str,
-                  required_capabilities: Optional[list[str]]) -> str:
+                  required_capabilities: Optional[list[str]],
+                  execution: Optional[dict] = None) -> str:
     norm_desc = (description or "").strip()
     norm_caps = ",".join(sorted(required_capabilities or []))
     payload = f"{kind}\n{norm_desc}\n{max_cost_tier}\n{norm_caps}"
+    if execution:
+        payload += "\n" + json.dumps(execution, sort_keys=True, separators=(",", ":"))
     return _hashlib.sha256(payload.encode()).hexdigest()
 
 
@@ -1224,6 +1229,17 @@ class AgentHeartbeat(BaseModel):
     metadata: Optional[dict] = None
 
 
+class LocalProcessExecution(BaseModel):
+    """Explicit, shell-free process contract for system-watcher workers."""
+
+    model_config = {"extra": "forbid"}
+    type: Literal["local-process"] = "local-process"
+    argv: list[str] = Field(..., min_length=1, max_length=256)
+    cwd: str = Field(".", min_length=1, max_length=1024)
+    env: dict[str, str] = Field(default_factory=dict)
+    timeout_seconds: Optional[int] = Field(None, ge=1, le=86400)
+
+
 class JobCreate(BaseModel):
     submitter_urn: str                                # who is asking (user OR delegating agent)
     parent_job_id: Optional[str] = None
@@ -1247,6 +1263,7 @@ class JobCreate(BaseModel):
     mnemos_refs: Optional[list[str]] = None            # mem_XXX ids — context/handoffs/related work the worker should consult
     # DAG support:
     depends_on: Optional[list[str]] = None             # job ids that must be status='done' before this job is dequeueable
+    execution: Optional[LocalProcessExecution] = None  # opt-in structured host execution; never inferred from description
     idempotency_key: Optional[str] = None              # forced-rerun escape: a unique value is never coalesced
 
 
@@ -1573,6 +1590,7 @@ async def lifespan(app: FastAPI):
             ("jobs", "claimed_host_caps", "claimed_host_caps TEXT"),
             ("jobs", "tags", "tags TEXT"),
             ("jobs", "depends_on", "depends_on TEXT"),
+            ("jobs", "execution_spec", "execution_spec TEXT"),
             ("jobs", "retry_count", "retry_count INTEGER NOT NULL DEFAULT 0"),
             ("jobs", "max_retries", "max_retries INTEGER NOT NULL DEFAULT 2"),
             ("jobs", "dedup_hash", "dedup_hash TEXT"),
@@ -1607,6 +1625,16 @@ async def lifespan(app: FastAPI):
                 rcur = raw.cursor()
                 await rcur.execute(
                     "SELECT COUNT(*) FROM user_tab_columns "
+                    "WHERE table_name = 'HIVE_JOBS' AND column_name = 'EXECUTION_SPEC'"
+                )
+                has_execution_spec = (await rcur.fetchone())[0]
+                if not has_execution_spec:
+                    raise RuntimeError(
+                        "Oracle schema is missing canonical HIVE_JOBS.EXECUTION_SPEC; "
+                        "apply migrations/2026-08-10-system-job-execution.sql before startup"
+                    )
+                await rcur.execute(
+                    "SELECT COUNT(*) FROM user_tab_columns "
                     "WHERE table_name = 'HIVE_JOBS' AND column_name = 'DECLINE_COUNT'"
                 )
                 has_col = (await rcur.fetchone())[0]
@@ -1635,7 +1663,7 @@ async def lifespan(app: FastAPI):
                 # fails, every subsequent decline PATCH would error (invalid
                 # identifier / CHECK violation), so refuse to start rather than
                 # serve a half-migrated bus.
-                print(f"oracle dead-letter migration failed: {e}", flush=True)
+                print(f"oracle required schema migration failed: {e}", flush=True)
                 raise
         # Idempotent index re-creates (in case live DB pre-dates an index).
         live_indexes = (
@@ -2184,6 +2212,14 @@ async def create_job(req: JobCreate):
         if "heavy-repo" not in _norm_str_set(_caps):
             _caps.append("heavy-repo")
             req = req.model_copy(update={"required_capabilities": _caps})
+    # Structured host execution must never be claimed by a generic wildcard
+    # worker that only knows how to interpret the description. Hard capability
+    # matching requires an exact local-process advertisement from the watcher.
+    if req.execution is not None:
+        _caps = list(req.required_capabilities or [])
+        if "hard:local-process" not in _norm_str_set(_caps):
+            _caps.append("hard:local-process")
+            req = req.model_copy(update={"required_capabilities": _caps})
     # ROLE ENFORCEMENT: check submitter runtime BEFORE the cache lookup so
     # worker-only runtimes get a 403 consistently for both cache hits and
     # cache misses. Unregistered submitter_urn values are rejected too; the
@@ -2207,7 +2243,13 @@ async def create_job(req: JobCreate):
             )
 
     # RESULT-CACHE CHECK: identical (kind, description, max_cost_tier, required_caps) within TTL → return cached result, mark new job done immediately
-    ck = cache_key_for(req.kind, req.description, max_cost_tier, req.required_capabilities)
+    ck = cache_key_for(
+        req.kind,
+        req.description,
+        max_cost_tier,
+        req.required_capabilities,
+        req.execution.model_dump() if req.execution else None,
+    )
     async with connect_db() as db:
         cached = await cache_lookup(db, ck)
         if cached:
@@ -2215,9 +2257,9 @@ async def create_job(req: JobCreate):
             await db.execute(
                 "INSERT INTO jobs (id, submitter_urn, parent_job_id, kind, description, priority, deadline, "
                 "required_capabilities, eligible_kinds, eligible_hosts, project, max_cost_tier, preferred_providers, preferred_models, "
-                "mnemos_refs, status, started_at, ended_at, result, claimed_provider, claimed_model, "
+                "mnemos_refs, execution_spec, status, started_at, ended_at, result, claimed_provider, claimed_model, "
                 "claimed_cost_tier, estimated_cost_usd, result_mnemos_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'done', ?, ?, ?, ?, ?, 'A', 0, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'done', ?, ?, ?, ?, ?, 'A', 0, ?)",
                 (
                     job_id, req.submitter_urn, req.parent_job_id, req.kind, req.description,
                     req.priority, req.deadline,
@@ -2229,6 +2271,7 @@ async def create_job(req: JobCreate):
                     json.dumps(req.preferred_providers) if req.preferred_providers else None,
                     json.dumps(req.preferred_models) if req.preferred_models else None,
                     json.dumps(req.mnemos_refs) if req.mnemos_refs else None,
+                    json.dumps(req.execution.model_dump()) if req.execution else None,
                     now, now,
                     json.dumps({**(cached["result"] or {}), "cache_hit": True,
                                 "source_job_id": cached["source_job_id"]}),
@@ -2264,6 +2307,9 @@ async def create_job(req: JobCreate):
                 "preferred_providers": req.preferred_providers or [],
                 "preferred_models": req.preferred_models or [],
                 "depends_on": sorted(req.depends_on or []),
+                "execution": (
+                    req.execution.model_dump() if req.execution is not None else None
+                ),
                 "project": req.project,
                 "parent_job_id": req.parent_job_id,
                 "mnemos_refs": sorted(req.mnemos_refs or []),
@@ -2283,8 +2329,8 @@ async def create_job(req: JobCreate):
             await db.execute(
                 "INSERT INTO jobs (id, submitter_urn, parent_job_id, kind, description, priority, deadline, "
                 "required_capabilities, eligible_kinds, eligible_hosts, project, max_cost_tier, preferred_providers, preferred_models, "
-                "mnemos_refs, depends_on, max_retries, dedup_hash, status, started_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
+                "mnemos_refs, depends_on, execution_spec, max_retries, dedup_hash, status, started_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
                 (
                     job_id, req.submitter_urn, req.parent_job_id, req.kind, req.description,
                     req.priority, req.deadline,
@@ -2297,6 +2343,7 @@ async def create_job(req: JobCreate):
                     json.dumps(req.preferred_models) if req.preferred_models else None,
                     json.dumps(req.mnemos_refs) if req.mnemos_refs else None,
                     json.dumps(req.depends_on) if req.depends_on else None,
+                    json.dumps(req.execution.model_dump()) if req.execution else None,
                     int(req.max_retries),
                     dedup_hash,
                     now,
@@ -2328,7 +2375,11 @@ async def create_job(req: JobCreate):
 
 
 @app.post("/v1/jobs/next")
-async def dequeue_next_job(agent_urn: str):
+async def dequeue_next_job(
+    agent_urn: str,
+    execution_type: Optional[str] = None,
+    job_kinds: Optional[str] = None,
+):
     """Atomic dequeue: highest-priority queued job that this agent is eligible for.
 
     Self-assignment for swarm: agent calls this in its main loop. Server:
@@ -2339,6 +2390,14 @@ async def dequeue_next_job(agent_urn: str):
 
     Race-safe via SQLite immediate-mode UPDATE...WHERE rowid=(SELECT...LIMIT 1) under a transaction.
     """
+    if execution_type not in {None, "local-process"}:
+        raise HTTPException(422, "execution_type must be 'local-process' when provided")
+    requested_kinds = {
+        item.strip() for item in (job_kinds or "").split(",") if item.strip()
+    }
+    if any(not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", item) for item in requested_kinds):
+        raise HTTPException(422, "job_kinds contains an invalid kind")
+
     now = time.time()
     urn_parts = agent_urn.split(":")
     agent_host = (urn_parts[3] if len(urn_parts) > 3 else "").lower()
@@ -2391,15 +2450,21 @@ async def dequeue_next_job(agent_urn: str):
                 ),
             }
 
-            async with db.execute(
+            candidate_sql = (
                 "SELECT id, submitter_urn, parent_job_id, kind, description, priority, deadline, "
                 "required_capabilities, eligible_kinds, eligible_hosts, project, max_cost_tier, "
-                "preferred_providers, preferred_models, mnemos_refs, depends_on, retry_backoff_until "
+                "preferred_providers, preferred_models, mnemos_refs, depends_on, retry_backoff_until, execution_spec "
                 "FROM jobs WHERE status IN ('queued','offered') "
-                "AND (retry_backoff_until IS NULL OR retry_backoff_until <= ?) "
-                "ORDER BY priority DESC, started_at ASC LIMIT 100",
-                (now,),
-            ) as cur:
+                "AND (retry_backoff_until IS NULL OR retry_backoff_until <= ?)"
+            )
+            candidate_args: list[Any] = [now]
+            if execution_type:
+                candidate_sql += " AND execution_spec IS NOT NULL"
+            if requested_kinds:
+                candidate_sql += f" AND kind IN ({','.join('?' * len(requested_kinds))})"
+                candidate_args.extend(sorted(requested_kinds))
+            candidate_sql += " ORDER BY priority DESC, started_at ASC LIMIT 100"
+            async with db.execute(candidate_sql, candidate_args) as cur:
                 candidates = [tuple(r) async for r in cur]
             candidates = [
                 r for _idx, r in sorted(
@@ -2424,7 +2489,15 @@ async def dequeue_next_job(agent_urn: str):
                 (j_id, j_submitter, j_parent, j_kind, j_desc, j_priority, j_deadline,
                  j_caps_json, j_kinds_json, j_hosts_json, j_project, j_max_tier,
                  j_pref_providers, j_pref_models, j_mnemos_refs, j_deps_json,
-                 _j_retry_backoff_until) = r
+                 _j_retry_backoff_until, j_execution_json) = r
+                if requested_kinds and j_kind not in requested_kinds:
+                    continue
+                execution = json.loads(j_execution_json) if j_execution_json else None
+                if execution_type and (
+                    not isinstance(execution, dict)
+                    or execution.get("type") != execution_type
+                ):
+                    continue
                 deps = json_list(j_deps_json)
                 if deps:
                     ph = ",".join("?" * len(deps))
@@ -2474,6 +2547,7 @@ async def dequeue_next_job(agent_urn: str):
                     "preferred_providers": json_list(j_pref_providers),
                     "preferred_models": json_list(j_pref_models),
                     "mnemos_refs": json_list(j_mnemos_refs),
+                    "execution": execution,
                     "status": "claimed",
                     "claimed_by": agent_urn,
                     "claimed_at": now,
@@ -2745,12 +2819,13 @@ async def update_job(job_id: str, req: JobUpdate):
             if req.status in TERMINAL_JOB_STATUSES:
                 async with db.execute(
                     "SELECT kind, description, max_cost_tier, required_capabilities, "
-                    "claimed_model, claimed_provider, claimed_by, result, started_at "
+                    "claimed_model, claimed_provider, claimed_by, result, started_at, execution_spec "
                     "FROM jobs WHERE id=?", (job_id,)
                 ) as cur2:
                     jrow = await cur2.fetchone()
                 if jrow:
-                    kind_j, desc_j, mtier, reqcaps_json, mdl_j, prov_j, claimed_by_j, result_j, started_j = jrow
+                    (kind_j, desc_j, mtier, reqcaps_json, mdl_j, prov_j,
+                     claimed_by_j, result_j, started_j, execution_json) = jrow
                     if claimed_by_j and kind_j:
                         duration = (time.time() - (started_j or time.time())) if started_j else 0
                         col = {"done": "success_count", "failed": "fail_count", "cancelled": "cancelled_count"}[req.status]
@@ -2774,8 +2849,10 @@ async def update_job(job_id: str, req: JobUpdate):
                             ),
                         )
                     if req.status == "done":
-                        ck = cache_key_for(kind_j, desc_j, (mtier or "A").upper(),
-                                           json_list(reqcaps_json))
+                        ck = cache_key_for(
+                            kind_j, desc_j, (mtier or "A").upper(), json_list(reqcaps_json),
+                            json.loads(execution_json) if execution_json else None,
+                        )
                         rdict = json.loads(result_j) if result_j else (req.result or {})
                         ec = (rdict or {}).get("exit_code")
                         if ec == 0 or ec is None:
@@ -3452,7 +3529,7 @@ async def list_jobs(
     limit = clamp_limit(limit, default=100, max_limit=1000)
     sql = ("SELECT id, submitter_urn, parent_job_id, kind, description, priority, status, "
            "claimed_by, started_at, ended_at, result, estimated_cost_usd, "
-           "required_capabilities, eligible_kinds, eligible_hosts FROM jobs WHERE 1=1")
+           "required_capabilities, eligible_kinds, eligible_hosts, execution_spec FROM jobs WHERE 1=1")
     args: list = []
     cnt_sql = "SELECT COUNT(*) FROM jobs WHERE 1=1"
     cnt_args: list = []
@@ -3500,6 +3577,7 @@ async def list_jobs(
                     "required_capabilities": json.loads(r[12]) if r[12] else None,
                     "eligible_kinds": json.loads(r[13]) if r[13] else None,
                     "eligible_hosts": json.loads(r[14]) if r[14] else None,
+                    "execution": json.loads(r[15]) if r[15] else None,
                 })
     return {"count": len(rows), "total": total, "jobs": rows}
 
