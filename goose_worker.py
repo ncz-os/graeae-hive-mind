@@ -26,6 +26,8 @@ import subprocess
 import sys
 import time
 import urllib.request
+
+from hive.auth import client_token
 import urllib.error
 import random
 import signal
@@ -33,7 +35,7 @@ from typing import Optional
 
 HIVE_URL = os.environ.get("HIVE_URL", "http://192.168.207.8:5005")
 # C1: bus transport auth bearer token (env-sourced, never baked in).
-HIVE_BUS_TOKEN = os.environ.get("HIVE_BUS_TOKEN", "")
+HIVE_BUS_TOKEN = client_token("HIVE_BUS_TOKEN", "HIVE_BUS_TOKENS")
 GOOSE_BIN = os.environ.get("GOOSE_BIN", "/usr/local/bin/goose")
 AGENT_HOST = os.environ.get("AGENT_HOST", socket.gethostname())
 AGENT_CAPABILITIES = [c.strip() for c in os.environ.get(
@@ -100,9 +102,10 @@ def _http(method: str, path: str, body: dict | None = None, timeout: float = 10.
 
 
 def register() -> str:
-    global _urn, _last_heartbeat
+    global _urn, _last_heartbeat, HIVE_BUS_TOKEN
     body = {
         "kind": "goose",
+        "runtime": "goose",
         "host": AGENT_HOST,
         "pid": os.getpid(),
         "capabilities": AGENT_CAPABILITIES,
@@ -118,6 +121,7 @@ def register() -> str:
     code, resp = _http("POST", "/v1/agents/register", body)
     if code == 200 and resp:
         _urn = resp["urn"]
+        HIVE_BUS_TOKEN = resp.get("agent_token") or HIVE_BUS_TOKEN
         _last_heartbeat = time.time()
         print(f"[worker] registered urn={_urn}", flush=True)
         return _urn

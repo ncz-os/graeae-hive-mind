@@ -21,6 +21,8 @@ import threading
 import time
 import urllib.error
 import urllib.request
+
+from hive.auth import client_token
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -29,7 +31,7 @@ import wss_driver  # noqa: E402
 HIVE_URL = os.environ.get("HIVE_URL", "http://192.168.207.67:5005")
 # C1: bus transport auth — every request carries this bearer token (the bus now
 # rejects unauthenticated /v1/* + /mcp). Sourced from env, never baked in.
-HIVE_BUS_TOKEN = os.environ.get("HIVE_BUS_TOKEN", "")
+HIVE_BUS_TOKEN = client_token("HIVE_BUS_TOKEN", "HIVE_BUS_TOKENS")
 # MNEMOS — the commit-DAG store. The worker records every meaningful completed
 # job + its commits here so OTHER agents can cross-reference prior work and
 # link future work (GRAEAE-blessed arch 2026-06-01). On the Spark this is the
@@ -285,6 +287,7 @@ def http(method, path, body=None, timeout=20):
 
 
 def register():
+    global HIVE_BUS_TOKEN
     body = {
         "host": AGENT_HOST, "kind": "zeroclaw", "runtime": "zeroclaw",
         "autonomy_level": "interactive", "auth_method": "api",
@@ -299,6 +302,7 @@ def register():
     code, resp = http("POST", "/v1/agents/register", body, timeout=15)
     if code in (200, 201):
         urn = resp.get("urn")
+        HIVE_BUS_TOKEN = resp.get("agent_token") or HIVE_BUS_TOKEN
         log.info("registered urn=%s host=%s narrow=%s",
                  urn, AGENT_HOST, _HOST_LOWER in NARROW_HOSTS)
         return urn

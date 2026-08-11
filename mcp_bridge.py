@@ -24,8 +24,10 @@ Tools:
 from __future__ import annotations
 import json
 import os
+import secrets
 import sys
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from typing import Any
 
 import httpx
@@ -42,12 +44,15 @@ from mcp.types import (
     Tool,
 )
 from starlette.applications import Starlette
+from starlette.responses import JSONResponse
 from starlette.routing import Mount, Route
+
+from hive.auth import client_token
 
 HIVE_URL = os.environ.get("HIVE_URL", "http://127.0.0.1:5005")
 # C1: bus transport auth bearer token (env-sourced). Injected only on bus calls
 # (_hive), kept separate from the MNEMOS token used by _mnemos.
-HIVE_BUS_TOKEN = os.environ.get("HIVE_BUS_TOKEN", "")
+HIVE_BUS_TOKEN = client_token("HIVE_BUS_TOKEN", "HIVE_BUS_TOKENS")
 MNEMOS_URL = os.environ.get("MNEMOS_URL", "http://192.168.207.67:5002")
 # MNEMOS bearer token comes from env. No source-baked default — having a
 # token literal in source meant every clone of this repo carried a working
@@ -56,6 +61,28 @@ MNEMOS_URL = os.environ.get("MNEMOS_URL", "http://192.168.207.67:5002")
 # EnvironmentFile or container env); when missing, calls to /v1/memories/*
 # return a clear MCP tool error instead of being silently unauthenticated.
 MNEMOS_TOKEN = os.environ.get("MNEMOS_TOKEN", "")
+
+
+def _bridge_token_set(singular: str, plural: str) -> frozenset[str]:
+    one = (os.environ.get(singular, "") or "").strip()
+    many = frozenset(
+        item.strip() for item in (os.environ.get(plural, "") or "").split(",")
+        if item.strip()
+    )
+    if one and many and one not in many:
+        raise RuntimeError(f"conflicting {singular} and {plural}")
+    return many or (frozenset({one}) if one else frozenset())
+
+
+MCP_BRIDGE_TOKENS = _bridge_token_set("MCP_BRIDGE_TOKEN", "MCP_BRIDGE_TOKENS")
+MCP_BRIDGE_WRITE_TOKENS = _bridge_token_set(
+    "MCP_BRIDGE_WRITE_TOKEN", "MCP_BRIDGE_WRITE_TOKENS"
+)
+_MCP_TIER: ContextVar[str] = ContextVar("mcp_bridge_tier", default="internal")
+_MUTATING_TOOLS = frozenset({
+    "hive.agent_register", "hive.job_create", "hive.job_next", "hive.job_update",
+    "hive.message_publish", "mnemos.memory_create", "graeae.consult",
+})
 
 client = httpx.AsyncClient(timeout=15.0)
 
@@ -136,8 +163,11 @@ async def handle_list_tools() -> list[Tool]:
         Tool(name="hive.job_next",
              description="Atomic dequeue: claim highest-priority eligible job for this agent. Returns job or {204: no work}.",
              inputSchema={"type": "object",
-                          "properties": {"agent_urn": {"type": "string"}},
-                          "required": ["agent_urn"]}),
+                          "properties": {
+                              "agent_urn": {"type": "string"},
+                              "agent_token": {"type": "string"},
+                          },
+                          "required": ["agent_urn", "agent_token"]}),
         Tool(name="hive.job_list",
              description="List jobs in the Hive. Filter by status/agent/since.",
              inputSchema={"type": "object",
@@ -155,7 +185,8 @@ async def handle_list_tools() -> list[Tool]:
                               "status": {"type": "string"},
                               "result": {"type": "object"},
                               "claimed_by": {"type": "string"},
-                          }, "required": ["id", "status"]}),
+                              "agent_token": {"type": "string"},
+                          }, "required": ["id", "status", "agent_token"]}),
         Tool(name="hive.message_publish",
              description="Publish a Hive message. to_urn=null for broadcast.",
              inputSchema={"type": "object",
@@ -245,14 +276,26 @@ async def handle_call_tool(name: str, args: dict[str, Any]) -> list[TextContent]
                     "raw_response": r,
                 }
         elif name == "hive.job_create":
-            r = await _hive("POST", "/v1/jobs", json=args)
+            allowed = {
+                "submitter_urn", "kind", "description", "priority", "required_capabilities",
+                "eligible_kinds", "deadline", "parent_job_id",
+            }
+            r = await _hive("POST", "/v1/jobs", json={k: v for k, v in args.items() if k in allowed})
         elif name == "hive.job_next":
-            r = await _hive("POST", f"/v1/jobs/next", params={"agent_urn": args["agent_urn"]})
+            agent_token = args["agent_token"]
+            r = await _hive(
+                "POST", f"/v1/jobs/next", params={"agent_urn": args["agent_urn"]},
+                headers={"Authorization": f"Bearer {agent_token}"},
+            )
         elif name == "hive.job_list":
             r = await _hive("GET", "/v1/jobs", params={k: v for k, v in args.items() if v})
         elif name == "hive.job_update":
             jid = args.pop("id")
-            r = await _hive("PATCH", f"/v1/jobs/{jid}", json=args)
+            agent_token = args.pop("agent_token")
+            r = await _hive(
+                "PATCH", f"/v1/jobs/{jid}", json=args,
+                headers={"Authorization": f"Bearer {agent_token}"},
+            )
         elif name == "hive.message_publish":
             r = await _hive("POST", "/v1/messages", json=args)
         elif name == "hive.message_list":
@@ -292,6 +335,11 @@ async def _on_list_tools(_ctx, _params) -> ListToolsResult:
 
 
 async def _on_call_tool(_ctx, params) -> CallToolResult:
+    if params.name in _MUTATING_TOOLS and _MCP_TIER.get() != "write":
+        return CallToolResult(content=[TextContent(
+            type="text",
+            text=json.dumps({"error": "this tool requires an MCP bridge write token"}),
+        )], isError=True)
     return CallToolResult(
         content=await handle_call_tool(params.name, dict(params.arguments or {}))
     )
@@ -320,21 +368,25 @@ sse = SseServerTransport("/messages/")
 
 
 async def handle_sse(request):
-    async with sse.connect_sse(request.scope, request.receive, request._send) as (read_stream, write_stream):
-        await server.run(
-            read_stream, write_stream,
-            InitializationOptions(
-                server_name="graeae-hive-mind",
-                server_version="0.1.0",
-                capabilities=server.get_capabilities(
-                    notification_options=NotificationOptions(),
-                    experimental_capabilities={},
+    token = _MCP_TIER.set(request.scope.get("state", {}).get("mcp_bridge_tier", "read"))
+    try:
+        async with sse.connect_sse(request.scope, request.receive, request._send) as (read_stream, write_stream):
+            await server.run(
+                read_stream, write_stream,
+                InitializationOptions(
+                    server_name="graeae-hive-mind",
+                    server_version="0.1.0",
+                    capabilities=server.get_capabilities(
+                        notification_options=NotificationOptions(),
+                        experimental_capabilities={},
+                    ),
                 ),
-            ),
-        )
+            )
+    finally:
+        _MCP_TIER.reset(token)
 
 
-app = Starlette(
+_starlette_app = Starlette(
     debug=False,
     lifespan=lifespan,
     routes=[
@@ -344,5 +396,39 @@ app = Starlette(
 )
 
 
+class BridgeAuthMiddleware:
+    def __init__(self, wrapped):
+        self.wrapped = wrapped
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http":
+            configured = MCP_BRIDGE_TOKENS | MCP_BRIDGE_WRITE_TOKENS
+            if not configured:
+                await JSONResponse(
+                    {"error": "MCP bridge auth not configured (set MCP_BRIDGE_TOKEN)"},
+                    status_code=503,
+                )(scope, receive, send)
+                return
+            headers = {key.lower(): value for key, value in scope.get("headers", [])}
+            auth = headers.get(b"authorization", b"").decode(errors="ignore")
+            presented = auth[7:].strip() if auth[:7].lower() == "bearer " else ""
+            is_write = any(secrets.compare_digest(presented, t) for t in MCP_BRIDGE_WRITE_TOKENS)
+            is_read = is_write or any(secrets.compare_digest(presented, t) for t in MCP_BRIDGE_TOKENS)
+            if not is_read:
+                await JSONResponse({"error": "invalid MCP bridge bearer token"}, status_code=401)(
+                    scope, receive, send
+                )
+                return
+            scope.setdefault("state", {})["mcp_bridge_tier"] = "write" if is_write else "read"
+        await self.wrapped(scope, receive, send)
+
+
+app = BridgeAuthMiddleware(_starlette_app)
+
+
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "5006")))
+    uvicorn.run(
+        app,
+        host=os.environ.get("MCP_BRIDGE_HOST", "127.0.0.1"),
+        port=int(os.environ.get("PORT", "5006")),
+    )

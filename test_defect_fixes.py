@@ -22,6 +22,7 @@ os.environ["AGENT_BUS_DB"] = _DB_FILE.name
 import agent_bus
 from hive.persistence.factory import get_hive_repository
 from hive.persistence.sqlite import SqliteHiveRepository
+from hive.auth import client_token
 
 
 def _load_script(name: str, filename: str):
@@ -51,7 +52,7 @@ class AgentBusDefectTests(unittest.IsolatedAsyncioTestCase):
             agent_bus.HIVE_BUS_TOKENS = original_workers
             agent_bus.HIVE_BUS_ADMIN_TOKENS = original_admins
 
-    async def test_single_token_profile_retains_admin_compatibility(self):
+    async def test_single_worker_token_is_not_promoted_to_admin(self):
         original_admins = agent_bus.HIVE_BUS_ADMIN_TOKENS
         agent_bus.HIVE_BUS_ADMIN_TOKENS = frozenset()
         request = Request({
@@ -60,9 +61,98 @@ class AgentBusDefectTests(unittest.IsolatedAsyncioTestCase):
         })
         request.state.bus_tier = "worker"
         try:
-            self.assertIsNone(await agent_bus.require_bus_admin(request))
+            with self.assertRaises(agent_bus.HTTPException) as raised:
+                await agent_bus.require_bus_admin(request)
+            self.assertEqual(raised.exception.status_code, 503)
         finally:
             agent_bus.HIVE_BUS_ADMIN_TOKENS = original_admins
+
+    def test_singular_and_plural_bus_token_contracts(self):
+        old = {name: os.environ.get(name) for name in (
+            "HIVE_BUS_TOKEN", "HIVE_BUS_TOKENS", "HIVE_BUS_ADMIN_TOKEN", "HIVE_BUS_ADMIN_TOKENS",
+        )}
+        try:
+            os.environ["HIVE_BUS_TOKEN"] = "worker"
+            os.environ.pop("HIVE_BUS_TOKENS", None)
+            self.assertEqual(
+                agent_bus._load_compatible_token_set("HIVE_BUS_TOKEN", "HIVE_BUS_TOKENS"),
+                frozenset({"worker"}),
+            )
+            os.environ["HIVE_BUS_TOKENS"] = "old,worker"
+            self.assertEqual(len(agent_bus._load_compatible_token_set(
+                "HIVE_BUS_TOKEN", "HIVE_BUS_TOKENS"
+            )), 2)
+            self.assertEqual(client_token("HIVE_BUS_TOKEN", "HIVE_BUS_TOKENS"), "worker")
+            os.environ.pop("HIVE_BUS_TOKEN")
+            self.assertEqual(client_token("HIVE_BUS_TOKEN", "HIVE_BUS_TOKENS"), "old")
+            os.environ["HIVE_BUS_TOKEN"] = "worker"
+            os.environ["HIVE_BUS_TOKENS"] = "different"
+            with self.assertRaisesRegex(RuntimeError, "conflicting"):
+                agent_bus._load_compatible_token_set("HIVE_BUS_TOKEN", "HIVE_BUS_TOKENS")
+        finally:
+            for name, value in old.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+    async def test_agent_session_token_is_bound_to_registered_urn(self):
+        original_workers = agent_bus.HIVE_BUS_TOKENS
+        original_admins = agent_bus.HIVE_BUS_ADMIN_TOKENS
+        agent_bus.HIVE_BUS_TOKENS = frozenset({"worker-secret"})
+        agent_bus.HIVE_BUS_ADMIN_TOKENS = frozenset({"admin-secret"})
+        try:
+            async with agent_bus.lifespan(agent_bus.app):
+                transport = httpx.ASGITransport(app=agent_bus.app)
+                async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                    registration = await client.post(
+                        "/v1/agents/register",
+                        headers={"Authorization": "Bearer worker-secret"},
+                        json={"kind": "goose", "runtime": "goose", "host": "session-test"},
+                    )
+                    self.assertEqual(registration.status_code, 200)
+                    body = registration.json()
+                    shared = await client.post(
+                        "/v1/agents/heartbeat",
+                        headers={"Authorization": "Bearer worker-secret"},
+                        json={"urn": body["urn"]},
+                    )
+                    self.assertEqual(shared.status_code, 403)
+                    bound = await client.post(
+                        "/v1/agents/heartbeat",
+                        headers={"Authorization": f"Bearer {body['agent_token']}"},
+                        json={"urn": body["urn"]},
+                    )
+                    self.assertEqual(bound.status_code, 200)
+                    impersonation = await client.post(
+                        "/v1/agents/heartbeat",
+                        headers={"Authorization": f"Bearer {body['agent_token']}"},
+                        json={"urn": "urn:agent:goose:victim:other"},
+                    )
+                    self.assertEqual(impersonation.status_code, 403)
+        finally:
+            agent_bus.HIVE_BUS_TOKENS = original_workers
+            agent_bus.HIVE_BUS_ADMIN_TOKENS = original_admins
+
+    async def test_health_reports_missing_auth_as_degraded(self):
+        original_workers = agent_bus.HIVE_BUS_TOKENS
+        original_admins = agent_bus.HIVE_BUS_ADMIN_TOKENS
+        agent_bus.HIVE_BUS_TOKENS = frozenset()
+        agent_bus.HIVE_BUS_ADMIN_TOKENS = frozenset()
+        task = asyncio.create_task(asyncio.sleep(30))
+        agent_bus.app.state.reaper_task = task
+        agent_bus.app.state.reaper_last_success = agent_bus.time.time()
+        agent_bus.app.state.reaper_consecutive_failures = 0
+        try:
+            response = await agent_bus.health()
+            self.assertEqual(response.status_code, 503)
+            self.assertEqual(json.loads(response.body)["checks"]["authentication"], "not_configured")
+        finally:
+            agent_bus.HIVE_BUS_TOKENS = original_workers
+            agent_bus.HIVE_BUS_ADMIN_TOKENS = original_admins
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
 
     async def test_worker_token_cannot_toggle_knemon_bypass(self):
         original_workers = agent_bus.HIVE_BUS_TOKENS
@@ -223,6 +313,26 @@ class AgentBusDefectTests(unittest.IsolatedAsyncioTestCase):
 
 
 class WorkerAndRestoreDefectTests(unittest.TestCase):
+    def test_system_watcher_terminal_patch_retries_and_persists_receipt(self):
+        watcher = _load_script("system_watcher_finalize_test", "system_watcher.py")
+        calls = []
+
+        def flaky_patch(job_id, status, result=None):
+            calls.append((status, result))
+            return status == "running"
+
+        watcher.patch_job = flaky_patch
+        watcher._sleep_while_running = lambda _seconds: None
+        self.assertFalse(watcher.finalize_job("job-receipt", "done", {"exit_code": 0}, attempts=2))
+        receipts = [result["_execution_receipt"] for status, result in calls if status == "running"]
+        self.assertTrue(receipts)
+        self.assertEqual(receipts[0]["terminal_status"], "done")
+        self.assertTrue(agent_bus._completed_execution_receipt(json.dumps(calls[-1][1])))
+
+    def test_default_executor_does_not_allow_container_runtimes(self):
+        watcher = _load_script("system_watcher_default_allowlist_test", "system_watcher.py")
+        self.assertNotIn("docker", watcher.ALLOWED_EXECUTABLES)
+        self.assertNotIn("podman", watcher.ALLOWED_EXECUTABLES)
     def test_system_watcher_load_gate_fails_closed(self):
         watcher = _load_script("system_watcher_load_test", "system_watcher.py")
         watcher.LOAD_THRESHOLD = 2.0
@@ -382,6 +492,34 @@ class McpBridgeDefectTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls[1][2]["json"]["metadata"]["tags"], ["release"])
         self.assertNotIn("tags", calls[1][2]["json"])
 
+    async def test_bridge_requires_inbound_auth_and_separates_write_tools(self):
+        transport = httpx.ASGITransport(app=self.bridge.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            unavailable = await client.get("/sse")
+        self.assertEqual(unavailable.status_code, 503)
+
+        self.bridge.MCP_BRIDGE_TOKENS = frozenset({"read-secret"})
+        self.bridge.MCP_BRIDGE_WRITE_TOKENS = frozenset({"write-secret"})
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            rejected = await client.get("/missing", headers={"Authorization": "Bearer bad"})
+            accepted = await client.get(
+                "/missing", headers={"Authorization": "Bearer read-secret"}
+            )
+        self.assertEqual(rejected.status_code, 401)
+        self.assertEqual(accepted.status_code, 404)
+
+        token = self.bridge._MCP_TIER.set("read")
+        try:
+            params = type("Params", (), {"name": "mnemos.memory_create", "arguments": {}})()
+            result = await self.bridge._on_call_tool(None, params)
+            self.assertTrue(result.is_error)
+        finally:
+            self.bridge._MCP_TIER.reset(token)
+
+    def test_bridge_defaults_to_loopback(self):
+        source = Path("mcp_bridge.py").read_text()
+        self.assertIn('os.environ.get("MCP_BRIDGE_HOST", "127.0.0.1")', source)
+
 
 class DashboardDefectTests(unittest.TestCase):
     def test_dashboard_authenticates_fetch_and_sse_without_query_tokens(self):
@@ -412,6 +550,16 @@ class MigrationDefectTests(unittest.TestCase):
         )[0]
         self.assertIn("raise", handler)
         self.assertNotIn("non-fatal", handler)
+
+    def test_oracle_startup_converges_dedup_column_and_index(self):
+        source = Path("agent_bus.py").read_text()
+        oracle_block = source.split('if HIVE_BACKEND == "oracle" and', 1)[1].split(
+            "# Idempotent index", 1
+        )[0]
+        self.assertIn("column_name = 'DEDUP_HASH'", oracle_block)
+        self.assertIn("ALTER TABLE HIVE_JOBS ADD (dedup_hash VARCHAR2(64))", oracle_block)
+        self.assertIn("index_name = 'JOBS_ACTIVE_DEDUP_UQ'", oracle_block)
+        self.assertIn("CREATE UNIQUE INDEX jobs_active_dedup_uq ON HIVE_JOBS", oracle_block)
 
     def test_oracle_startup_closes_async_cursor_synchronously_in_finally(self):
         source = Path("agent_bus.py").read_text()

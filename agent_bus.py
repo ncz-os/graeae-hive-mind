@@ -9,6 +9,9 @@ Triage queue: /v1/jobs/next dequeues highest-priority eligible work; no central 
 """
 from __future__ import annotations
 import asyncio
+import base64
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -46,20 +49,35 @@ MAX_EVENT_SUBSCRIBERS = int(os.environ.get("AGENT_BUS_MAX_EVENT_SUBSCRIBERS", "1
 # an attacker could self-register an "orchestrator" runtime, SUBMIT a job, and a
 # worker would claim+execute it as a shell agent. We now require a bearer token
 # on every /v1/* and /mcp request, in TWO tiers:
-#   * worker tier (HIVE_BUS_TOKENS)        — register/heartbeat/claim/next/patch/read
-#   * admin tier  (HIVE_BUS_ADMIN_TOKENS)  — SUBMIT jobs + /v1/admin/* + schedules
+#   * worker tier (HIVE_BUS_TOKEN; legacy HIVE_BUS_TOKENS rotation set)
+#   * admin tier  (HIVE_BUS_ADMIN_TOKEN; legacy HIVE_BUS_ADMIN_TOKENS set)
 # Admin tokens are a superset (also accepted as worker tokens). Job SUBMISSION
 # now requires the admin tier, so a self-declared `runtime` can no longer grant
 # submit rights — the caller must hold the orchestrator/admin secret. Tokens are
 # sourced from env (comma-separated), never baked into code.
 # FAIL-CLOSED: if NO tokens are configured the bus refuses all /v1 + /mcp traffic
 # (503) instead of serving it open.
-def _load_token_set(var: str) -> frozenset:
+def _load_token_set(var: str) -> frozenset[str]:
     return frozenset(t.strip() for t in (os.environ.get(var, "") or "").split(",") if t.strip())
 
 
-HIVE_BUS_TOKENS = _load_token_set("HIVE_BUS_TOKENS")
-HIVE_BUS_ADMIN_TOKENS = _load_token_set("HIVE_BUS_ADMIN_TOKENS")
+def _load_compatible_token_set(singular: str, plural: str) -> frozenset[str]:
+    """Load the canonical singular token while accepting the rotation-era set."""
+    one = (os.environ.get(singular, "") or "").strip()
+    many = _load_token_set(plural)
+    if one and many and one not in many:
+        raise RuntimeError(
+            f"conflicting {singular} and {plural}: when both are set, "
+            f"{singular} must also appear in {plural}"
+        )
+    return many or (frozenset({one}) if one else frozenset())
+
+
+HIVE_BUS_TOKENS = _load_compatible_token_set("HIVE_BUS_TOKEN", "HIVE_BUS_TOKENS")
+HIVE_BUS_ADMIN_TOKENS = _load_compatible_token_set(
+    "HIVE_BUS_ADMIN_TOKEN", "HIVE_BUS_ADMIN_TOKENS"
+)
+HIVE_BUS_SESSION_SECRET = os.environ.get("HIVE_BUS_SESSION_SECRET") or secrets.token_urlsafe(32)
 # Never-authed paths: liveness probe + the dashboard HTML shell (its XHRs to
 # /v1/* still carry the token).
 _AUTH_EXEMPT_PATHS = frozenset({"/health", "/"})
@@ -1307,6 +1325,24 @@ CLAIM_STALE_AFTER_BY_KIND = {
     "benchmark": 3600.0,
     "migration": 7200.0,  # multi-host db / fleet migrations need wide window
 }
+
+
+def _completed_execution_receipt(result_json: Optional[str]) -> Optional[dict]:
+    try:
+        result = json.loads(result_json) if result_json else None
+    except (TypeError, ValueError):
+        return None
+    receipt = result.get("_execution_receipt") if isinstance(result, dict) else None
+    if (
+        isinstance(receipt, dict)
+        and receipt.get("version") == 1
+        and receipt.get("completed") is True
+        and receipt.get("terminal_status") == "done"
+    ):
+        return result
+    return None
+
+
 async def reaper_task(app: FastAPI):
     while True:
         await asyncio.sleep(HEARTBEAT_REAP_INTERVAL)
@@ -1340,10 +1376,20 @@ async def reaper_task(app: FastAPI):
                 if dead:
                     for urn in dead:
                         async with db.execute(
-                            "SELECT id FROM jobs WHERE claimed_by=? AND status IN ('offered','claimed','running')",
+                            "SELECT id, result FROM jobs WHERE claimed_by=? AND status IN ('offered','claimed','running')",
                             (urn,),
                         ) as cur:
-                            assigned_jobs = [row[0] async for row in cur]
+                            assigned_jobs = [(row[0], row[1]) async for row in cur]
+                        completed_ids = [
+                            job_id for job_id, result_json in assigned_jobs
+                            if _completed_execution_receipt(result_json)
+                        ]
+                        for job_id in completed_ids:
+                            await db.execute(
+                                "UPDATE jobs SET status='done', ended_at=?, claim_lease_expires_at=NULL "
+                                "WHERE id=? AND status IN ('claimed','running')",
+                                (now_ts, job_id),
+                            )
                         await db.execute(
                             "UPDATE jobs SET status='queued', claimed_by=NULL, claimed_at=NULL, "
                             "claimed_runtime=NULL, claimed_model=NULL, claimed_provider=NULL, "
@@ -1355,7 +1401,9 @@ async def reaper_task(app: FastAPI):
                             "UPDATE agents SET status='offline' WHERE urn=?",
                             (urn,),
                         )
-                        for job_id in assigned_jobs:
+                        for job_id, result_json in assigned_jobs:
+                            if _completed_execution_receipt(result_json):
+                                continue
                             await emit_event(db, "job.unclaimed", {
                                 "id": job_id, "prior_claimer": urn,
                                 "reason": "agent_offline_heartbeat_timeout",
@@ -1371,7 +1419,7 @@ async def reaper_task(app: FastAPI):
                 default_cutoff = now_ts - CLAIM_STALE_AFTER
                 async with db.execute(
                     "SELECT j.id, j.kind, j.claimed_by, j.claimed_at, j.last_update_at, "
-                    "j.claim_lease_expires_at "
+                    "j.claim_lease_expires_at, j.result "
                     "FROM jobs j "
                     "LEFT JOIN agents a ON a.urn = j.claimed_by "
                     "WHERE j.status IN ('claimed','running') "
@@ -1380,11 +1428,15 @@ async def reaper_task(app: FastAPI):
                     "      COALESCE(j.last_update_at, j.claimed_at) < ? )",
                     (now_ts, default_cutoff,)
                 ) as cur:
-                    candidates = [(r[0], r[1], r[2], r[3], r[4], r[5]) async for r in cur]
+                    candidates = [(r[0], r[1], r[2], r[3], r[4], r[5], r[6]) async for r in cur]
                 # Apply kind-specific override: keep job if its kind has a longer TTL
                 # AND its latest progress timestamp is within that window.
                 orphans = []
-                for jid, jkind, claimer, c_at, u_at, lease_exp in candidates:
+                completed_orphans = []
+                for jid, jkind, claimer, c_at, u_at, lease_exp, result_json in candidates:
+                    if _completed_execution_receipt(result_json):
+                        completed_orphans.append((jid, claimer))
+                        continue
                     if lease_exp is not None and lease_exp <= now_ts:
                         orphans.append((jid, claimer))
                         continue
@@ -1392,6 +1444,18 @@ async def reaper_task(app: FastAPI):
                     latest = u_at if u_at is not None else (c_at or 0)
                     if (now_ts - latest) >= kind_ttl:
                         orphans.append((jid, claimer))
+                if completed_orphans:
+                    for job_id, claimer in completed_orphans:
+                        await db.execute(
+                            "UPDATE jobs SET status='done', ended_at=?, claim_lease_expires_at=NULL "
+                            "WHERE id=? AND status IN ('claimed','running')",
+                            (now_ts, job_id),
+                        )
+                        await emit_event(db, "job.done", {
+                            "id": job_id, "claimed_by": claimer,
+                            "reason": "execution_receipt_reconciled",
+                        })
+                    await db.commit()
                 if orphans:
                     for job_id, claimer in orphans:
                         await db.execute(
@@ -1634,6 +1698,24 @@ async def lifespan(app: FastAPI):
                         )
                     await rcur.execute(
                         "SELECT COUNT(*) FROM user_tab_columns "
+                        "WHERE table_name = 'HIVE_JOBS' AND column_name = 'DEDUP_HASH'"
+                    )
+                    if not (await rcur.fetchone())[0]:
+                        await rcur.execute(
+                            "ALTER TABLE HIVE_JOBS ADD (dedup_hash VARCHAR2(64))"
+                        )
+                    await rcur.execute(
+                        "SELECT COUNT(*) FROM user_indexes "
+                        "WHERE table_name = 'HIVE_JOBS' AND index_name = 'JOBS_ACTIVE_DEDUP_UQ'"
+                    )
+                    if not (await rcur.fetchone())[0]:
+                        await rcur.execute(
+                            "CREATE UNIQUE INDEX jobs_active_dedup_uq ON HIVE_JOBS ("
+                            "CASE WHEN status IN ('queued','offered','claimed','running') "
+                            "THEN dedup_hash END)"
+                        )
+                    await rcur.execute(
+                        "SELECT COUNT(*) FROM user_tab_columns "
                         "WHERE table_name = 'HIVE_JOBS' AND column_name = 'DECLINE_COUNT'"
                     )
                     has_col = (await rcur.fetchone())[0]
@@ -1720,6 +1802,24 @@ def _token_matches(token: str, allowed: frozenset) -> bool:
     return any(secrets.compare_digest(token, a) for a in allowed)
 
 
+def _agent_session_token(urn: str) -> str:
+    payload = base64.urlsafe_b64encode(urn.encode()).decode().rstrip("=")
+    signature = hmac.new(HIVE_BUS_SESSION_SECRET.encode(), urn.encode(), hashlib.sha256).hexdigest()
+    return f"hive-agent-v1.{payload}.{signature}"
+
+
+def _agent_session_urn(token: str) -> Optional[str]:
+    try:
+        prefix, payload, signature = token.split(".", 2)
+        if prefix != "hive-agent-v1":
+            return None
+        urn = base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)).decode()
+    except (ValueError, UnicodeError):
+        return None
+    expected = hmac.new(HIVE_BUS_SESSION_SECRET.encode(), urn.encode(), hashlib.sha256).hexdigest()
+    return urn if secrets.compare_digest(signature, expected) else None
+
+
 async def verify_bus_auth(request: Request) -> None:
     """Global baseline auth: every /v1/* and /mcp request needs a worker- (or
     admin-) tier bearer token. Stamps request.state.bus_tier for the admin check.
@@ -1730,26 +1830,40 @@ async def verify_bus_auth(request: Request) -> None:
     if not HIVE_BUS_TOKENS and not HIVE_BUS_ADMIN_TOKENS:
         raise HTTPException(
             status_code=503,
-            detail="bus auth not configured (set HIVE_BUS_TOKENS); refusing to serve unauthenticated",
+            detail="bus auth not configured (set HIVE_BUS_TOKEN); refusing to serve unauthenticated",
         )
     token = _bearer_token(request)
     is_admin = _token_matches(token, HIVE_BUS_ADMIN_TOKENS)
     is_worker = is_admin or _token_matches(token, HIVE_BUS_TOKENS)
-    if not is_worker:
+    agent_urn = None if is_worker else _agent_session_urn(token)
+    if not is_worker and not agent_urn:
         raise HTTPException(
             status_code=401,
             detail="missing/invalid bus token (Authorization: Bearer <HIVE_BUS_TOKEN>)",
         )
     request.state.bus_tier = "admin" if is_admin else "worker"
+    request.state.agent_urn = agent_urn
+
+
+def _require_agent_identity(request: Optional[Request], urn: str) -> None:
+    if request is None:  # trusted in-process callers
+        return
+    if getattr(request.state, "bus_tier", None) == "admin":
+        return
+    authenticated_urn = getattr(request.state, "agent_urn", None)
+    if not authenticated_urn:
+        raise HTTPException(403, "agent session token required; register to obtain one")
+    if not secrets.compare_digest(authenticated_urn, urn):
+        raise HTTPException(403, "agent session token does not match requested agent URN")
 
 
 async def require_bus_admin(request: Request) -> None:
     """Privileged tier for job SUBMISSION + admin + schedule mutation. Closes the
     self-declared-runtime escalation: submitting now requires the admin secret,
-    not a chosen `runtime` field. If no admin tier is configured, worker auth
-    (already enforced globally) suffices so single-token deployments still work."""
+    not a chosen `runtime` field. Worker credentials are never promoted to the
+    administrative tier implicitly."""
     if not HIVE_BUS_ADMIN_TOKENS:
-        return
+        raise HTTPException(503, "admin auth not configured (set HIVE_BUS_ADMIN_TOKEN)")
     if getattr(request.state, "bus_tier", None) == "admin":
         return
     # ordering-independent fallback: re-check the presented token directly.
@@ -1757,7 +1871,7 @@ async def require_bus_admin(request: Request) -> None:
         return
     raise HTTPException(
         status_code=403,
-        detail="this endpoint requires an admin bus token (HIVE_BUS_ADMIN_TOKENS)",
+        detail="this endpoint requires an admin bus token (HIVE_BUS_ADMIN_TOKEN)",
     )
 
 
@@ -1775,6 +1889,9 @@ app = FastAPI(
 @app.get("/health")
 async def health():
     checks: dict[str, str] = {}
+    checks["authentication"] = (
+        "ok" if HIVE_BUS_TOKENS or HIVE_BUS_ADMIN_TOKENS else "not_configured"
+    )
 
     async def _check_database() -> None:
         sql = "SELECT 1 FROM dual" if HIVE_BACKEND == "oracle" else "SELECT 1"
@@ -1828,7 +1945,7 @@ async def dashboard():
 
 
 @app.post("/v1/agents/register")
-async def register(req: AgentRegister):
+async def register(req: AgentRegister, request: Request = None):
     # #5 FIX (review 2026-05-23): reject minimally-incomplete registrations with 422 so
     # callers see the error instead of getting a null URN that bricks their session.
     if (req.host or "").lower().strip() in HOST_DENYLIST:
@@ -1915,6 +2032,7 @@ async def register(req: AgentRegister):
         })
     return {
         "urn": urn, "session_id": session_id, "registered_at": now,
+        "agent_token": _agent_session_token(urn),
         "kind": kind, "runtime": runtime, "model": model,
         "provider": provider, "cost_tier": tier, "autonomy_level": autonomy,
         "auth_method": auth_method, "plan_cap_usd": plan_cap_usd,
@@ -1923,7 +2041,8 @@ async def register(req: AgentRegister):
 
 
 @app.post("/v1/agents/heartbeat")
-async def heartbeat(req: AgentHeartbeat):
+async def heartbeat(req: AgentHeartbeat, request: Request = None):
+    _require_agent_identity(request, req.urn)
     now = time.time()
     status = (req.status or "online").lower()
     if status not in VALID_AGENT_STATUSES:
@@ -2379,6 +2498,7 @@ async def dequeue_next_job(
     agent_urn: str,
     execution_type: Optional[str] = None,
     job_kinds: Optional[str] = None,
+    request: Request = None,
 ):
     """Atomic dequeue: highest-priority queued job that this agent is eligible for.
 
@@ -2390,6 +2510,7 @@ async def dequeue_next_job(
 
     Race-safe via SQLite immediate-mode UPDATE...WHERE rowid=(SELECT...LIMIT 1) under a transaction.
     """
+    _require_agent_identity(request, agent_urn)
     if execution_type not in {None, "local-process"}:
         raise HTTPException(422, "execution_type must be 'local-process' when provided")
     requested_kinds = {
@@ -2588,7 +2709,7 @@ async def dequeue_next_job(
 
 
 @app.patch("/v1/jobs/{job_id}")
-async def update_job(job_id: str, req: JobUpdate):
+async def update_job(job_id: str, req: JobUpdate, request: Request = None):
     now = time.time()
     if req.status not in VALID_JOB_STATUSES:
         raise HTTPException(
@@ -2650,6 +2771,9 @@ async def update_job(job_id: str, req: JobUpdate):
                 await db.execute("ROLLBACK")
                 raise HTTPException(404, f"job not found: {job_id}")
             old_status, old_claimed_by, prov, mod, retry_count, max_retries, decline_count = current
+
+            if old_claimed_by:
+                _require_agent_identity(request, old_claimed_by)
 
             if req.status not in STATUS_TRANSITIONS.get(old_status, set()):
                 await db.execute("ROLLBACK")
@@ -3377,7 +3501,7 @@ async def job_metrics():
 
 
 @app.post("/v1/jobs/{job_id}/claim")
-async def claim_job(job_id: str, by: str):
+async def claim_job(job_id: str, by: str, request: Request = None):
     """Targeted single-job claim with the same eligibility checks as
     /v1/jobs/next (dequeue_next_job).
 
@@ -3392,6 +3516,7 @@ async def claim_job(job_id: str, by: str):
     one specific job_id so manual claims are subject to the same
     contract as auto-claims.
     """
+    _require_agent_identity(request, by)
     now = time.time()
     async with connect_db() as db:
         # 1. agent must exist + be online/idle

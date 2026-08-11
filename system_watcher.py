@@ -41,9 +41,11 @@ import signal
 import tempfile
 import urllib.parse
 
+from hive.auth import client_token
+
 HIVE_URL = os.environ.get("HIVE_URL", "http://192.168.207.67:5005")
 # C1: bus transport auth bearer token (env-sourced, never baked in).
-HIVE_BUS_TOKEN = os.environ.get("HIVE_BUS_TOKEN", "")
+HIVE_BUS_TOKEN = client_token("HIVE_BUS_TOKEN", "HIVE_BUS_TOKENS")
 AGENT_HOST = os.environ.get("AGENT_HOST", socket.gethostname().split(".")[0])
 HEARTBEAT_INTERVAL = float(os.environ.get("HEARTBEAT_INTERVAL", "15"))
 CLAIM_JOBS = os.environ.get("CLAIM_JOBS", "0") == "1"
@@ -63,7 +65,7 @@ JOB_KINDS = tuple(
 ALLOWED_EXECUTABLES = frozenset(
     item.strip() for item in os.environ.get(
         "SYSTEM_WATCHER_ALLOWED_EXECUTABLES",
-        "make,ninja,cmake,cargo,go,npm,pnpm,yarn,docker,podman,blender",
+        "make,ninja,cmake,cargo,go,npm,pnpm,yarn,blender",
     ).split(",") if item.strip()
 )
 ALLOWED_JOB_ENV = frozenset(
@@ -506,7 +508,7 @@ def capabilities_from_specs(specs: dict) -> list[str]:
 
 
 def register():
-    global _urn
+    global _urn, HIVE_BUS_TOKEN
     specs = static_specs()
     caps = capabilities_from_specs(specs)
     load = dynamic_load()
@@ -530,6 +532,7 @@ def register():
     code, resp = _http("POST", "/v1/agents/register", body)
     if code == 200 and resp:
         _urn = resp["urn"]
+        HIVE_BUS_TOKEN = resp.get("agent_token") or HIVE_BUS_TOKEN
         print(f"[sysw] registered urn={_urn} caps={caps}", flush=True)
     else:
         print(f"[sysw] register failed code={code} resp={resp}", flush=True)
@@ -591,6 +594,39 @@ def patch_job(job_id: str, status: str, result: dict | None = None) -> bool:
         print(f"[sysw] job patch failed id={job_id} status={status} code={code} resp={resp}", flush=True)
         return False
     return True
+
+
+def finalize_job(job_id: str, status: str, result: dict, attempts: int = 5) -> bool:
+    """Persist completion evidence and retry the terminal transition."""
+    if status != "done":
+        for attempt in range(attempts):
+            if patch_job(job_id, status, result):
+                return True
+            if attempt + 1 < attempts:
+                _sleep_while_running(min(0.25 * (2 ** attempt), 4.0))
+        return False
+    receipt_result = dict(result)
+    receipt_result["_execution_receipt"] = {
+        "version": 1,
+        "execution_id": job_id,
+        "completed": True,
+        "terminal_status": status,
+    }
+    delay = 0.25
+    receipt_saved = False
+    for attempt in range(attempts):
+        if patch_job(job_id, status, receipt_result):
+            return True
+        # A running PATCH both renews ownership and gives the bus durable proof
+        # that the side effect completed. Its reaper finalizes this receipt
+        # instead of putting the job back in the execution queue.
+        receipt_saved = patch_job(job_id, "running", receipt_result) or receipt_saved
+        if attempt + 1 < attempts:
+            _sleep_while_running(delay)
+            delay = min(delay * 2, 4.0)
+    if receipt_saved:
+        print(f"[sysw] terminal patch deferred to bus receipt reconciliation id={job_id}", flush=True)
+    return False
 
 
 def _validated_process(job: dict) -> tuple[list[str], str, dict[str, str], int]:
@@ -677,7 +713,13 @@ def execute_job(job: dict) -> tuple[str, dict]:
     except Exception as exc:
         return "failed", {"exit_code": -2, "worker_error": "invalid_execution_spec", "error": str(exc)}
 
-    if not patch_job(job_id, "running", {"phase": "starting", "executor": "local-process"}):
+    if not patch_job(job_id, "running", {
+        "phase": "starting",
+        "executor": "local-process",
+        "_execution_receipt": {
+            "version": 1, "execution_id": job_id, "completed": False,
+        },
+    }):
         return "failed", {
             "exit_code": -3,
             "worker_error": "running_transition_failed",
@@ -726,6 +768,9 @@ def execute_job(job: dict) -> tuple[str, dict]:
             if now_monotonic >= next_lease:
                 renewed = patch_job(job_id, "running", {
                     "phase": "running", "executor": "local-process", "elapsed_sec": round(elapsed, 1),
+                    "_execution_receipt": {
+                        "version": 1, "execution_id": job_id, "completed": False,
+                    },
                 })
                 if not renewed:
                     stop_reason = "lease_renewal_failed"
@@ -798,7 +843,7 @@ def main():
                 job = claim_next_job()
                 if job:
                     status, result = execute_job(job)
-                    patch_job(job["id"], status, result)
+                    finalize_job(job["id"], status, result)
                     delay = 0
                 else:
                     delay = JOB_POLL_INTERVAL

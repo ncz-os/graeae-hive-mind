@@ -20,10 +20,12 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+from hive.auth import client_token
+
 HIVE_URL = os.environ.get("HIVE_URL", "http://192.168.207.67:5005")
 # C1: bus transport auth bearer token (env-sourced, never baked in).
-HIVE_BUS_TOKEN = os.environ.get("HIVE_BUS_TOKEN", "")
-HIVE_BUS_ADMIN_TOKEN = os.environ.get("HIVE_BUS_ADMIN_TOKEN", HIVE_BUS_TOKEN)
+HIVE_BUS_TOKEN = client_token("HIVE_BUS_TOKEN", "HIVE_BUS_TOKENS")
+HIVE_BUS_ADMIN_TOKEN = client_token("HIVE_BUS_ADMIN_TOKEN", "HIVE_BUS_ADMIN_TOKENS")
 STATE_DIR = Path("/var/lib/hive-auto-restore")
 STATE_FILE = STATE_DIR / "retry_counts.json"
 LOG_FILE = "/var/log/hive-auto-restore.log"
