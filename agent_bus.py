@@ -23,8 +23,6 @@ from contextlib import asynccontextmanager
 from contextlib import suppress
 from typing import Optional, Any, Literal
 
-from hive.persistence import _sqlite_async as aiosqlite
-
 import queue_logic
 from hive.persistence.factory import get_hive_repository
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -77,7 +75,24 @@ HIVE_BUS_TOKENS = _load_compatible_token_set("HIVE_BUS_TOKEN", "HIVE_BUS_TOKENS"
 HIVE_BUS_ADMIN_TOKENS = _load_compatible_token_set(
     "HIVE_BUS_ADMIN_TOKEN", "HIVE_BUS_ADMIN_TOKENS"
 )
-HIVE_BUS_SESSION_SECRET = os.environ.get("HIVE_BUS_SESSION_SECRET") or secrets.token_urlsafe(32)
+def _session_signing_secret(
+    configured: Optional[str], workers: frozenset[str], admins: frozenset[str]
+) -> str:
+    """Return a restart-stable signing key without requiring another secret."""
+    if configured:
+        return configured
+    tokens = sorted(workers | admins)
+    if tokens:
+        material = "\0".join(tokens).encode()
+        return hashlib.sha256(b"hive-agent-session-v1\0" + material).hexdigest()
+    # Auth is fail-closed when no transport tokens exist, so this key cannot
+    # mint a usable session. Keep imports possible for diagnostics/tests.
+    return secrets.token_urlsafe(32)
+
+
+HIVE_BUS_SESSION_SECRET = _session_signing_secret(
+    os.environ.get("HIVE_BUS_SESSION_SECRET"), HIVE_BUS_TOKENS, HIVE_BUS_ADMIN_TOKENS
+)
 # Never-authed paths: liveness probe + the dashboard HTML shell (its XHRs to
 # /v1/* still carry the token).
 _AUTH_EXEMPT_PATHS = frozenset({"/health", "/"})
@@ -694,6 +709,18 @@ CREATE TABLE IF NOT EXISTS scheduled_jobs (
 );
 CREATE INDEX IF NOT EXISTS idx_sched_next ON scheduled_jobs(next_fire_at, enabled);
 """
+
+
+def _schema_create_table_statement(table: str) -> str:
+    """Extract one CREATE TABLE statement without using executescript()."""
+    match = re.search(
+        rf"CREATE TABLE IF NOT EXISTS {re.escape(table)}\s*\(.*?\n\);",
+        SCHEMA,
+        flags=re.DOTALL,
+    )
+    if not match:
+        raise RuntimeError(f"SCHEMA has no CREATE TABLE statement for {table}")
+    return match.group(0)
 
 
 # ---------- models ----------
@@ -1376,19 +1403,29 @@ async def reaper_task(app: FastAPI):
                 if dead:
                     for urn in dead:
                         async with db.execute(
-                            "SELECT id, result FROM jobs WHERE claimed_by=? AND status IN ('offered','claimed','running')",
+                            "SELECT id, result, status, tokens_in, tokens_out, result_mnemos_id "
+                            "FROM jobs WHERE claimed_by=? "
+                            "AND status IN ('offered','claimed','running')",
                             (urn,),
                         ) as cur:
-                            assigned_jobs = [(row[0], row[1]) async for row in cur]
-                        completed_ids = [
-                            job_id for job_id, result_json in assigned_jobs
-                            if _completed_execution_receipt(result_json)
+                            assigned_jobs = [tuple(row) async for row in cur]
+                        completed_jobs = [
+                            (job_id, _completed_execution_receipt(result_json),
+                             tokens_in, tokens_out, result_mnemos_id)
+                            for job_id, result_json, status, tokens_in, tokens_out,
+                            result_mnemos_id in assigned_jobs
+                            if status in {"claimed", "running"}
+                            and _completed_execution_receipt(result_json)
                         ]
-                        for job_id in completed_ids:
-                            await db.execute(
-                                "UPDATE jobs SET status='done', ended_at=?, claim_lease_expires_at=NULL "
-                                "WHERE id=? AND status IN ('claimed','running')",
-                                (now_ts, job_id),
+                        for job_id, receipt_result, tokens_in, tokens_out, result_mnemos_id in completed_jobs:
+                            await update_job(
+                                job_id,
+                                JobUpdate(
+                                    status="done", claimed_by=urn,
+                                    result=receipt_result,
+                                    tokens_in=tokens_in, tokens_out=tokens_out,
+                                    result_mnemos_id=result_mnemos_id,
+                                ),
                             )
                         await db.execute(
                             "UPDATE jobs SET status='queued', claimed_by=NULL, claimed_at=NULL, "
@@ -1401,7 +1438,7 @@ async def reaper_task(app: FastAPI):
                             "UPDATE agents SET status='offline' WHERE urn=?",
                             (urn,),
                         )
-                        for job_id, result_json in assigned_jobs:
+                        for job_id, result_json, _status, _tokens_in, _tokens_out, _mnemos_id in assigned_jobs:
                             if _completed_execution_receipt(result_json):
                                 continue
                             await emit_event(db, "job.unclaimed", {
@@ -1419,7 +1456,8 @@ async def reaper_task(app: FastAPI):
                 default_cutoff = now_ts - CLAIM_STALE_AFTER
                 async with db.execute(
                     "SELECT j.id, j.kind, j.claimed_by, j.claimed_at, j.last_update_at, "
-                    "j.claim_lease_expires_at, j.result "
+                    "j.claim_lease_expires_at, j.result, j.tokens_in, j.tokens_out, "
+                    "j.result_mnemos_id "
                     "FROM jobs j "
                     "LEFT JOIN agents a ON a.urn = j.claimed_by "
                     "WHERE j.status IN ('claimed','running') "
@@ -1428,14 +1466,18 @@ async def reaper_task(app: FastAPI):
                     "      COALESCE(j.last_update_at, j.claimed_at) < ? )",
                     (now_ts, default_cutoff,)
                 ) as cur:
-                    candidates = [(r[0], r[1], r[2], r[3], r[4], r[5], r[6]) async for r in cur]
+                    candidates = [tuple(r) async for r in cur]
                 # Apply kind-specific override: keep job if its kind has a longer TTL
                 # AND its latest progress timestamp is within that window.
                 orphans = []
                 completed_orphans = []
-                for jid, jkind, claimer, c_at, u_at, lease_exp, result_json in candidates:
-                    if _completed_execution_receipt(result_json):
-                        completed_orphans.append((jid, claimer))
+                for (jid, jkind, claimer, c_at, u_at, lease_exp, result_json,
+                     tokens_in, tokens_out, result_mnemos_id) in candidates:
+                    receipt_result = _completed_execution_receipt(result_json)
+                    if receipt_result:
+                        completed_orphans.append(
+                            (jid, claimer, receipt_result, tokens_in, tokens_out, result_mnemos_id)
+                        )
                         continue
                     if lease_exp is not None and lease_exp <= now_ts:
                         orphans.append((jid, claimer))
@@ -1445,17 +1487,17 @@ async def reaper_task(app: FastAPI):
                     if (now_ts - latest) >= kind_ttl:
                         orphans.append((jid, claimer))
                 if completed_orphans:
-                    for job_id, claimer in completed_orphans:
-                        await db.execute(
-                            "UPDATE jobs SET status='done', ended_at=?, claim_lease_expires_at=NULL "
-                            "WHERE id=? AND status IN ('claimed','running')",
-                            (now_ts, job_id),
+                    for (job_id, claimer, receipt_result, tokens_in, tokens_out,
+                         result_mnemos_id) in completed_orphans:
+                        await update_job(
+                            job_id,
+                            JobUpdate(
+                                status="done", claimed_by=claimer,
+                                result=receipt_result,
+                                tokens_in=tokens_in, tokens_out=tokens_out,
+                                result_mnemos_id=result_mnemos_id,
+                            ),
                         )
-                        await emit_event(db, "job.done", {
-                            "id": job_id, "claimed_by": claimer,
-                            "reason": "execution_receipt_reconciled",
-                        })
-                    await db.commit()
                 if orphans:
                     for job_id, claimer in orphans:
                         await db.execute(
@@ -1532,6 +1574,32 @@ async def lifespan(app: FastAPI):
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     async with connect_db() as db:
         await db.executescript("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
+        if HIVE_BACKEND == "sqlite":
+            # A prior process may have stopped after the source table was
+            # renamed but before its replacement was committed. Restore the
+            # authoritative pre-migration table before SCHEMA can create an
+            # empty replacement and hide the stranded data.
+            async with db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND "
+                "name IN ('agents','agents__pre_stale_migration',"
+                "'jobs','jobs__pre_deadletter_migration')"
+            ) as cur:
+                existing_tables = {row[0] for row in await cur.fetchall()}
+            for table, backup in (
+                ("agents", "agents__pre_stale_migration"),
+                ("jobs", "jobs__pre_deadletter_migration"),
+            ):
+                if backup not in existing_tables:
+                    continue
+                await db.execute("BEGIN IMMEDIATE")
+                try:
+                    if table in existing_tables:
+                        await db.execute(f"DROP TABLE {table}")
+                    await db.execute(f"ALTER TABLE {backup} RENAME TO {table}")
+                    await db.execute("COMMIT")
+                except Exception:
+                    await db.execute("ROLLBACK")
+                    raise
         await db.executescript(SCHEMA)
         # graeae:schema-drift (2026-05-23): additive migrations for live DBs.
         # New-column indexes stay out of SCHEMA because CREATE INDEX fails on
@@ -1558,35 +1626,21 @@ async def lifespan(app: FastAPI):
                 "subscription_pools",
             )
             col_list = ", ".join(cols)
-            await conn.execute("ALTER TABLE agents RENAME TO agents__pre_stale_migration")
-            await conn.execute(
-                "CREATE TABLE agents ("
-                "urn TEXT PRIMARY KEY, "
-                "kind TEXT NOT NULL, "
-                "host TEXT NOT NULL, "
-                "session_id TEXT NOT NULL, "
-                "pid INTEGER, "
-                "capabilities TEXT, "
-                "version TEXT, "
-                "started_at REAL NOT NULL, "
-                "last_heartbeat REAL NOT NULL, "
-                "status TEXT NOT NULL CHECK(status IN ('online','idle','stale','offline','error')), "
-                "metadata TEXT, "
-                "runtime TEXT, "
-                "model TEXT, "
-                "provider TEXT, "
-                "autonomy_level TEXT, "
-                "cost_tier TEXT, "
-                "current_load TEXT, "
-                "auth_method TEXT, "
-                "plan_cap_usd REAL, "
-                "plan_period_used_usd REAL DEFAULT 0, "
-                "subscription_pools TEXT)"
-            )
-            await conn.execute(
-                f"INSERT INTO agents ({col_list}) SELECT {col_list} FROM agents__pre_stale_migration"
-            )
-            await conn.execute("DROP TABLE agents__pre_stale_migration")
+            await conn.commit()
+            await conn.execute("BEGIN IMMEDIATE")
+            try:
+                await conn.execute("ALTER TABLE agents RENAME TO agents__pre_stale_migration")
+                await conn.execute(_schema_create_table_statement("agents"))
+                await conn.execute(
+                    f"INSERT INTO agents ({col_list}) SELECT {col_list} FROM agents__pre_stale_migration"
+                )
+                await conn.execute("DROP TABLE agents__pre_stale_migration")
+                await conn.execute("CREATE INDEX IF NOT EXISTS idx_agents_status ON agents(status)")
+                await conn.execute("CREATE INDEX IF NOT EXISTS idx_agents_kind ON agents(kind)")
+                await conn.execute("COMMIT")
+            except Exception:
+                await conn.execute("ROLLBACK")
+                raise
 
         async def _ensure_jobs_status_allows_dead_letter(conn) -> None:
             # Thrash fix (2026-06-02): older live jobs tables have a CHECK(status
@@ -1606,19 +1660,33 @@ async def lifespan(app: FastAPI):
                 return  # no status CHECK, or already permissive — nothing to do
             async with conn.execute("PRAGMA table_info(jobs)") as cur:
                 old_cols = [r[1] for r in await cur.fetchall()]
-            await conn.execute("ALTER TABLE jobs RENAME TO jobs__pre_deadletter_migration")
-            await conn.executescript(SCHEMA)  # recreate jobs (+others, all IF NOT EXISTS) with new CHECK
-            # Copy only columns common to old + recreated table — guards against
-            # drift columns the recreated SCHEMA lacks (the live_columns ALTERs
-            # below re-add any expected-but-missing ones afterwards).
-            async with conn.execute("PRAGMA table_info(jobs)") as cur:
-                new_cols = {r[1] for r in await cur.fetchall()}
-            common = [c for c in old_cols if c in new_cols]
-            col_list = ", ".join(common)
-            await conn.execute(
-                f"INSERT INTO jobs ({col_list}) SELECT {col_list} FROM jobs__pre_deadletter_migration"
-            )
-            await conn.execute("DROP TABLE jobs__pre_deadletter_migration")
+            await conn.commit()
+            await conn.execute("BEGIN IMMEDIATE")
+            try:
+                await conn.execute("ALTER TABLE jobs RENAME TO jobs__pre_deadletter_migration")
+                await conn.execute(_schema_create_table_statement("jobs"))
+                # Copy only columns common to old + recreated table — guards
+                # against drift columns the recreated SCHEMA lacks.
+                async with conn.execute("PRAGMA table_info(jobs)") as cur:
+                    new_cols = {r[1] for r in await cur.fetchall()}
+                common = [c for c in old_cols if c in new_cols]
+                col_list = ", ".join(common)
+                await conn.execute(
+                    f"INSERT INTO jobs ({col_list}) SELECT {col_list} FROM jobs__pre_deadletter_migration"
+                )
+                await conn.execute("DROP TABLE jobs__pre_deadletter_migration")
+                for stmt in (
+                    "CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)",
+                    "CREATE INDEX IF NOT EXISTS idx_jobs_submitter ON jobs(submitter_urn)",
+                    "CREATE INDEX IF NOT EXISTS idx_jobs_claimed_by ON jobs(claimed_by)",
+                    "CREATE INDEX IF NOT EXISTS idx_jobs_parent ON jobs(parent_job_id)",
+                    "CREATE INDEX IF NOT EXISTS idx_jobs_queue ON jobs(status, priority DESC, started_at ASC)",
+                ):
+                    await conn.execute(stmt)
+                await conn.execute("COMMIT")
+            except Exception:
+                await conn.execute("ROLLBACK")
+                raise
 
         live_columns = (
             # agents — v0.2 cost/runtime/autonomy columns
@@ -1756,6 +1824,11 @@ async def lifespan(app: FastAPI):
             "CREATE INDEX IF NOT EXISTS idx_agents_provider    ON agents(provider)",
             "CREATE INDEX IF NOT EXISTS idx_agents_cost_tier   ON agents(cost_tier)",
             "CREATE INDEX IF NOT EXISTS idx_agents_auth_method ON agents(auth_method)",
+            "CREATE INDEX IF NOT EXISTS idx_jobs_status            ON jobs(status)",
+            "CREATE INDEX IF NOT EXISTS idx_jobs_submitter         ON jobs(submitter_urn)",
+            "CREATE INDEX IF NOT EXISTS idx_jobs_claimed_by        ON jobs(claimed_by)",
+            "CREATE INDEX IF NOT EXISTS idx_jobs_parent            ON jobs(parent_job_id)",
+            "CREATE INDEX IF NOT EXISTS idx_jobs_queue             ON jobs(status, priority DESC, started_at ASC)",
             "CREATE INDEX IF NOT EXISTS idx_jobs_project           ON jobs(project)",
             "CREATE INDEX IF NOT EXISTS idx_jobs_autonomy          ON jobs(required_autonomy)",
             "CREATE INDEX IF NOT EXISTS idx_jobs_max_cost_tier     ON jobs(max_cost_tier)",
@@ -2692,7 +2765,7 @@ async def dequeue_next_job(
                 return claimed
     except HTTPException:
         raise
-    except aiosqlite.Error as e:
+    except Exception as e:
         raise HTTPException(500, f"claim failed: database error while claiming next job: {e}") from e
 
     # HTTP 204 = No Content. By spec the response body must be EMPTY.
@@ -2771,6 +2844,12 @@ async def update_job(job_id: str, req: JobUpdate, request: Request = None):
                 await db.execute("ROLLBACK")
                 raise HTTPException(404, f"job not found: {job_id}")
             old_status, old_claimed_by, prov, mod, retry_count, max_retries, decline_count = current
+
+            # Unclaimed queue routing and cancellation are administrative
+            # operations. Agent session credentials are scoped only to the job
+            # currently claimed by that same agent.
+            if old_status in {"queued", "offered"} and request is not None:
+                await require_bus_admin(request)
 
             if old_claimed_by:
                 _require_agent_identity(request, old_claimed_by)

@@ -53,6 +53,7 @@ HIVE_URL = os.environ.get("HIVE_URL", "http://127.0.0.1:5005")
 # C1: bus transport auth bearer token (env-sourced). Injected only on bus calls
 # (_hive), kept separate from the MNEMOS token used by _mnemos.
 HIVE_BUS_TOKEN = client_token("HIVE_BUS_TOKEN", "HIVE_BUS_TOKENS")
+HIVE_BUS_ADMIN_TOKEN = client_token("HIVE_BUS_ADMIN_TOKEN", "HIVE_BUS_ADMIN_TOKENS")
 MNEMOS_URL = os.environ.get("MNEMOS_URL", "http://192.168.207.67:5002")
 # MNEMOS bearer token comes from env. No source-baked default — having a
 # token literal in source meant every clone of this repo carried a working
@@ -95,10 +96,16 @@ async def lifespan(app):
         await client.aclose()
 
 
-async def _hive(method: str, path: str, **kw) -> dict:
-    if HIVE_BUS_TOKEN:
+async def _hive(method: str, path: str, *, admin: bool = False, **kw) -> dict:
+    token = HIVE_BUS_ADMIN_TOKEN if admin else HIVE_BUS_TOKEN
+    if admin and not token:
+        raise RuntimeError(
+            "HIVE_BUS_ADMIN_TOKEN is not configured; hive.job_create requires "
+            "the bus admin credential"
+        )
+    if token:
         headers = dict(kw.pop("headers", {}) or {})
-        headers.setdefault("Authorization", f"Bearer {HIVE_BUS_TOKEN}")
+        headers.setdefault("Authorization", f"Bearer {token}")
         kw["headers"] = headers
     r = await client.request(method, f"{HIVE_URL}{path}", **kw)
     r.raise_for_status()
@@ -252,7 +259,14 @@ async def handle_list_tools() -> list[Tool]:
     ]
 
 
-async def handle_call_tool(name: str, args: dict[str, Any]) -> list[TextContent]:
+def _tool_result(payload: Any, *, is_error: bool = False) -> CallToolResult:
+    return CallToolResult(
+        content=[TextContent(type="text", text=json.dumps(payload, default=str))],
+        isError=is_error,
+    )
+
+
+async def handle_call_tool(name: str, args: dict[str, Any]) -> CallToolResult:
     try:
         if name == "hive.agent_list":
             r = await _hive("GET", "/v1/agents", params={k: v for k, v in args.items() if v})
@@ -280,7 +294,10 @@ async def handle_call_tool(name: str, args: dict[str, Any]) -> list[TextContent]
                 "submitter_urn", "kind", "description", "priority", "required_capabilities",
                 "eligible_kinds", "deadline", "parent_job_id",
             }
-            r = await _hive("POST", "/v1/jobs", json={k: v for k, v in args.items() if k in allowed})
+            r = await _hive(
+                "POST", "/v1/jobs", admin=True,
+                json={k: v for k, v in args.items() if k in allowed},
+            )
         elif name == "hive.job_next":
             agent_token = args["agent_token"]
             r = await _hive(
@@ -321,12 +338,17 @@ async def handle_call_tool(name: str, args: dict[str, Any]) -> list[TextContent]
         elif name == "graeae.get":
             r = await _mnemos("GET", f"/v1/consultations/{args['consultation_id']}")
         else:
-            return [TextContent(type="text", text=json.dumps({"error": f"unknown tool: {name}"}))]
-        return [TextContent(type="text", text=json.dumps(r, default=str))]
+            return _tool_result({"error": f"unknown tool: {name}"}, is_error=True)
+        return _tool_result(r)
     except httpx.HTTPStatusError as e:
-        return [TextContent(type="text", text=json.dumps({"error": str(e), "status": e.response.status_code, "body": e.response.text[:500]}))]
+        return _tool_result(
+            {"error": str(e), "status": e.response.status_code, "body": e.response.text[:500]},
+            is_error=True,
+        )
     except Exception as e:
-        return [TextContent(type="text", text=json.dumps({"error": type(e).__name__, "msg": str(e)}))]
+        return _tool_result(
+            {"error": type(e).__name__, "msg": str(e)}, is_error=True
+        )
 
 
 # Silence -32601 method-not-found warnings on opencode boot.
@@ -340,9 +362,7 @@ async def _on_call_tool(_ctx, params) -> CallToolResult:
             type="text",
             text=json.dumps({"error": "this tool requires an MCP bridge write token"}),
         )], isError=True)
-    return CallToolResult(
-        content=await handle_call_tool(params.name, dict(params.arguments or {}))
-    )
+    return await handle_call_tool(params.name, dict(params.arguments or {}))
 
 
 async def _on_list_resources(_ctx, _params) -> ListResourcesResult:

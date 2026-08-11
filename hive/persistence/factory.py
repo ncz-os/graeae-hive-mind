@@ -7,9 +7,6 @@ import sys
 from typing import Any, AsyncIterator
 from urllib.parse import unquote, urlparse
 
-from .sqlite import SqliteHiveRepository
-
-
 class _OracleCompatibilityRepository:
     """Expose the connection seam still used by ``agent_bus`` for Oracle."""
 
@@ -72,6 +69,9 @@ def get_hive_repository(
     """
     normalized = backend.strip().lower()
     if normalized == "sqlite":
+        # Keep the optional aiosqlite dependency out of Oracle-only processes.
+        from .sqlite import SqliteHiveRepository
+
         return SqliteHiveRepository(db_path, busy_timeout_ms=busy_timeout_ms)
     if normalized == "oracle":
         return _OracleCompatibilityRepository(dsn)

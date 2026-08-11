@@ -37,9 +37,7 @@ HIVE_BUS_TOKEN = client_token("HIVE_BUS_TOKEN", "HIVE_BUS_TOKENS")
 # link future work (GRAEAE-blessed arch 2026-06-01). On the Spark this is the
 # tunnelled fleet MNEMOS at localhost:5012; on fleet hosts it's PYTHIA:5002.
 MNEMOS_URL = os.environ.get("MNEMOS_URL", "http://192.168.207.67:5002")
-MNEMOS_TOKEN = os.environ.get(
-    "MNEMOS_TOKEN",
-    "d3a3bc609583005f4a077b6ffd00154b4f03f70104d0cdbfbb019fceb28daca9")
+MNEMOS_TOKEN = os.environ.get("MNEMOS_TOKEN", "")
 AGENT_HOST = os.environ.get("AGENT_HOST") or socket.gethostname().split(".")[0]
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "30"))
 HEARTBEAT_INTERVAL = float(os.environ.get("HEARTBEAT_INTERVAL", "15"))
@@ -322,10 +320,12 @@ def claim_next(urn):
     return None
 
 
-def patch_job(jid, urn, status, result=None):
+def patch_job(jid, urn, status, result=None, result_mnemos_id=None):
     body = {"status": status, "claimed_by": urn}
     if result is not None:
         body["result"] = result
+    if result_mnemos_id is not None:
+        body["result_mnemos_id"] = result_mnemos_id
     code, resp = http("PATCH", f"/v1/jobs/{jid}", body, timeout=15)
     if code not in (200, 201, 204):
         log.warning("patch %s -> %s: %s", jid, code, str(resp)[:200])
@@ -333,6 +333,10 @@ def patch_job(jid, urn, status, result=None):
 
 
 def _mnemos_http(method, path, body=None, timeout=15):
+    if not MNEMOS_TOKEN:
+        raise RuntimeError(
+            "MNEMOS_TOKEN is required for authoritative job provenance"
+        )
     url = MNEMOS_URL + path
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(
@@ -362,7 +366,7 @@ def _record_job_to_mnemos(job, result, status):
     try:
         commits = result.get("commits") or []
         if status != "done" and not commits:
-            return
+            return None
         jid = job.get("id", "")
         kind = job.get("kind", "") or ""
         parent = job.get("parent_job_id") or ""
@@ -389,10 +393,15 @@ def _record_job_to_mnemos(job, result, status):
         code, resp = _mnemos_http("POST", "/v1/memories",
                                   {"content": content, "metadata": meta}, timeout=12)
         if code in (200, 201):
+            memory_id = resp.get("id") if isinstance(resp, dict) else None
             log.info("  recorded commit-DAG node %s -> mnemos %s",
-                     jid[:12], resp.get("id", ""))
+                     jid[:12], memory_id or "")
         else:
             log.warning("  mnemos memory write %s: %s", code, str(resp)[:120])
+            return None
+        if not memory_id:
+            log.warning("  mnemos memory write returned no id for job %s", jid[:12])
+            return None
         # DAG edges — best-effort. Skip silently on pool-down / any error.
         triples = [(f"job:{jid}", "has_kind", kind)]
         for c in commits:
@@ -403,10 +412,15 @@ def _record_job_to_mnemos(job, result, status):
         if parent:
             triples.append((f"job:{jid}", "derives_from", f"job:{parent}"))
         for s, p, o in triples:
-            _mnemos_http("POST", "/v1/kg/triples",
-                         {"subject": s, "predicate": p, "object": o}, timeout=6)
+            try:
+                _mnemos_http("POST", "/v1/kg/triples",
+                             {"subject": s, "predicate": p, "object": o}, timeout=6)
+            except Exception:
+                pass
+        return memory_id
     except Exception as e:
         log.warning("  mnemos record skipped: %s", e)
+        return None
 
 
 def pick_agent_alias(tier, kind):
@@ -861,8 +875,14 @@ def process_job(urn, job):
         status = "done"
     else:
         status = "failed"
-    patch_job(jid, urn, status, result)
-    _record_job_to_mnemos(job, result, status)  # commit-DAG node (best-effort)
+    mnemos_id = _record_job_to_mnemos(job, result, status)
+    if status == "done" and not mnemos_id:
+        status = "failed"
+        result["worker_error"] = "authoritative_provenance_write_failed"
+        result["error"] = (
+            "MNEMOS did not return a referenceable memory id; completion was not accepted"
+        )
+    patch_job(jid, urn, status, result, result_mnemos_id=mnemos_id)
     commits = result.get("commits") or []
     log.info("→ %s %s commits=%d dur=%.1fs %s",
              status, jid[:12], len(commits), result["duration_sec"],
@@ -870,6 +890,10 @@ def process_job(urn, job):
 
 
 def main():
+    if not MNEMOS_TOKEN:
+        raise SystemExit(
+            "MNEMOS_TOKEN is required; refusing to run without authoritative provenance"
+        )
     log.info("starting wss-worker-v2 on %s, gateway=%s:%s, poll=%ss "
              "(open-weights default, codex scarce)",
              AGENT_HOST, GATEWAY_HOST, GATEWAY_PORT, POLL_INTERVAL)

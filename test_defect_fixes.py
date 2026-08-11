@@ -8,6 +8,8 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import sqlite3
+import subprocess
 import tempfile
 import unittest
 
@@ -34,6 +36,60 @@ def _load_script(name: str, filename: str):
 
 
 class AgentBusDefectTests(unittest.IsolatedAsyncioTestCase):
+    async def test_worker_session_cannot_cancel_or_reroute_queued_job(self):
+        original_workers = agent_bus.HIVE_BUS_TOKENS
+        original_admins = agent_bus.HIVE_BUS_ADMIN_TOKENS
+        agent_bus.HIVE_BUS_TOKENS = frozenset({"worker-secret"})
+        agent_bus.HIVE_BUS_ADMIN_TOKENS = frozenset({"admin-secret"})
+        try:
+            async with agent_bus.lifespan(agent_bus.app):
+                transport = httpx.ASGITransport(app=agent_bus.app)
+                async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                    registration = await client.post(
+                        "/v1/agents/register",
+                        headers={"Authorization": "Bearer worker-secret"},
+                        json={"kind": "goose", "runtime": "goose", "host": "queue-auth"},
+                    )
+                    token = registration.json()["agent_token"]
+                    job_id = "queue-auth-regression"
+                    async with agent_bus.connect_db() as db:
+                        await db.execute(
+                            "INSERT OR REPLACE INTO jobs (id, submitter_urn, kind, priority, "
+                            "status, started_at) VALUES (?, 'urn:test', 'test', 0, 'queued', ?)",
+                            (job_id, agent_bus.time.time()),
+                        )
+                        await db.commit()
+                    cancelled = await client.patch(
+                        f"/v1/jobs/{job_id}",
+                        headers={"Authorization": f"Bearer {token}"},
+                        json={"status": "cancelled"},
+                    )
+                    rerouted = await client.patch(
+                        f"/v1/jobs/{job_id}",
+                        headers={"Authorization": f"Bearer {token}"},
+                        json={"status": "queued", "eligible_hosts": ["attacker"]},
+                    )
+                self.assertEqual(cancelled.status_code, 403)
+                self.assertEqual(rerouted.status_code, 403)
+                async with agent_bus.connect_db() as db:
+                    async with db.execute(
+                        "SELECT status, eligible_hosts FROM jobs WHERE id=?", (job_id,)
+                    ) as cur:
+                        self.assertEqual(await cur.fetchone(), ("queued", None))
+        finally:
+            agent_bus.HIVE_BUS_TOKENS = original_workers
+            agent_bus.HIVE_BUS_ADMIN_TOKENS = original_admins
+
+    def test_derived_session_secret_is_stable_across_restart(self):
+        workers = frozenset({"worker-b", "worker-a"})
+        admins = frozenset({"admin"})
+        first = agent_bus._session_signing_secret(None, workers, admins)
+        second = agent_bus._session_signing_secret(None, workers, admins)
+        self.assertEqual(first, second)
+        self.assertEqual(
+            agent_bus._session_signing_secret("explicit", workers, admins), "explicit"
+        )
+
     async def test_worker_token_cannot_create_job_through_mcp(self):
         original_workers = agent_bus.HIVE_BUS_TOKENS
         original_admins = agent_bus.HIVE_BUS_ADMIN_TOKENS
@@ -311,6 +367,75 @@ class AgentBusDefectTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(base, first)
         self.assertNotEqual(first, second)
 
+    async def test_receipt_reconciliation_uses_terminal_bookkeeping(self):
+        async with agent_bus.lifespan(agent_bus.app):
+            now = agent_bus.time.time()
+            urn = "urn:agent:system:receipt-test:session"
+            job_id = "receipt-reconciliation-regression"
+            receipt = {
+                "exit_code": 0,
+                "_execution_receipt": {
+                    "version": 1, "execution_id": job_id,
+                    "completed": True, "terminal_status": "done",
+                },
+            }
+            async with agent_bus.connect_db() as db:
+                await db.execute(
+                    "INSERT OR REPLACE INTO agents (urn, kind, host, session_id, started_at, "
+                    "last_heartbeat, status, runtime) VALUES (?, 'system', 'receipt-test', "
+                    "'session', ?, ?, 'online', 'system')",
+                    (urn, now - 1000, now - 1000),
+                )
+                await db.execute(
+                    "INSERT OR REPLACE INTO jobs (id, submitter_urn, kind, description, priority, "
+                    "status, claimed_by, claimed_at, started_at, result, max_cost_tier, "
+                    "claimed_model, claimed_provider, tokens_in, tokens_out) "
+                    "VALUES (?, ?, 'build', 'receipt job', 0, "
+                    "'running', ?, ?, ?, ?, 'A', 'local', 'local', 11, 7)",
+                    (job_id, "urn:agent:human:test:receipt", urn, now - 1000,
+                     now - 1000, json.dumps(receipt)),
+                )
+                await db.commit()
+
+            original_sleep = agent_bus.asyncio.sleep
+            sleep_calls = 0
+
+            async def one_iteration(_seconds):
+                nonlocal sleep_calls
+                sleep_calls += 1
+                if sleep_calls > 1:
+                    raise asyncio.CancelledError
+
+            agent_bus.asyncio.sleep = one_iteration
+            try:
+                with self.assertRaises(asyncio.CancelledError):
+                    await agent_bus.reaper_task(agent_bus.app)
+            finally:
+                agent_bus.asyncio.sleep = original_sleep
+
+            async with agent_bus.connect_db() as db:
+                async with db.execute("SELECT status FROM jobs WHERE id=?", (job_id,)) as cur:
+                    self.assertEqual((await cur.fetchone())[0], "done")
+                async with db.execute(
+                    "SELECT success_count, total_tokens_in, total_tokens_out "
+                    "FROM worker_kind_stats WHERE urn=? AND kind='build'", (urn,)
+                ) as cur:
+                    self.assertEqual(await cur.fetchone(), (1, 11, 7))
+                async with db.execute(
+                    "SELECT new_status FROM job_audit_log WHERE job_id=? ORDER BY id DESC LIMIT 1",
+                    (job_id,),
+                ) as cur:
+                    self.assertEqual((await cur.fetchone())[0], "done")
+                async with db.execute(
+                    "SELECT COUNT(*) FROM events WHERE kind='job.done' AND payload LIKE ?",
+                    (f'%{job_id}%',),
+                ) as cur:
+                    self.assertGreaterEqual((await cur.fetchone())[0], 1)
+                async with db.execute(
+                    "SELECT COUNT(*) FROM hive_cache WHERE source_job_id=?", (job_id,)
+                ) as cur:
+                    self.assertEqual((await cur.fetchone())[0], 1)
+
 
 class WorkerAndRestoreDefectTests(unittest.TestCase):
     def test_system_watcher_terminal_patch_retries_and_persists_receipt(self):
@@ -459,6 +584,20 @@ class WorkerAndRestoreDefectTests(unittest.TestCase):
         })
         self.assertEqual(calls[-1][2], {"status": "queued", "eligible_kinds": ["human"]})
 
+    def test_zeroclaw_requires_referenceable_mnemos_provenance(self):
+        worker = _load_script("zeroclaw_worker_mnemos_test", "zeroclaw_wss_worker_v2.py")
+        worker.MNEMOS_TOKEN = ""
+        with self.assertRaisesRegex(SystemExit, "MNEMOS_TOKEN is required"):
+            worker.main()
+        worker.MNEMOS_TOKEN = "configured"
+        worker._mnemos_http = lambda *args, **kwargs: (201, {})
+        result = worker._record_job_to_mnemos(
+            {"id": "job-provenance", "kind": "analysis"},
+            {"full_response": "answer"},
+            "done",
+        )
+        self.assertIsNone(result)
+
 
 class McpBridgeDefectTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -491,6 +630,30 @@ class McpBridgeDefectTests(unittest.IsolatedAsyncioTestCase):
         ])
         self.assertEqual(calls[1][2]["json"]["metadata"]["tags"], ["release"])
         self.assertNotIn("tags", calls[1][2]["json"])
+
+    async def test_job_create_uses_bus_admin_credential(self):
+        calls = []
+
+        async def fake_hive(method, path, **kwargs):
+            calls.append((method, path, kwargs))
+            return {"id": "job-1"}
+
+        self.bridge._hive = fake_hive
+        result = await self.bridge.handle_call_tool(
+            "hive.job_create", {"submitter_urn": "urn:test", "kind": "test"}
+        )
+        self.assertFalse(result.is_error)
+        self.assertTrue(calls[0][2]["admin"])
+
+    async def test_backend_and_unknown_tool_fail_at_protocol_level(self):
+        async def unavailable(*_args, **_kwargs):
+            raise RuntimeError("backend unavailable")
+
+        self.bridge._mnemos = unavailable
+        backend = await self.bridge.handle_call_tool("mnemos.memory_search", {"query": "q"})
+        unknown = await self.bridge.handle_call_tool("not.a.tool", {})
+        self.assertTrue(backend.is_error)
+        self.assertTrue(unknown.is_error)
 
     async def test_bridge_requires_inbound_auth_and_separates_write_tools(self):
         transport = httpx.ASGITransport(app=self.bridge.app)
@@ -535,6 +698,136 @@ class MigrationDefectTests(unittest.TestCase):
     def test_factory_constructs_sqlite_repository(self):
         repository = get_hive_repository("sqlite", db_path=_DB_FILE.name)
         self.assertIsInstance(repository, SqliteHiveRepository)
+
+    def test_oracle_factory_import_does_not_require_aiosqlite(self):
+        script = """
+import builtins
+real_import = builtins.__import__
+def guarded(name, *args, **kwargs):
+    if name == 'aiosqlite':
+        raise ModuleNotFoundError("blocked", name='aiosqlite')
+    return real_import(name, *args, **kwargs)
+builtins.__import__ = guarded
+from hive.persistence.factory import get_hive_repository
+repo = get_hive_repository('oracle', db_path='unused', dsn='oracle://u:p@host/service')
+assert repo.connect_dsn == 'host:1521/service'
+"""
+        completed = subprocess.run(
+            [os.sys.executable, "-c", script], cwd=Path.cwd(),
+            text=True, capture_output=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_oracle_agent_bus_import_does_not_require_aiosqlite(self):
+        script = """
+import builtins, os, sys, types
+real_import = builtins.__import__
+def guarded(name, *args, **kwargs):
+    if name == 'aiosqlite':
+        raise ModuleNotFoundError("blocked", name='aiosqlite')
+    return real_import(name, *args, **kwargs)
+builtins.__import__ = guarded
+driver = types.ModuleType('oracledb')
+class Probe:
+    def close(self): pass
+driver.connect = lambda **kwargs: Probe()
+sys.modules['oracledb'] = driver
+os.environ['HIVE_BACKEND'] = 'oracle'
+os.environ['HIVE_BUS_TOKEN'] = 'worker'
+import agent_bus
+assert agent_bus.HIVE_BACKEND == 'oracle'
+"""
+        completed = subprocess.run(
+            [os.sys.executable, "-c", script], cwd=Path.cwd(),
+            text=True, capture_output=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_db2_backend_fails_explicitly_without_an_adapter(self):
+        with self.assertRaisesRegex(RuntimeError, "no DB2 persistence adapter"):
+            get_hive_repository("db2", db_path=_DB_FILE.name)
+
+    def test_sqlite_populated_rebuild_preserves_data_and_base_indexes(self):
+        with tempfile.NamedTemporaryFile(prefix="hive-legacy-", suffix=".db") as db_file:
+            raw = sqlite3.connect(db_file.name)
+            raw.execute(
+                "CREATE TABLE jobs (id TEXT PRIMARY KEY, submitter_urn TEXT NOT NULL, "
+                "parent_job_id TEXT, kind TEXT NOT NULL, priority INTEGER NOT NULL DEFAULT 0, "
+                "status TEXT NOT NULL CHECK(status IN ('queued','claimed','running','done','failed','cancelled')), "
+                "claimed_by TEXT, started_at REAL NOT NULL)"
+            )
+            raw.execute(
+                "CREATE INDEX idx_jobs_queue ON jobs(status, priority DESC, started_at ASC)"
+            )
+            raw.execute(
+                "INSERT INTO jobs (id, submitter_urn, kind, priority, status, started_at) "
+                "VALUES ('legacy-job', 'urn:test', 'test', 7, 'queued', 1.0)"
+            )
+            raw.commit()
+            raw.close()
+
+            old_path, old_repo = agent_bus.DB_PATH, agent_bus._HIVE_REPO
+            agent_bus.DB_PATH, agent_bus._HIVE_REPO = db_file.name, None
+            try:
+                asyncio.run(self._run_lifespan_once())
+                raw = sqlite3.connect(db_file.name)
+                self.assertEqual(raw.execute(
+                    "SELECT id, priority FROM jobs"
+                ).fetchall(), [("legacy-job", 7)])
+                indexes = {row[1] for row in raw.execute("PRAGMA index_list(jobs)")}
+                self.assertTrue({
+                    "idx_jobs_status", "idx_jobs_submitter", "idx_jobs_claimed_by",
+                    "idx_jobs_parent", "idx_jobs_queue",
+                }.issubset(indexes))
+                sql = raw.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='jobs'"
+                ).fetchone()[0]
+                self.assertIn("dead-letter", sql)
+                raw.close()
+            finally:
+                agent_bus.DB_PATH, agent_bus._HIVE_REPO = old_path, old_repo
+
+    async def _run_lifespan_once(self):
+        async with agent_bus.lifespan(agent_bus.app):
+            pass
+
+    def test_sqlite_interrupted_rebuild_recovers_stranded_table(self):
+        with tempfile.NamedTemporaryFile(prefix="hive-interrupted-", suffix=".db") as db_file:
+            raw = sqlite3.connect(db_file.name)
+            raw.execute(
+                "CREATE TABLE jobs__pre_deadletter_migration ("
+                "id TEXT PRIMARY KEY, submitter_urn TEXT NOT NULL, parent_job_id TEXT, kind TEXT NOT NULL, "
+                "priority INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL "
+                "CHECK(status IN ('queued','claimed','running','done','failed','cancelled')), "
+                "claimed_by TEXT, started_at REAL NOT NULL)"
+            )
+            raw.execute(
+                "INSERT INTO jobs__pre_deadletter_migration "
+                "(id, submitter_urn, kind, priority, status, started_at) VALUES "
+                "('stranded-job', 'urn:test', 'test', 1, 'queued', 1.0)"
+            )
+            raw.commit()
+            raw.close()
+
+            old_path, old_repo = agent_bus.DB_PATH, agent_bus._HIVE_REPO
+            agent_bus.DB_PATH, agent_bus._HIVE_REPO = db_file.name, None
+            try:
+                asyncio.run(self._run_lifespan_once())
+                raw = sqlite3.connect(db_file.name)
+                self.assertEqual(
+                    raw.execute("SELECT id FROM jobs").fetchall(), [("stranded-job",)]
+                )
+                self.assertIsNone(raw.execute(
+                    "SELECT name FROM sqlite_master WHERE name='jobs__pre_deadletter_migration'"
+                ).fetchone())
+                raw.close()
+            finally:
+                agent_bus.DB_PATH, agent_bus._HIVE_REPO = old_path, old_repo
+
+    def test_zeroclaw_has_no_source_baked_mnemos_token(self):
+        source = Path("zeroclaw_wss_worker_v2.py").read_text()
+        self.assertIn('MNEMOS_TOKEN = os.environ.get("MNEMOS_TOKEN", "")', source)
+        self.assertNotRegex(source, r'["\'][0-9a-fA-F]{64}["\']')
 
     def test_oracle_dedup_migration_targets_hive_jobs(self):
         sql = Path("migrations/2026-06-03-jobs-dedup.sql").read_text()
