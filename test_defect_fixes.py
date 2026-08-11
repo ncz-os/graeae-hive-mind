@@ -11,6 +11,9 @@ from pathlib import Path
 import tempfile
 import unittest
 
+import httpx
+from starlette.requests import Request
+
 
 _DB_FILE = tempfile.NamedTemporaryFile(prefix="hive-defects-", suffix=".db", delete=False)
 _DB_FILE.close()
@@ -30,6 +33,63 @@ def _load_script(name: str, filename: str):
 
 
 class AgentBusDefectTests(unittest.IsolatedAsyncioTestCase):
+    async def test_worker_token_cannot_create_job_through_mcp(self):
+        original_workers = agent_bus.HIVE_BUS_TOKENS
+        original_admins = agent_bus.HIVE_BUS_ADMIN_TOKENS
+        agent_bus.HIVE_BUS_TOKENS = frozenset({"worker-secret"})
+        agent_bus.HIVE_BUS_ADMIN_TOKENS = frozenset({"admin-secret"})
+        try:
+            transport = httpx.ASGITransport(app=agent_bus.app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                response = await client.post(
+                    "/mcp",
+                    headers={"Authorization": "Bearer worker-secret"},
+                    json={"method": "job.create", "params": {}},
+                )
+            self.assertEqual(response.status_code, 403)
+        finally:
+            agent_bus.HIVE_BUS_TOKENS = original_workers
+            agent_bus.HIVE_BUS_ADMIN_TOKENS = original_admins
+
+    async def test_single_token_profile_retains_admin_compatibility(self):
+        original_admins = agent_bus.HIVE_BUS_ADMIN_TOKENS
+        agent_bus.HIVE_BUS_ADMIN_TOKENS = frozenset()
+        request = Request({
+            "type": "http", "method": "POST", "path": "/mcp", "headers": [],
+            "query_string": b"", "server": ("test", 80), "scheme": "http",
+        })
+        request.state.bus_tier = "worker"
+        try:
+            self.assertIsNone(await agent_bus.require_bus_admin(request))
+        finally:
+            agent_bus.HIVE_BUS_ADMIN_TOKENS = original_admins
+
+    async def test_worker_token_cannot_toggle_knemon_bypass(self):
+        original_workers = agent_bus.HIVE_BUS_TOKENS
+        original_admins = agent_bus.HIVE_BUS_ADMIN_TOKENS
+        agent_bus.HIVE_BUS_TOKENS = frozenset({"worker-secret"})
+        agent_bus.HIVE_BUS_ADMIN_TOKENS = frozenset({"admin-secret"})
+        try:
+            transport = httpx.ASGITransport(app=agent_bus.app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                response = await client.post(
+                    "/v1/knemon/bypass",
+                    headers={"Authorization": "Bearer worker-secret"},
+                    json={"enabled": True},
+                )
+            self.assertEqual(response.status_code, 403)
+        finally:
+            agent_bus.HIVE_BUS_TOKENS = original_workers
+            agent_bus.HIVE_BUS_ADMIN_TOKENS = original_admins
+
+    def test_oracle_dedup_violation_uses_real_index_name(self):
+        self.assertTrue(agent_bus._is_dedup_violation(
+            RuntimeError("ORA-00001: unique constraint (MNEMOS.JOBS_ACTIVE_DEDUP_UQ) violated")
+        ))
+        self.assertFalse(agent_bus._is_dedup_violation(
+            RuntimeError("ORA-00001: unique constraint (MNEMOS.OTHER_UQ) violated")
+        ))
+
     async def test_fresh_sqlite_schema_accepts_deduplicated_job_submission(self):
         async with agent_bus.lifespan(agent_bus.app):
             now = agent_bus.time.time()
@@ -252,6 +312,86 @@ class WorkerAndRestoreDefectTests(unittest.TestCase):
         self.assertEqual(captured["path"], "/v1/admin/jobs/requeue")
         self.assertTrue(captured["admin"])
 
+    def test_auto_restore_fetch_failure_is_not_an_empty_success(self):
+        restore = _load_script("hive_auto_restore_fetch_failure_test", "hive-auto-restore.py")
+        restore._http = lambda *args, **kwargs: (401, {"detail": "invalid token"})
+        with self.assertRaisesRegex(RuntimeError, "http=401"):
+            restore.fetch_failed_jobs()
+        restore._http = lambda *args, **kwargs: (200, {})
+        with self.assertRaisesRegex(RuntimeError, "missing field 'jobs'"):
+            restore.fetch_failed_jobs()
+
+    def test_auto_restore_requeue_failure_returns_nonzero(self):
+        restore = _load_script("hive_auto_restore_requeue_failure_test", "hive-auto-restore.py")
+        restore.load_state = lambda: {}
+        restore.save_state = lambda state: None
+        restore.fetch_failed_jobs = lambda: [{
+            "id": "job-restore", "kind": "build", "ended_at": 0,
+        }]
+        restore.restore_jobs = lambda job_ids: ({}, "http=401")
+        self.assertEqual(restore.main(), 1)
+
+    def test_zeroclaw_orchestrator_retag_is_validated_and_checked(self):
+        worker = _load_script("zeroclaw_worker_retag_test", "zeroclaw_wss_worker_v2.py")
+        worker.route_chain = lambda *args: ["unused"]
+        worker._resolve_workspace = lambda kind, desc: (None, "no_workspace_for_kind")
+        worker.patch_job = lambda *args, **kwargs: True
+        calls = []
+
+        def fake_http(method, path, body=None, timeout=0):
+            calls.append((method, path, body))
+            return 200, {"ok": True}
+
+        worker.http = fake_http
+        worker.process_job("urn:agent:zeroclaw:test:s", {
+            "id": "job-retag", "kind": "unknown-kind", "description": "x",
+            "eligible_kinds": ["zeroclaw", "human"],
+        })
+        self.assertEqual(calls[-1][2], {"status": "queued", "eligible_kinds": ["human"]})
+
+
+class McpBridgeDefectTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.bridge = _load_script("mcp_bridge_for_test", "mcp_bridge.py")
+
+    async def asyncTearDown(self):
+        await self.bridge.client.aclose()
+
+    async def test_canonical_mcp_v2_handlers_are_registered(self):
+        self.assertIn("tools/list", self.bridge.server._request_handlers)
+        self.assertIn("tools/call", self.bridge.server._request_handlers)
+        result = await self.bridge._on_list_tools(None, None)
+        self.assertIn("mnemos.memory_create", {tool.name for tool in result.tools})
+
+    async def test_mnemos_tools_use_versioned_routes_and_preserve_tags(self):
+        calls = []
+
+        async def fake_mnemos(method, path, **kwargs):
+            calls.append((method, path, kwargs))
+            return {"ok": True}
+
+        self.bridge._mnemos = fake_mnemos
+        await self.bridge.handle_call_tool("mnemos.memory_search", {"query": "q"})
+        await self.bridge.handle_call_tool(
+            "mnemos.memory_create", {"content": "c", "category": "facts", "tags": ["release"]}
+        )
+        await self.bridge.handle_call_tool("mnemos.memory_get", {"id": "mem_1"})
+        self.assertEqual([call[1] for call in calls], [
+            "/v1/memories/search", "/v1/memories", "/v1/memories/mem_1",
+        ])
+        self.assertEqual(calls[1][2]["json"]["metadata"]["tags"], ["release"])
+        self.assertNotIn("tags", calls[1][2]["json"])
+
+
+class DashboardDefectTests(unittest.TestCase):
+    def test_dashboard_authenticates_fetch_and_sse_without_query_tokens(self):
+        source = Path("dashboard.html").read_text()
+        self.assertIn("opts.headers.Authorization='Bearer '+_busToken", source)
+        self.assertIn("headers.Authorization='Bearer '+_busToken", source)
+        self.assertIn("sessionStorage", source)
+        self.assertNotIn("new EventSource", source)
+        self.assertNotIn("/v1/events?token=", source)
+
 
 class MigrationDefectTests(unittest.TestCase):
     def test_factory_constructs_sqlite_repository(self):
@@ -272,6 +412,14 @@ class MigrationDefectTests(unittest.TestCase):
         )[0]
         self.assertIn("raise", handler)
         self.assertNotIn("non-fatal", handler)
+
+    def test_oracle_startup_closes_async_cursor_synchronously_in_finally(self):
+        source = Path("agent_bus.py").read_text()
+        oracle_block = source.split('if HIVE_BACKEND == "oracle" and', 1)[1].split(
+            "# Idempotent index", 1
+        )[0]
+        self.assertIn("finally:\n                    rcur.close()", oracle_block)
+        self.assertNotIn("await rcur.close()", oracle_block)
 
     def test_system_execution_migration_targets_canonical_oracle_table(self):
         sql = Path("migrations/2026-08-10-system-job-execution.sql").read_text()

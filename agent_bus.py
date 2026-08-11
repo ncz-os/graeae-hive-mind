@@ -471,7 +471,8 @@ async def connect_db():
 def _is_dedup_violation(exc: BaseException) -> bool:
     """Unique-violation from the active-only dedup index ONLY (never another PK/unique)."""
     m = str(exc)
-    return "HIVE_JOBS_ACTIVE_DEDUP_UQ" in m.upper() or (
+    upper = m.upper()
+    return ("ORA-00001" in upper and "JOBS_ACTIVE_DEDUP_UQ" in upper) or (
         "unique constraint failed" in m.lower() and "dedup_hash" in m.lower()
     )
 
@@ -1620,39 +1621,41 @@ async def lifespan(app: FastAPI):
             try:
                 raw = db._conn
                 rcur = raw.cursor()
-                await rcur.execute(
-                    "SELECT COUNT(*) FROM user_tab_columns "
-                    "WHERE table_name = 'HIVE_JOBS' AND column_name = 'EXECUTION_SPEC'"
-                )
-                has_execution_spec = (await rcur.fetchone())[0]
-                if not has_execution_spec:
-                    raise RuntimeError(
-                        "Oracle schema is missing canonical HIVE_JOBS.EXECUTION_SPEC; "
-                        "apply migrations/2026-08-10-system-job-execution.sql before startup"
-                    )
-                await rcur.execute(
-                    "SELECT COUNT(*) FROM user_tab_columns "
-                    "WHERE table_name = 'HIVE_JOBS' AND column_name = 'DECLINE_COUNT'"
-                )
-                has_col = (await rcur.fetchone())[0]
-                if not has_col:
+                try:
                     await rcur.execute(
-                        "ALTER TABLE HIVE_JOBS ADD (decline_count NUMBER DEFAULT 0 NOT NULL)"
+                        "SELECT COUNT(*) FROM user_tab_columns "
+                        "WHERE table_name = 'HIVE_JOBS' AND column_name = 'EXECUTION_SPEC'"
                     )
-                await rcur.execute(
-                    "SELECT search_condition_vc FROM user_constraints "
-                    "WHERE table_name = 'HIVE_JOBS' AND constraint_name = 'CK_HIVE_JOBS_STATUS'"
-                )
-                crow = await rcur.fetchone()
-                cond = str(crow[0]) if crow and crow[0] is not None else ""
-                if crow is not None and "dead-letter" not in cond:
-                    await rcur.execute("ALTER TABLE HIVE_JOBS DROP CONSTRAINT CK_HIVE_JOBS_STATUS")
+                    has_execution_spec = (await rcur.fetchone())[0]
+                    if not has_execution_spec:
+                        raise RuntimeError(
+                            "Oracle schema is missing canonical HIVE_JOBS.EXECUTION_SPEC; "
+                            "apply migrations/2026-08-10-system-job-execution.sql before startup"
+                        )
                     await rcur.execute(
-                        "ALTER TABLE HIVE_JOBS ADD CONSTRAINT CK_HIVE_JOBS_STATUS "
-                        "CHECK (status IN ('queued','offered','claimed','running',"
-                        "'done','failed','failed_completion','cancelled','dead-letter'))"
+                        "SELECT COUNT(*) FROM user_tab_columns "
+                        "WHERE table_name = 'HIVE_JOBS' AND column_name = 'DECLINE_COUNT'"
                     )
-                await rcur.close()
+                    has_col = (await rcur.fetchone())[0]
+                    if not has_col:
+                        await rcur.execute(
+                            "ALTER TABLE HIVE_JOBS ADD (decline_count NUMBER DEFAULT 0 NOT NULL)"
+                        )
+                    await rcur.execute(
+                        "SELECT search_condition_vc FROM user_constraints "
+                        "WHERE table_name = 'HIVE_JOBS' AND constraint_name = 'CK_HIVE_JOBS_STATUS'"
+                    )
+                    crow = await rcur.fetchone()
+                    cond = str(crow[0]) if crow and crow[0] is not None else ""
+                    if crow is not None and "dead-letter" not in cond:
+                        await rcur.execute("ALTER TABLE HIVE_JOBS DROP CONSTRAINT CK_HIVE_JOBS_STATUS")
+                        await rcur.execute(
+                            "ALTER TABLE HIVE_JOBS ADD CONSTRAINT CK_HIVE_JOBS_STATUS "
+                            "CHECK (status IN ('queued','offered','claimed','running',"
+                            "'done','failed','failed_completion','cancelled','dead-letter'))"
+                        )
+                finally:
+                    rcur.close()
                 await db.commit()
             except Exception as e:
                 # FATAL: the runtime decline/dead-letter path REQUIRES both the
@@ -3300,7 +3303,7 @@ async def knemon_bypass_get():
             "flag_file": KNEMON_BYPASS_FILE}
 
 
-@app.post("/v1/knemon/bypass")
+@app.post("/v1/knemon/bypass", dependencies=[Depends(require_bus_admin)])
 async def knemon_bypass_set(req: Request):
     """Toggle hive-level KNEMON bypass. POST {enabled: bool, reason?: str}.
     When enabled, ALL workers skip the codex/gpt sub-lead (open-weights only)."""
@@ -3700,7 +3703,7 @@ async def events_log(since_id: Optional[int] = None, limit: int = 100):
 # Phase 2: replace with full mcp-server-sdk.
 
 @app.post("/mcp")
-async def mcp_rpc(body: dict):
+async def mcp_rpc(body: dict, request: Request):
     method = body.get("method", "")
     params = body.get("params", {})
     handlers = {
@@ -3714,6 +3717,8 @@ async def mcp_rpc(body: dict):
     }
     if method not in handlers:
         return JSONResponse({"error": f"unknown method: {method}"}, status_code=404)
+    if method == "job.create":
+        await require_bus_admin(request)
     # crude param coercion - production MCP would use proper validation
     try:
         if method == "agent.register":

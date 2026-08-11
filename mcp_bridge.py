@@ -17,9 +17,9 @@ Tools:
   hive.job_update           -> PATCH /v1/jobs/{id}
   hive.message_publish      -> POST /v1/messages
   hive.message_list         -> GET /v1/messages
-  mnemos.memory_search      -> POST /memories/search on PYTHIA
-  mnemos.memory_create      -> POST /memories
-  mnemos.memory_get         -> GET /memories/{id}
+  mnemos.memory_search      -> POST /v1/memories/search on PYTHIA
+  mnemos.memory_create      -> POST /v1/memories
+  mnemos.memory_get         -> GET /v1/memories/{id}
 """
 from __future__ import annotations
 import json
@@ -33,7 +33,14 @@ import uvicorn
 from mcp.server import Server, NotificationOptions
 from mcp.server.models import InitializationOptions
 from mcp.server.sse import SseServerTransport
-from mcp.types import Tool, TextContent, Resource, Prompt
+from mcp.types import (
+    CallToolResult,
+    ListPromptsResult,
+    ListResourcesResult,
+    ListToolsResult,
+    TextContent,
+    Tool,
+)
 from starlette.applications import Starlette
 from starlette.routing import Mount, Route
 
@@ -50,7 +57,6 @@ MNEMOS_URL = os.environ.get("MNEMOS_URL", "http://192.168.207.67:5002")
 # return a clear MCP tool error instead of being silently unauthenticated.
 MNEMOS_TOKEN = os.environ.get("MNEMOS_TOKEN", "")
 
-server = Server("graeae-hive-mind")
 client = httpx.AsyncClient(timeout=15.0)
 
 
@@ -91,7 +97,6 @@ async def _mnemos(method: str, path: str, **kw) -> dict:
 
 # ---------- tool definitions ----------
 
-@server.list_tools()
 async def handle_list_tools() -> list[Tool]:
     return [
         Tool(name="hive.agent_list", description="List registered agents in the GRAEAE Hive Mind.",
@@ -216,7 +221,6 @@ async def handle_list_tools() -> list[Tool]:
     ]
 
 
-@server.call_tool()
 async def handle_call_tool(name: str, args: dict[str, Any]) -> list[TextContent]:
     try:
         if name == "hive.agent_list":
@@ -254,11 +258,17 @@ async def handle_call_tool(name: str, args: dict[str, Any]) -> list[TextContent]
         elif name == "hive.message_list":
             r = await _hive("GET", "/v1/messages", params={k: v for k, v in args.items() if v})
         elif name == "mnemos.memory_search":
-            r = await _mnemos("POST", "/memories/search", json=args)
+            r = await _mnemos("POST", "/v1/memories/search", json=args)
         elif name == "mnemos.memory_create":
-            r = await _mnemos("POST", "/memories", json=args)
+            payload = dict(args)
+            tags = payload.pop("tags", None)
+            if tags is not None:
+                metadata = dict(payload.get("metadata") or {})
+                metadata["tags"] = tags
+                payload["metadata"] = metadata
+            r = await _mnemos("POST", "/v1/memories", json=payload)
         elif name == "mnemos.memory_get":
-            r = await _mnemos("GET", f"/memories/{args['id']}")
+            r = await _mnemos("GET", f"/v1/memories/{args['id']}")
         elif name == "graeae.consult":
             r = await _mnemos("POST", "/v1/consultations", json=args)
         elif name == "graeae.muses":
@@ -277,14 +287,31 @@ async def handle_call_tool(name: str, args: dict[str, Any]) -> list[TextContent]
 
 
 # Silence -32601 method-not-found warnings on opencode boot.
-@server.list_resources()
-async def _list_resources() -> list[Resource]:
-    return []
+async def _on_list_tools(_ctx, _params) -> ListToolsResult:
+    return ListToolsResult(tools=await handle_list_tools())
 
 
-@server.list_prompts()
-async def _list_prompts() -> list[Prompt]:
-    return []
+async def _on_call_tool(_ctx, params) -> CallToolResult:
+    return CallToolResult(
+        content=await handle_call_tool(params.name, dict(params.arguments or {}))
+    )
+
+
+async def _on_list_resources(_ctx, _params) -> ListResourcesResult:
+    return ListResourcesResult(resources=[])
+
+
+async def _on_list_prompts(_ctx, _params) -> ListPromptsResult:
+    return ListPromptsResult(prompts=[])
+
+
+server = Server(
+    "graeae-hive-mind",
+    on_list_tools=_on_list_tools,
+    on_call_tool=_on_call_tool,
+    on_list_resources=_on_list_resources,
+    on_list_prompts=_on_list_prompts,
+)
 
 
 # ---------- SSE transport ----------

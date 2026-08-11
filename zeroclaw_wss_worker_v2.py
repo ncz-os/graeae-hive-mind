@@ -717,9 +717,18 @@ def process_job(urn, job):
             # Claude/Codex orchestrator claims them and we stop re-grabbing/churning.
             _cur = job.get("eligible_kinds") or []
             _new_elig = [k for k in _cur if k != "zeroclaw" and k not in _ZEROCLAW_PROVIDER_ALIASES] or ["claude", "codex"]
-            patch_job(jid, urn, "queued",
-                      {"worker_error": werr, "note": "released_to_orchestrator:no_zeroclaw_handler"})
-            http("PATCH", f"/v1/jobs/{jid}", {"eligible_kinds": _new_elig}, timeout=15)
+            if not patch_job(jid, urn, "queued",
+                             {"worker_error": werr, "note": "released_to_orchestrator:no_zeroclaw_handler"}):
+                log.error("failed to release %s before orchestrator retag", jid[:12])
+                return
+            retag_code, retag_resp = http(
+                "PATCH", f"/v1/jobs/{jid}",
+                {"status": "queued", "eligible_kinds": _new_elig}, timeout=15,
+            )
+            if retag_code not in (200, 201, 204):
+                log.error("failed to retag %s for orchestrator: %s %s",
+                          jid[:12], retag_code, str(retag_resp)[:200])
+                return
             log.info("→ released %s to orchestrator %s (%s) — no zeroclaw handler", jid[:12], _new_elig, werr)
             return
         if werr == "noncommit_workspaceless":

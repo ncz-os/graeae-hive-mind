@@ -85,10 +85,13 @@ def _http(method: str, path: str, body: dict | None = None, timeout: float = 15.
 def fetch_failed_jobs(limit: int = 1000) -> list[dict]:
     query = urllib.parse.urlencode({"status": "failed", "limit": str(limit)})
     code, resp = _http("GET", f"/v1/jobs?{query}", timeout=15.0)
-    if code != 200 or not resp:
-        log(f"fetch_failed_jobs http={code} resp={str(resp)[:200]}")
-        return []
-    jobs = resp.get("jobs", []) or []
+    if code != 200 or not isinstance(resp, dict):
+        raise RuntimeError(f"fetch_failed_jobs http={code} resp={str(resp)[:200]}")
+    if "jobs" not in resp:
+        raise RuntimeError("fetch_failed_jobs response is missing field 'jobs'")
+    jobs = resp.get("jobs") or []
+    if not isinstance(jobs, list):
+        raise RuntimeError("fetch_failed_jobs response field 'jobs' is not a list")
     jobs.sort(key=lambda j: j.get("ended_at") or 0, reverse=True)
     return jobs
 
@@ -142,6 +145,7 @@ def main():
         candidates.append((job, entry))
 
     restore_results, restore_error = restore_jobs([job["id"] for job, _entry in candidates]) if candidates else ({}, "")
+    restore_failed = bool(restore_error)
     for job, entry in candidates:
         jid = job["id"]
         kind = job.get("kind") or ""
@@ -152,13 +156,16 @@ def main():
             entry["last_kind"] = kind
             state[jid] = entry
             log(f"restored {jid[:13]} kind={kind[:40]} attempt={entry['count']}/{MAX_RETRIES}")
+        elif restore_results.get(jid) in {"not_found", "skipped_done"}:
+            log(f"skipped restoring {jid[:13]}: {restore_results[jid]}")
         else:
+            restore_failed = True
             outcome = restore_results.get(jid, "missing_result")
             log(f"err restoring {jid[:13]}: {restore_error or outcome}")
 
     save_state(state)
     log(f"summary: restored={restored} skipped_capped={skipped_capped} skipped_backoff={skipped_backoff} skipped_too_fresh={skipped_too_fresh}")
-    return 0
+    return 1 if restore_failed else 0
 
 if __name__ == "__main__":
     sys.exit(main())
