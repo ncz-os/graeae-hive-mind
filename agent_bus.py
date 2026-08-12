@@ -2311,9 +2311,13 @@ async def agent_throttle(urn_path: str):
     }
 
 
-@app.post("/v1/agents/{urn_path:path}/plan-reset")
+@app.post("/v1/agents/{urn_path:path}/plan-reset", dependencies=[Depends(require_bus_admin)])
 async def reset_plan_period(urn_path: str):
-    """Operator zeros the MTD usage — call monthly on billing rollover."""
+    """Operator zeros the MTD usage — call monthly on billing rollover.
+
+    Admin-only: this erases an agent's month-to-date spend, so any worker token
+    could otherwise clear any agent's budget and defeat the subscription cap.
+    Matches the tier already required for job submission."""
     async with connect_db() as db:
         cur = await db.execute(
             "UPDATE agents SET plan_period_used_usd = 0 WHERE urn=?", (urn_path,))
@@ -3787,9 +3791,13 @@ async def list_jobs(
 
 
 @app.post("/v1/messages")
-async def publish_message(req: MessagePublish):
+async def publish_message(req: MessagePublish, request: Request = None):
     msg_id = uuidv7()
     now = time.time()
+    # require_registered_agent only proves the URN EXISTS; without binding it to
+    # the caller's own session token any registered agent could publish as any
+    # other. This repo does issue agent-scoped tokens, so bind them.
+    _require_agent_identity(request, req.from_urn)
     await require_registered_agent(req.from_urn, active_only=True)
     async with connect_db() as db:
         await db.execute(
@@ -3926,9 +3934,9 @@ async def mcp_rpc(body: dict, request: Request):
     # crude param coercion - production MCP would use proper validation
     try:
         if method == "agent.register":
-            return await register(AgentRegister(**params))
+            return await register(AgentRegister(**params), request)
         if method == "agent.heartbeat":
-            return await heartbeat(AgentHeartbeat(**params))
+            return await heartbeat(AgentHeartbeat(**params), request)
         if method == "agent.list":
             return await list_agents(**params)
         if method == "job.create":
@@ -3936,7 +3944,7 @@ async def mcp_rpc(body: dict, request: Request):
         if method == "job.list":
             return await list_jobs(**params)
         if method == "message.publish":
-            return await publish_message(MessagePublish(**params))
+            return await publish_message(MessagePublish(**params), request)
         if method == "message.list":
             return await list_messages(**params)
     except Exception as e:
