@@ -1760,10 +1760,29 @@ async def lifespan(app: FastAPI):
                     )
                     has_execution_spec = (await rcur.fetchone())[0]
                     if not has_execution_spec:
-                        raise RuntimeError(
-                            "Oracle schema is missing canonical HIVE_JOBS.EXECUTION_SPEC; "
-                            "apply migrations/2026-08-10-system-job-execution.sql before startup"
+                        # Previously this refused to start and told the operator to
+                        # run migrations/2026-08-10-system-job-execution.sql by hand.
+                        # SQLite already self-migrates this column, so Oracle was the
+                        # only backend that could not come up from a clean deploy --
+                        # a container rebuild would crash-loop until someone applied
+                        # it manually. The migration's Oracle branch is exactly the
+                        # statement below and is idempotent, so apply it here, in the
+                        # same guarded-DDL block that already adds decline_count and
+                        # relaxes CK_HIVE_JOBS_STATUS.
+                        log.warning(
+                            "HIVE_JOBS.EXECUTION_SPEC absent; applying "
+                            "migrations/2026-08-10-system-job-execution.sql inline"
                         )
+                        await rcur.execute("ALTER TABLE HIVE_JOBS ADD (execution_spec CLOB)")
+                        await rcur.execute(
+                            "SELECT COUNT(*) FROM user_tab_columns "
+                            "WHERE table_name = 'HIVE_JOBS' AND column_name = 'EXECUTION_SPEC'"
+                        )
+                        if not (await rcur.fetchone())[0]:
+                            raise RuntimeError(
+                                "failed to add HIVE_JOBS.EXECUTION_SPEC; apply "
+                                "migrations/2026-08-10-system-job-execution.sql manually"
+                            )
                     await rcur.execute(
                         "SELECT COUNT(*) FROM user_tab_columns "
                         "WHERE table_name = 'HIVE_JOBS' AND column_name = 'DEDUP_HASH'"
