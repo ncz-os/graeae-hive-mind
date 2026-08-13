@@ -54,6 +54,9 @@ LOAD_THRESHOLD = float(os.environ.get(
 ))
 ALLOW_CLAIM_WITHOUT_LOAD = os.environ.get("ALLOW_CLAIM_WITHOUT_LOAD", "0") == "1"
 JOB_POLL_INTERVAL = float(os.environ.get("JOB_POLL_INTERVAL", "5"))
+TELEMETRY_CACHE_SECONDS = max(
+    0.0, float(os.environ.get("SYSTEM_WATCHER_TELEMETRY_CACHE_SECONDS", "0"))
+)
 JOB_LEASE_RENEW_INTERVAL = float(os.environ.get("JOB_LEASE_RENEW_INTERVAL", "300"))
 JOB_TIMEOUT_MAX = int(os.environ.get("JOB_TIMEOUT_MAX", "21600"))
 JOB_WORK_ROOT = os.path.realpath(os.environ.get("JOB_WORK_ROOT", "/srv"))
@@ -483,6 +486,31 @@ def dynamic_load() -> dict:
     return out
 
 
+_telemetry_cache: dict = {}
+_telemetry_cache_at = 0.0
+
+
+def current_load() -> dict:
+    """Return telemetry, optionally caching expensive probes while refreshing loadavg."""
+    global _telemetry_cache, _telemetry_cache_at
+    now = time.monotonic()
+    if (
+        TELEMETRY_CACHE_SECONDS > 0
+        and _telemetry_cache
+        and now - _telemetry_cache_at < TELEMETRY_CACHE_SECONDS
+    ):
+        load = dict(_telemetry_cache)
+        try:
+            load["load_1min"], load["load_5min"], load["load_15min"] = os.getloadavg()
+        except (AttributeError, OSError):
+            pass
+        return load
+    load = dynamic_load()
+    _telemetry_cache = dict(load)
+    _telemetry_cache_at = now
+    return load
+
+
 def capabilities_from_specs(specs: dict) -> list[str]:
     caps = ["system", "host"]
     if specs.get("has_docker"):     caps.append("docker")
@@ -540,7 +568,7 @@ def register():
 
 
 def heartbeat(load: dict | None = None):
-    load = load or dynamic_load()
+    load = load or current_load()
     # Push fresh load into agent metadata so /v1/hosts always has current data.
     # Heartbeat endpoint merges {"load": load} into existing metadata (server-side update).
     _http("POST", "/v1/agents/heartbeat", {

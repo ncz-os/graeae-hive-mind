@@ -37,10 +37,16 @@ HEARTBEAT_REAP_INTERVAL = 30.0
 HEARTBEAT_STALE_AFTER = 90.0
 HEARTBEAT_OFFLINE_AFTER = 300.0
 EVENTS_RETAIN_HOURS = 168  # 7 days
+CACHE_RETENTION_SWEEP_INTERVAL = max(
+    60, int(os.environ.get("AGENT_BUS_CACHE_RETENTION_SWEEP_INTERVAL", "3600"))
+)
 SSE_PING_INTERVAL = 15.0
 EVENT_QUEUE: dict[str, asyncio.Queue] = {}  # subscriber_id -> queue
 SQLITE_BUSY_TIMEOUT_MS = int(os.environ.get("AGENT_BUS_SQLITE_BUSY_TIMEOUT_MS", "5000"))
 MAX_EVENT_SUBSCRIBERS = int(os.environ.get("AGENT_BUS_MAX_EVENT_SUBSCRIBERS", "100"))
+DEPENDENCY_QUERY_BATCH_SIZE = max(
+    1, min(int(os.environ.get("AGENT_BUS_DEPENDENCY_QUERY_BATCH_SIZE", "500")), 900)
+)
 
 # ── transport auth (review C1: unauth RCE-by-design) ─────────────────────────
 # The bus had NO transport auth — any LAN host could GET/POST every endpoint, so
@@ -905,6 +911,27 @@ def json_list(raw: Optional[str]) -> list[Any]:
     return [x for x in val if isinstance(x, str)] if isinstance(val, list) else []
 
 
+async def dependency_status_map(db, dependency_json_values) -> dict[str, str]:
+    """Load dependency statuses for a candidate set without per-job queries."""
+    dependency_ids = {
+        dependency_id
+        for raw in dependency_json_values
+        for dependency_id in json_list(raw)
+    }
+    statuses: dict[str, str] = {}
+    ordered_ids = sorted(dependency_ids)
+    for offset in range(0, len(ordered_ids), DEPENDENCY_QUERY_BATCH_SIZE):
+        chunk = ordered_ids[offset:offset + DEPENDENCY_QUERY_BATCH_SIZE]
+        placeholders = ",".join("?" * len(chunk))
+        async with db.execute(
+            f"SELECT id, status FROM jobs WHERE id IN ({placeholders})",
+            tuple(chunk),
+        ) as cur:
+            async for dependency_id, status in cur:
+                statuses[dependency_id] = status
+    return statuses
+
+
 def clamp_limit(value: int, *, default: int = 100, max_limit: int = 1000) -> int:
     try:
         limit = int(value)
@@ -1558,6 +1585,15 @@ async def reaper_task(app: FastAPI):
                 retain_cutoff = time.time() - EVENTS_RETAIN_HOURS * 3600
                 await db.execute("DELETE FROM events WHERE ts < ?", (retain_cutoff,))
                 await db.commit()
+                # Expired cache rows are already invisible to cache_lookup. Reclaim
+                # their duplicate result payloads at a low cadence without changing
+                # cache-hit behavior.
+                last_cache_sweep = getattr(app.state, "cache_retention_last_run", 0.0)
+                if time.time() - last_cache_sweep >= CACHE_RETENTION_SWEEP_INTERVAL:
+                    cache_cutoff = time.time() - CACHE_TTL_SECONDS
+                    await db.execute("DELETE FROM hive_cache WHERE cached_at < ?", (cache_cutoff,))
+                    await db.commit()
+                    app.state.cache_retention_last_run = time.time()
             app.state.reaper_last_success = time.time()
             app.state.reaper_last_error = None
             app.state.reaper_consecutive_failures = 0
@@ -2683,6 +2719,9 @@ async def dequeue_next_job(
             candidate_sql += " ORDER BY priority DESC, started_at ASC LIMIT 100"
             async with db.execute(candidate_sql, candidate_args) as cur:
                 candidates = [tuple(r) async for r in cur]
+            dependency_statuses = await dependency_status_map(
+                db, (candidate[15] for candidate in candidates)
+            )
             candidates = [
                 r for _idx, r in sorted(
                     enumerate(candidates),
@@ -2716,15 +2755,8 @@ async def dequeue_next_job(
                 ):
                     continue
                 deps = json_list(j_deps_json)
-                if deps:
-                    ph = ",".join("?" * len(deps))
-                    async with db.execute(
-                        f"SELECT COUNT(*) FROM jobs WHERE id IN ({ph}) AND status='done'",
-                        tuple(deps),
-                    ) as dc:
-                        done_count = (await dc.fetchone())[0]
-                    if done_count < len(deps):
-                        continue
+                if deps and any(dependency_statuses.get(dep) != "done" for dep in deps):
+                    continue
                 job = {
                     "id": j_id,
                     "kind": j_kind,
@@ -3751,12 +3783,23 @@ async def list_jobs(
     agent_urn: Optional[str] = None,
     parent_job_id: Optional[str] = None,
     since: Optional[float] = None,
+    ended_since: Optional[float] = None,
+    kind_prefix: Optional[str] = None,
+    include_result: bool = True,
     limit: int = 100,
 ):
     limit = clamp_limit(limit, default=100, max_limit=1000)
-    sql = ("SELECT id, submitter_urn, parent_job_id, kind, description, priority, status, "
-           "claimed_by, started_at, ended_at, result, estimated_cost_usd, "
-           "required_capabilities, eligible_kinds, eligible_hosts, execution_spec FROM jobs WHERE 1=1")
+    columns = [
+        "id", "submitter_urn", "parent_job_id", "kind", "description", "priority",
+        "status", "claimed_by", "started_at", "ended_at",
+    ]
+    if include_result:
+        columns.append("result")
+    columns.extend([
+        "estimated_cost_usd", "required_capabilities", "eligible_kinds",
+        "eligible_hosts", "execution_spec",
+    ])
+    sql = f"SELECT {', '.join(columns)} FROM jobs WHERE 1=1"
     args: list = []
     cnt_sql = "SELECT COUNT(*) FROM jobs WHERE 1=1"
     cnt_args: list = []
@@ -3780,6 +3823,16 @@ async def list_jobs(
         cnt_sql += " AND started_at >= ?"
         args.append(since)
         cnt_args.append(since)
+    if ended_since is not None:
+        sql += " AND ended_at >= ?"
+        cnt_sql += " AND ended_at >= ?"
+        args.append(ended_since)
+        cnt_args.append(ended_since)
+    if kind_prefix:
+        sql += " AND SUBSTR(kind, 1, ?) = ?"
+        cnt_sql += " AND SUBSTR(kind, 1, ?) = ?"
+        args.extend([len(kind_prefix), kind_prefix])
+        cnt_args.extend([len(kind_prefix), kind_prefix])
     # For terminal statuses (done/failed/cancelled), sort by ended_at DESC so 'recent' actually means recently-finished.
     if status in ("done", "failed", "cancelled"):
         sql += " ORDER BY COALESCE(ended_at, started_at) DESC LIMIT ?"
@@ -3794,18 +3847,26 @@ async def list_jobs(
             total = row[0] if row else 0
         async with db.execute(sql, args) as cur:
             async for r in cur:
-                rows.append({
-                    "id": r[0], "submitter_urn": r[1], "parent_job_id": r[2],
-                    "kind": r[3], "description": r[4], "priority": r[5],
-                    "status": r[6], "claimed_by": r[7],
-                    "started_at": r[8], "ended_at": r[9],
-                    "result": json.loads(r[10]) if r[10] else None,
-                    "estimated_cost_usd": r[11],
-                    "required_capabilities": json.loads(r[12]) if r[12] else None,
-                    "eligible_kinds": json.loads(r[13]) if r[13] else None,
-                    "eligible_hosts": json.loads(r[14]) if r[14] else None,
-                    "execution": json.loads(r[15]) if r[15] else None,
-                })
+                values = dict(zip(columns, r))
+                job = {
+                    "id": values["id"], "submitter_urn": values["submitter_urn"],
+                    "parent_job_id": values["parent_job_id"], "kind": values["kind"],
+                    "description": values["description"], "priority": values["priority"],
+                    "status": values["status"], "claimed_by": values["claimed_by"],
+                    "started_at": values["started_at"], "ended_at": values["ended_at"],
+                    "estimated_cost_usd": values["estimated_cost_usd"],
+                    "required_capabilities": json.loads(values["required_capabilities"])
+                    if values["required_capabilities"] else None,
+                    "eligible_kinds": json.loads(values["eligible_kinds"])
+                    if values["eligible_kinds"] else None,
+                    "eligible_hosts": json.loads(values["eligible_hosts"])
+                    if values["eligible_hosts"] else None,
+                    "execution": json.loads(values["execution_spec"])
+                    if values["execution_spec"] else None,
+                }
+                if include_result:
+                    job["result"] = json.loads(values["result"]) if values["result"] else None
+                rows.append(job)
     return {"count": len(rows), "total": total, "jobs": rows}
 
 

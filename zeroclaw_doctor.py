@@ -56,7 +56,7 @@ import urllib.error
 import urllib.request
 import uuid
 from collections import deque
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 HIVE_URL = os.environ.get("HIVE_URL", "http://192.168.207.67:5005")
 # C1: bus transport auth bearer token (env-sourced). The doctor SUBMITS jobs
@@ -1212,7 +1212,13 @@ def scan_for_failure_clusters() -> list[dict]:
     cutoff = time.time() - CLUSTER_WINDOW_SEC
     counts: dict[tuple[str, str], list[dict]] = {}
     for status in ("failed", "dead-letter"):
-        code, resp = _http("GET", f"/v1/jobs?status={status}&limit=500", timeout=20.0)
+        query = urlencode({
+            "status": status,
+            "limit": 500,
+            "ended_since": cutoff,
+            "include_result": "false",
+        })
+        code, resp = _http("GET", f"/v1/jobs?{query}", timeout=20.0)
         if code != 200 or not resp:
             continue
         for j in resp.get("jobs", []) or []:
@@ -1246,7 +1252,13 @@ def scan_for_failure_clusters() -> list[dict]:
 def _active_triage_exists(base_kind: str, source_status: str = "failed") -> bool:
     """True if a triage:<status>:<base_kind> job is currently queued or running."""
     for status in ("queued", "running"):
-        code, resp = _http("GET", f"/v1/jobs?status={status}&limit=200", timeout=10.0)
+        query = urlencode({
+            "status": status,
+            "kind_prefix": "triage:",
+            "limit": 200,
+            "include_result": "false",
+        })
+        code, resp = _http("GET", f"/v1/jobs?{query}", timeout=10.0)
         if code != 200 or not resp:
             continue
         target = f"triage:{source_status}:{base_kind}"

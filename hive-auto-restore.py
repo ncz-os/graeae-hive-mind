@@ -85,7 +85,9 @@ def _http(method: str, path: str, body: dict | None = None, timeout: float = 15.
         return 0, None
 
 def fetch_failed_jobs(limit: int = 1000) -> list[dict]:
-    query = urllib.parse.urlencode({"status": "failed", "limit": str(limit)})
+    query = urllib.parse.urlencode({
+        "status": "failed", "limit": str(limit), "include_result": "false",
+    })
     code, resp = _http("GET", f"/v1/jobs?{query}", timeout=15.0)
     if code != 200 or not isinstance(resp, dict):
         raise RuntimeError(f"fetch_failed_jobs http={code} resp={str(resp)[:200]}")

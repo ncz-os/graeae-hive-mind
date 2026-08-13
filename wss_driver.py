@@ -31,6 +31,7 @@ HOST_PORT = 42617
 SESSION_TIMEOUT_SEC = 600
 AUTO_APPROVE_TOOLS = {"shell", "edit", "read", "list_files", "git", "write", "apply_patch"}
 MAX_WS_FRAME_BYTES = 983_040  # leave websocket/proxy headroom below 1 MiB
+MAX_INBOUND_FRAME_BYTES = int(os.environ.get("WSS_MAX_INBOUND_FRAME_BYTES", "1048576"))
 MAX_CAPTURE_BYTES = 64_000
 GIT_COMMIT_RE = re.compile(
     r"^[a-f0-9]{7,40}\b|"
@@ -249,8 +250,8 @@ async def _drive_one(host: str, agent_alias: str, task: str, job_id: str,
         params["max_tool_iterations"] = str(max_tool_iterations)
     uri = f"ws://{host}:{HOST_PORT}/ws/chat?{urlencode(params)}"
     started = time.time()
-    tool_calls = []
-    tool_results = []
+    tool_call_count = 0
+    tool_result_count = 0
     candidate_commits = []
     files_touched = set()
     final_response = ""
@@ -260,7 +261,9 @@ async def _drive_one(host: str, agent_alias: str, task: str, job_id: str,
     frame_stats = {"outbound_truncations": 0, "max_outbound_frame_bytes": 0, "max_inbound_frame_bytes": 0}
 
     try:
-        async with websockets.connect(uri, open_timeout=15, close_timeout=10, max_size=None) as ws:
+        async with websockets.connect(
+            uri, open_timeout=15, close_timeout=10, max_size=MAX_INBOUND_FRAME_BYTES
+        ) as ws:
             # First frame: session_start
             first = await asyncio.wait_for(ws.recv(), timeout=15.0)
             frame_stats["max_inbound_frame_bytes"] = max(frame_stats["max_inbound_frame_bytes"], _utf8_len(first))
@@ -292,7 +295,7 @@ async def _drive_one(host: str, agent_alias: str, task: str, job_id: str,
                 elif t == "tool_call":
                     name = f.get("name", "")
                     args = f.get("args", {}) or f.get("arguments", {})
-                    tool_calls.append({"name": name, "args_preview": _capture_preview(str(args), 2_000)})
+                    tool_call_count += 1
                     for m in _harvest_commits_from_tool_call(args, name):
                         candidate_commits.append(m)
                     # Record file paths touched by edit/write tools
@@ -304,7 +307,7 @@ async def _drive_one(host: str, agent_alias: str, task: str, job_id: str,
                 elif t == "tool_result":
                     name = f.get("name", "")
                     out = f.get("output", "") or f.get("result", "")
-                    tool_results.append({"name": name, "out_preview": _capture_preview(out, 4_000)})
+                    tool_result_count += 1
                     shas = _harvest_commits_from_tool_result(out)
                     candidate_commits.extend(shas)
                 elif t == "done":
@@ -343,8 +346,8 @@ async def _drive_one(host: str, agent_alias: str, task: str, job_id: str,
         "agent_alias": agent_alias,
         "host": host,
         "duration_sec": round(duration, 2),
-        "tool_call_count": len(tool_calls),
-        "tool_results_count": len(tool_results),
+        "tool_call_count": tool_call_count,
+        "tool_results_count": tool_result_count,
         "approvals_handled": approvals_handled,
         "outbound_truncations": frame_stats["outbound_truncations"],
         "max_outbound_frame_bytes": frame_stats["max_outbound_frame_bytes"],

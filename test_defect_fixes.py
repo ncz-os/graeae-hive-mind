@@ -12,6 +12,7 @@ import sqlite3
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 import httpx
 from starlette.requests import Request
@@ -437,6 +438,50 @@ class AgentBusDefectTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual((await cur.fetchone())[0], 1)
 
 
+    async def test_job_list_can_omit_results_and_filter_terminal_rows(self):
+        async with agent_bus.lifespan(agent_bus.app):
+            now = agent_bus.time.time()
+            async with agent_bus.connect_db() as db:
+                await db.executemany(
+                    "INSERT OR REPLACE INTO jobs "
+                    "(id, submitter_urn, kind, status, started_at, ended_at, result) "
+                    "VALUES (?, 'urn:test', ?, 'failed', ?, ?, ?)",
+                    [
+                        ("perf-old", "perf:old", now - 20, now - 10, json.dumps({"blob": "x" * 1000})),
+                        ("perf-new", "perf:new", now - 2, now - 1, json.dumps({"blob": "y" * 1000})),
+                    ],
+                )
+                await db.commit()
+
+            summary = await agent_bus.list_jobs(
+                status="failed", ended_since=now - 5, kind_prefix="perf:",
+                include_result=False, limit=10,
+            )
+            self.assertEqual([job["id"] for job in summary["jobs"]], ["perf-new"])
+            self.assertNotIn("result", summary["jobs"][0])
+
+            full = await agent_bus.list_jobs(
+                status="failed", kind_prefix="perf:new", limit=1,
+            )
+            self.assertEqual(full["jobs"][0]["result"]["blob"], "y" * 1000)
+
+    async def test_dependency_statuses_are_loaded_as_one_candidate_batch(self):
+        async with agent_bus.lifespan(agent_bus.app):
+            now = agent_bus.time.time()
+            async with agent_bus.connect_db() as db:
+                await db.executemany(
+                    "INSERT OR REPLACE INTO jobs "
+                    "(id, submitter_urn, kind, status, started_at) "
+                    "VALUES (?, 'urn:test', 'dependency', ?, ?)",
+                    [("dep-done", "done", now), ("dep-running", "running", now)],
+                )
+                await db.commit()
+                statuses = await agent_bus.dependency_status_map(
+                    db, [json.dumps(["dep-done", "dep-running"]), json.dumps(["dep-done"])]
+                )
+            self.assertEqual(statuses, {"dep-done": "done", "dep-running": "running"})
+
+
 class WorkerAndRestoreDefectTests(unittest.TestCase):
     def test_system_watcher_terminal_patch_retries_and_persists_receipt(self):
         watcher = _load_script("system_watcher_finalize_test", "system_watcher.py")
@@ -465,6 +510,18 @@ class WorkerAndRestoreDefectTests(unittest.TestCase):
         self.assertFalse(watcher.load_allows_claim({})[0])
         self.assertFalse(watcher.load_allows_claim({"load_1min": 2.1})[0])
         self.assertTrue(watcher.load_allows_claim({"load_1min": 2.0})[0])
+
+    def test_system_watcher_can_cache_expensive_telemetry_with_fresh_loadavg(self):
+        watcher = _load_script("system_watcher_telemetry_cache_test", "system_watcher.py")
+        watcher.TELEMETRY_CACHE_SECONDS = 60
+        calls = []
+        watcher.dynamic_load = lambda: calls.append(True) or {"load_1min": 1.0, "gpus_runtime": []}
+        first = watcher.current_load()
+        with mock.patch.object(watcher.os, "getloadavg", return_value=(2.0, 3.0, 4.0)):
+            second = watcher.current_load()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(first["load_1min"], 1.0)
+        self.assertEqual(second["load_1min"], 2.0)
 
     def test_system_watcher_executes_and_renews_lease(self):
         watcher = _load_script("system_watcher_execution_test", "system_watcher.py")
@@ -555,6 +612,79 @@ class WorkerAndRestoreDefectTests(unittest.TestCase):
         restore._http = lambda *args, **kwargs: (200, {})
         with self.assertRaisesRegex(RuntimeError, "missing field 'jobs'"):
             restore.fetch_failed_jobs()
+
+    def test_auto_restore_omits_job_results(self):
+        restore = _load_script("hive_auto_restore_projection_test", "hive-auto-restore.py")
+        captured = {}
+
+        def fake_http(method, path, body=None, timeout=0, **kwargs):
+            captured["path"] = path
+            return 200, {"jobs": []}
+
+        restore._http = fake_http
+        self.assertEqual(restore.fetch_failed_jobs(), [])
+        self.assertIn("include_result=false", captured["path"])
+
+    def test_goose_uses_files_and_returns_bounded_output_tails(self):
+        worker = _load_script("goose_worker_output_test", "goose_worker.py")
+        streams = {}
+
+        class FakeProcess:
+            returncode = 0
+
+            def __init__(self, _cmd, cwd=None, stdout=None, stderr=None):
+                streams.update(stdout=stdout, stderr=stderr)
+                stdout.write(b"x" * 20_000 + b"stdout-tail")
+                stderr.write(b"e" * 8_000 + b"stderr-tail")
+
+            def wait(self, timeout=None):
+                return 0
+
+        worker.git_snapshot = lambda: (None, set())
+        worker.git_result_delta = lambda *_args: ([], [])
+        with mock.patch.object(worker.subprocess, "Popen", FakeProcess):
+            result = worker.run_goose("bounded output")
+        self.assertIsNot(streams["stdout"], worker.subprocess.PIPE)
+        self.assertLessEqual(len(result["stdout"].encode()), 12_000)
+        self.assertLessEqual(len(result["stderr"].encode()), 4_000)
+        self.assertTrue(result["stdout"].endswith("stdout-tail"))
+
+    def test_wss_sets_inbound_limit_without_retaining_tool_previews(self):
+        driver = _load_script("wss_driver_frame_test", "wss_driver.py")
+        captured = {}
+
+        class FakeWebSocket:
+            def __init__(self):
+                self.frames = iter([
+                    json.dumps({"type": "session_start"}),
+                    json.dumps({"type": "tool_call", "name": "read", "args": {"path": "a"}}),
+                    json.dumps({"type": "tool_result", "name": "read", "output": "ok"}),
+                    json.dumps({"type": "done", "full_response": "done"}),
+                ])
+
+            async def recv(self):
+                return next(self.frames)
+
+            async def send(self, _payload):
+                return None
+
+        class FakeConnection:
+            async def __aenter__(self):
+                return FakeWebSocket()
+
+            async def __aexit__(self, *_args):
+                return None
+
+        def fake_connect(_uri, **kwargs):
+            captured.update(kwargs)
+            return FakeConnection()
+
+        driver.load_tokens = lambda: {"test-host": "token"}
+        with mock.patch.object(driver.websockets, "connect", fake_connect):
+            result = asyncio.run(driver._drive_one("test-host", "agent", "task", "job"))
+        self.assertEqual(captured["max_size"], driver.MAX_INBOUND_FRAME_BYTES)
+        self.assertEqual(result["tool_call_count"], 1)
+        self.assertEqual(result["tool_results_count"], 1)
 
     def test_auto_restore_requeue_failure_returns_nonzero(self):
         restore = _load_script("hive_auto_restore_requeue_failure_test", "hive-auto-restore.py")

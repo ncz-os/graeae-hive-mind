@@ -14,6 +14,38 @@ from .base import HiveMindRepository, Transaction
 
 NARROW_HOSTS = {"cixmini", "bigpi", "clawpi", "zeropi"}
 NARROW_ALLOWLIST = ("cixmini-os:", "ncz-os-", "fleet-infra:")
+DEPENDENCY_QUERY_BATCH_SIZE = max(
+    1, min(int(os.environ.get("AGENT_BUS_DEPENDENCY_QUERY_BATCH_SIZE", "500")), 900)
+)
+
+
+def _json_string_list(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    try:
+        value = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return []
+    return [item for item in value if isinstance(item, str)] if isinstance(value, list) else []
+
+
+async def _dependency_status_map(db: Any, dependency_json_values) -> dict[str, str]:
+    dependency_ids = {
+        dependency_id
+        for raw in dependency_json_values
+        for dependency_id in _json_string_list(raw)
+    }
+    statuses: dict[str, str] = {}
+    ordered_ids = sorted(dependency_ids)
+    for offset in range(0, len(ordered_ids), DEPENDENCY_QUERY_BATCH_SIZE):
+        chunk = ordered_ids[offset:offset + DEPENDENCY_QUERY_BATCH_SIZE]
+        placeholders = ",".join("?" * len(chunk))
+        async with db.execute(
+            f"SELECT id, status FROM jobs WHERE id IN ({placeholders})", tuple(chunk)
+        ) as cur:
+            async for dependency_id, status in cur:
+                statuses[dependency_id] = status
+    return statuses
 
 
 class SqliteHiveRepository(HiveMindRepository):
@@ -204,26 +236,25 @@ class SqliteHiveRepository(HiveMindRepository):
                     "eligible_hosts, submitter_urn, parent_job_id, started_at, max_cost_tier, preferred_providers, "
                     "preferred_models, mnemos_refs, depends_on FROM jobs WHERE status='queued' "
                     "AND (retry_backoff_until IS NULL OR retry_backoff_until <= ?) "
-                    "ORDER BY priority DESC, started_at ASC",
+                    "ORDER BY priority DESC, started_at ASC LIMIT 100",
                     (now,),
                 ) as cur:
-                    async for r in cur:
+                    candidates = [tuple(row) async for row in cur]
+                dependency_statuses = await _dependency_status_map(
+                    db, (candidate[15] for candidate in candidates)
+                )
+                for r in candidates:
                         (job_id, j_kind, j_desc, j_prio, j_dead, j_caps_json, _j_kinds_json,
                          _j_hosts_json, j_sub, j_par, j_started, j_max_tier, j_pref_providers,
                          j_pref_models, j_mnemos_refs, j_deps_json) = r
                         if urn_host in NARROW_HOSTS and not (j_kind or "").startswith(NARROW_ALLOWLIST):
                             continue
                         if j_deps_json:
-                            deps = json_list(j_deps_json)
-                            if deps:
-                                ph = ",".join("?" * len(deps))
-                                async with db.execute(
-                                    f"SELECT COUNT(*) FROM jobs WHERE id IN ({ph}) AND status='done'",
-                                    tuple(deps),
-                                ) as dc:
-                                    done_count = (await dc.fetchone())[0]
-                                if done_count < len(deps):
-                                    continue
+                            deps = _json_string_list(j_deps_json)
+                            if deps and any(
+                                dependency_statuses.get(dep) != "done" for dep in deps
+                            ):
+                                continue
                         if _j_kinds_json:
                             kinds = set(json_list(_j_kinds_json))
                             if kinds and "*" not in kinds and not kinds.intersection(eligible_aliases):

@@ -24,6 +24,7 @@ import os
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 
@@ -318,6 +319,48 @@ def git_result_delta(before_head: str | None, before_status: set[str], cwd: str 
 JOB_HEARTBEAT_INTERVAL = int(os.environ.get("JOB_HEARTBEAT_INTERVAL", "300"))  # 5 min default
 
 
+def _read_output_tail(stream, max_bytes: int) -> str:
+    stream.flush()
+    stream.seek(0, os.SEEK_END)
+    stream.seek(max(0, stream.tell() - max_bytes))
+    return stream.read().decode("utf-8", errors="replace")
+
+
+def _parse_tokens_from_files(*streams) -> tuple[int, int]:
+    """Scan spooled output in bounded chunks so early usage markers are preserved."""
+    for pattern_kind, pattern in (("token", _TOKEN_PAT), ("usage", _USAGE_PAT)):
+        for stream in streams:
+            stream.flush()
+            stream.seek(0)
+            carry = ""
+            while chunk := stream.read(64 * 1024):
+                text = carry + chunk.decode("utf-8", errors="replace")
+                match = pattern.search(text)
+                if match:
+                    first = int(match.group(1))
+                    second = int(match.group(2)) if match.group(2) else 0
+                    if pattern_kind == "token" and not second:
+                        return 0, first
+                    return first, second
+                carry = text[-1024:]
+    return 0, 0
+
+
+def _detect_goose_error_from_file(stream) -> Optional[str]:
+    """Preserve full-output error detection without loading the output into RAM."""
+    for tag, needle in ERR_PATTERNS:
+        target = needle.lower().encode("utf-8")
+        stream.flush()
+        stream.seek(0)
+        carry = b""
+        while chunk := stream.read(64 * 1024):
+            text = (carry + chunk).lower()
+            if target in text:
+                return tag
+            carry = text[-max(0, len(target) - 1):]
+    return None
+
+
 def run_goose(description: str, kind: str = "", job_heartbeat_fn=None) -> dict:
     cmd = [GOOSE_BIN, "run", "--text", description, "--no-session"] + GOOSE_EXTRA_ARGS
     print(f"[worker] $ {' '.join(cmd[:6])} … [desc len={len(description)}]", flush=True)
@@ -325,38 +368,42 @@ def run_goose(description: str, kind: str = "", job_heartbeat_fn=None) -> dict:
     timeout = timeout_for_kind(kind)
     before_head, before_status = git_snapshot()
     try:
-        proc = subprocess.Popen(cmd, cwd=WORKDIR, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, text=True)
-        last_job_hb = time.time()
-        while True:
-            try:
-                proc.wait(timeout=30)
-                break  # process finished
-            except subprocess.TimeoutExpired:
-                elapsed = time.time() - start
-                if elapsed >= timeout:
-                    proc.kill()
-                    proc.wait()
-                    return {
-                        "exit_code": -1,
-                        "error": f"timeout {timeout}s exceeded",
-                        "duration_sec": round(elapsed, 1),
-                        "commits": [],
-                        "files_changed": [],
-                        "workdir": WORKDIR,
-                    }
-                # Proof-of-work heartbeat: renew job lease on the Hive so reaper doesn't
-                # reclaim long-running orchestration/migration jobs while worker is alive.
-                if job_heartbeat_fn and (time.time() - last_job_hb) >= JOB_HEARTBEAT_INTERVAL:
-                    try:
-                        job_heartbeat_fn(round(elapsed, 1))
-                    except Exception:
-                        pass
-                    last_job_hb = time.time()
+        with tempfile.TemporaryFile(mode="w+b") as stdout_file, \
+                tempfile.TemporaryFile(mode="w+b") as stderr_file:
+            proc = subprocess.Popen(
+                cmd, cwd=WORKDIR, stdout=stdout_file, stderr=stderr_file
+            )
+            last_job_hb = time.time()
+            while True:
+                try:
+                    proc.wait(timeout=30)
+                    break  # process finished
+                except subprocess.TimeoutExpired:
+                    elapsed = time.time() - start
+                    if elapsed >= timeout:
+                        proc.kill()
+                        proc.wait()
+                        return {
+                            "exit_code": -1,
+                            "error": f"timeout {timeout}s exceeded",
+                            "duration_sec": round(elapsed, 1),
+                            "commits": [],
+                            "files_changed": [],
+                            "workdir": WORKDIR,
+                        }
+                    # Proof-of-work heartbeat: renew job lease on the Hive so reaper doesn't
+                    # reclaim long-running orchestration/migration jobs while worker is alive.
+                    if job_heartbeat_fn and (time.time() - last_job_hb) >= JOB_HEARTBEAT_INTERVAL:
+                        try:
+                            job_heartbeat_fn(round(elapsed, 1))
+                        except Exception:
+                            pass
+                        last_job_hb = time.time()
 
-        stdout, stderr = proc.stdout.read(), proc.stderr.read()
-        err_tag = detect_goose_error(stdout)
-        t_in, t_out = parse_tokens(stdout, stderr)
+            t_in, t_out = _parse_tokens_from_files(stdout_file, stderr_file)
+            err_tag = _detect_goose_error_from_file(stdout_file)
+            stdout = _read_output_tail(stdout_file, 12_000)
+            stderr = _read_output_tail(stderr_file, 4_000)
         commits, files_changed = git_result_delta(before_head, before_status)
         # Fallback estimate when goose doesn't surface counts: char/4 (rough GPT-tokenizer heuristic)
         if t_in == 0 and t_out == 0:
@@ -364,8 +411,8 @@ def run_goose(description: str, kind: str = "", job_heartbeat_fn=None) -> dict:
             t_out = max(1, len(stdout) // 4)
         result = {
             "exit_code": proc.returncode,
-            "stdout": stdout[-12000:],
-            "stderr": stderr[-4000:],
+            "stdout": stdout,
+            "stderr": stderr,
             "duration_sec": round(time.time() - start, 1),
             "goose_cmd": " ".join(cmd[:6]),
             "tokens_in": t_in,
