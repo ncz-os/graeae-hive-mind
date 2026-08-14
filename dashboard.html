@@ -391,6 +391,12 @@ let _submitOpen = false;
 
 // ── helpers ──────────────────────────────────────────────────────────
 function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+// Telemetry is worker-controlled: a worker bearer can put anything in its
+// metadata, so a value that "is obviously a number" is only a number until
+// someone decides otherwise. tdText renders through a text node so markup can
+// never execute; num() coerces and refuses non-finite input outright.
+function tdText(value,cls=''){const t=document.createElement('td');t.className=cls;t.textContent=String(value??'-');return t;}
+function num(value,suffix=''){const n=Number(value);return Number.isFinite(n)?n+suffix:'-';}
 function td(html,cls=''){const t=document.createElement('td');t.className=cls;if(html instanceof Node)t.appendChild(html);else t.innerHTML=html;return t;}
 async function api(method,path,body){
   const opts={method,headers:{'Content-Type':'application/json'}};
@@ -639,10 +645,10 @@ async function refreshJobs(){
     const r=tb.insertRow();
     r.className='row-clickable';
     r.onclick=()=>showJobModal(j);
-    r.appendChild(td(`${pbar(j.priority)} <b>${j.priority}</b>`));
+    r.appendChild(td(`${pbar(j.priority)} <b>${num(j.priority)}</b>`));
     r.appendChild(td(`<span style="color:#a5d6ff">${esc(j.kind)}</span><br><span class="s-${esc(j.status)} dim" style="font-size:.78em">${esc(j.status)}</span>`));
     r.appendChild(td(`<small class="dim">${esc((j.description||'').slice(0,55))}</small>`));
-    r.appendChild(td(j.estimated_cost_usd?'$'+j.estimated_cost_usd.toFixed(4):'-'));
+    r.appendChild(tdText(j.estimated_cost_usd?'$'+Number(j.estimated_cost_usd).toFixed(4):'-'));
     const actCell=td('');
     actCell.onclick=e=>e.stopPropagation();
     const acts=document.createElement('div');acts.className='act-btns';
@@ -847,7 +853,7 @@ async function refreshDoctor(){
     const row=tb.insertRow();
     row.className='row-clickable';
     row.onclick=()=>showJobModal(j);
-    row.appendChild(td(`<b>${j.priority||0}</b>`));
+    row.appendChild(td(`<b>${num(j.priority||0)}</b>`));
     row.appendChild(td(`<span style="color:#a5d6ff">${esc(j.kind||'')}</span>`));
     const statusColor={running:'#7ee787',claimed:'#ffa657',queued:'#c9d1d9',offered:'#a5d6ff'}[j.status]||'#c9d1d9';
     row.appendChild(td(`<span style="color:${statusColor}">${esc(j.status||'?')}</span>`));
@@ -857,7 +863,7 @@ async function refreshDoctor(){
     row.appendChild(td(`<small>${esc(cbShort)}</small>`));
     const ref=j.started_at||j.claimed_at||0;
     const age=ref?Math.floor(now-ref):null;
-    row.appendChild(td(age!==null?`<small class="dim">${age}s</small>`:'<small class="dim">-</small>'));
+    row.appendChild(td(age!==null?`<small class="dim">${num(age,'s')}</small>`:'<small class="dim">-</small>'));
   }
 }
 
@@ -971,7 +977,7 @@ async function refreshCosts(){
     r.appendChild(td(esc(b.bucket)));
     r.appendChild(td(b.job_count));
     r.appendChild(td(`<small class="dim">${(b.tokens_in||0).toLocaleString()}/${(b.tokens_out||0).toLocaleString()}</small>`));
-    r.appendChild(td('$'+(b.estimated_cost_usd||0).toFixed(4)));
+    r.appendChild(tdText('$'+Number(b.estimated_cost_usd||0).toFixed(4)));
   }
 }
 
@@ -984,10 +990,10 @@ async function refreshWorkers(){
     const r=tb.insertRow();
     r.appendChild(td(`<small class="dim">${esc(lab)}</small>`));
     r.appendChild(td(esc(w.kind)));
-    r.appendChild(td(`<span class="s-done">${w.success_count}</span>`));
-    r.appendChild(td(`<span class="s-failed">${w.fail_count}</span>`));
-    r.appendChild(td((w.success_pct||0)+'%'));
-    r.appendChild(td(w.avg_duration_sec||0));
+    r.appendChild(td(`<span class="s-done">${num(w.success_count)}</span>`));
+    r.appendChild(td(`<span class="s-failed">${num(w.fail_count)}</span>`));
+    r.appendChild(tdText(num(w.success_pct||0,'%')));
+    r.appendChild(tdText(num(w.avg_duration_sec||0)));
   }
 }
 
@@ -997,7 +1003,7 @@ async function refreshSchedules(){
   for(const s of (d.schedules||[])){
     const r=tb.insertRow();
     r.appendChild(td(esc(s.name)));
-    r.appendChild(td(s.interval_seconds+'s'));
+    r.appendChild(tdText(num(s.interval_seconds,'s')));
     r.appendChild(td(s.enabled?'<span class="s-online">on</span>':'<span class="s-offline">off</span>'));
     r.appendChild(td(s.fire_count));
     r.appendChild(td(s.next_fire_at?new Date(s.next_fire_at*1000).toLocaleTimeString():'-'));
@@ -1063,7 +1069,7 @@ async function refreshHosts(){
       :(h.cpu_threads?`${h.cpu_threads} threads`:'-');
     r.appendChild(td(`<small class="dim">${esc(cpuStr)}</small>`));
     // RAM
-    r.appendChild(td(h.ram_gb!=null?h.ram_gb+'GB':'-'));
+    r.appendChild(tdText(h.ram_gb!=null?num(h.ram_gb,'GB'):'-'));
     // GPU
     const gpus=(h.gpus||[]);
     const gpuStr=gpus.length?gpus.map(g=>g.name||(g.vendor+' gpu')).join(', ').slice(0,30):'-';
@@ -1116,7 +1122,7 @@ async function refreshHosts(){
     r.appendChild(td(caps.map(c=>`<span class="dim" style="font-size:.72em;border:1px solid #30363d;border-radius:3px;padding:.05em .25em">${esc(c)}</span>`).join(' ')));
     // heartbeat age
     const ageClass=h.age_s>60?'s-failed':h.age_s>30?'s-claimed':'s-online';
-    r.appendChild(td(`<span class="${ageClass}">${h.age_s}s</span>`));
+    r.appendChild(td(`<span class="${esc(ageClass)}">${num(h.age_s,'s')}</span>`));
   }
 }
 
