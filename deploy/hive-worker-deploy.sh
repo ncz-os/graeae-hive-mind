@@ -64,6 +64,23 @@ fi
 git -C "$REPO" fetch --quiet origin "$DEPLOY_REF"
 git -C "$REPO" checkout --quiet --detach FETCH_HEAD
 
+# Self-update: this script's INSTALLED copy (/usr/local/bin/hive-worker-deploy.sh,
+# what the systemd timer actually runs) is never touched by the reconcile logic
+# below -- only hive_worker.py and the systemd unit files get pulled from the
+# repo. A fix to this script itself would otherwise need a manual re-push to
+# every host forever (found the hard way, 2026-09-15: a real bugfix committed
+# to the repo sat there doing nothing on two hosts because their installed
+# copy was still the pre-fix version, and "no changes" gave no hint why).
+SELF="/usr/local/bin/hive-worker-deploy.sh"
+REPO_SELF="$REPO/deploy/hive-worker-deploy.sh"
+if [ -f "$REPO_SELF" ] && [ -f "$SELF" ] && ! cmp -s "$REPO_SELF" "$SELF"; then
+  log "self-update: $SELF changed, installing and re-execing"
+  if [ "$DRY_RUN" != 1 ]; then
+    install -m 0755 "$REPO_SELF" "$SELF"
+    exec "$SELF" "$@"
+  fi
+fi
+
 if [ ! -f "$CONF" ]; then
   log "no $CONF; not a hive-worker-managed host"
   exit 0
