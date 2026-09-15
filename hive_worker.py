@@ -87,6 +87,19 @@ JOB_TIMEOUT = int(os.environ.get("JOB_TIMEOUT", "7200"))
 WORKSPACE_ROOT = os.path.expanduser(os.environ.get("WORKSPACE_ROOT", "~/hive-workspaces"))
 KEEP_WORKSPACE = os.environ.get("KEEP_WORKSPACE", "0") == "1"
 CODEX_MODEL = os.environ.get("CODEX_MODEL", "gpt-5.6-luna")
+# Optional per-host override for zeroclaw jobs. Unset by default -- bare
+# `zoder loop` (no --agent) is meant to defer entirely to that host's own
+# ~/.zoder/config.toml escalation ladder, per this worker's original design.
+# In practice, several hosts' zoder installs have real bugs/config drift in
+# their AUTOMATIC (no-pin) routing path -- confirmed 2026-09-15 on both
+# TYDEUS and CERBERUS, where bare invocation kept resolving to a stale/
+# removed model (a provider-identity bug fixed in zoder itself, plus a
+# separate automatic-routing-ignores-primary_model issue not yet fixed
+# upstream) while the SAME model, invoked explicitly via --agent, dispatched
+# correctly. Setting ZODER_AGENT sidesteps the broken automatic path
+# entirely by pinning a known-good agent alias, the same way CODEX_MODEL
+# already sidesteps codex's model-catalog drift above.
+ZODER_AGENT = os.environ.get("ZODER_AGENT", "")
 
 if WORKER_KIND not in ("zeroclaw", "codex"):
     print("[hive-worker] WORKER_KIND must be 'zeroclaw' or 'codex'", file=sys.stderr)
@@ -288,6 +301,8 @@ def _run_job_inner(job: dict) -> None:
 
     if WORKER_KIND == "zeroclaw":
         cmd = [_find_driver("zoder"), "loop", description, "--agent-timeout", str(JOB_TIMEOUT)]
+        if ZODER_AGENT:
+            cmd += ["--agent", ZODER_AGENT, "--allow-paid"]
     else:
         cmd = [_find_driver("codex"), "exec", "--skip-git-repo-check", "-m", CODEX_MODEL, description]
 
