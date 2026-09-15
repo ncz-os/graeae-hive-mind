@@ -69,11 +69,21 @@ if [ ! -f "$CONF" ]; then
   exit 0
 fi
 KINDS=""
+RUN_AS=""
 . "$CONF"
 if [ -z "$KINDS" ]; then
   log "hosts/$HOST/hive-worker.conf has no KINDS set; nothing to do"
   exit 0
 fi
+# RUN_AS=root selects the *-root.service template (User=root, WorkingDirectory=
+# /root) instead of the default jasonperlow one. Real bug this fixed, 2026-09-15:
+# the TYPHON LXC CTs (no jasonperlow user at all -- everything there runs as
+# root) had a one-off manually-installed root unit; the FIRST gitops reconcile
+# silently clobbered it with the canonical jasonperlow unit and crash-looped
+# the service (systemd exit 217/USER, "user does not exist"). Every 5-minute
+# timer fire would have re-broken it again even after a manual re-fix.
+UNIT_SUFFIX=""
+[ "$RUN_AS" = "root" ] && UNIT_SUFFIX="-root"
 
 SCRIPT_SRC="$REPO/hive_worker.py"
 SCRIPT_DST="/opt/graeae/hive_worker.py"
@@ -90,7 +100,7 @@ fi
 
 for KIND in $KINDS; do
   UNIT="hive-worker-$KIND.service"
-  SRC="$REPO/systemd/$UNIT"
+  SRC="$REPO/systemd/hive-worker-$KIND$UNIT_SUFFIX.service"
   DST="$UNITDIR/$UNIT"
   if [ ! -f "$SRC" ]; then
     log "WARNING: no template $SRC for kind=$KIND, skipping"
