@@ -2599,11 +2599,13 @@ async def create_job(req: JobCreate):
     max_cost_tier = (req.max_cost_tier or "B").upper()
     if max_cost_tier not in COST_TIERS:
         raise HTTPException(422, f"max_cost_tier must be one of {COST_TIERS}, got {max_cost_tier!r}")
-    # 2026-05-26: codex-only eligibility auto-rewrite. codex is a CLI not an
-    # agent — zeroclaw workers shell out to it. eligible_kinds=['codex'] alone
-    # is unclaimable. Rewrite to ['zeroclaw'] (which routes through codex when
-    # kind matches CODEX_KINDS_PREFIXES on the worker side).
-    NON_CLAIMER_KINDS = {"codex", "review", "hermes-cli"}  # codex + future CLI tools
+    # 2026-05-26: codex-only eligibility auto-rewrite, ORIGINALLY for all of
+    # codex/review/hermes-cli — codex was a CLI zeroclaw shells out to, with
+    # no standalone claimer. RESCINDED for codex 2026-09-14 (operator): a real
+    # kind=codex claimer daemon now exists and self-registers, so
+    # eligible_kinds=['codex'] is claimable again. review/hermes-cli still
+    # have no claimer and stay rewritten to ['zeroclaw'].
+    NON_CLAIMER_KINDS = {"review", "hermes-cli"}
     if req.eligible_kinds:
         ek = list(req.eligible_kinds)
         # Filter out non-claimer kinds
@@ -3981,12 +3983,13 @@ KNEMON_PROVIDERS: list[dict[str, Any]] = [
     # provider,         model,                 alias,                  in,    out
     {"provider": "groq",      "model": "gpt-oss-20b",          "alias": "hive_groq_1",        "tier": "B"},
     {"provider": "gemini",    "model": "gemini-2.5-flash-lite","alias": "hive_gemini_1",      "tier": "B"},
-    # DISABLED 2026-06-03 (blocker C): siliconflow key 401 invalid fleet-wide. Re-enable after key rotation.
-    # {"provider": "siliconflow","model": "qwen2.5-coder-32b",   "alias": "hive_siliconflow_1", "tier": "B"},
-    {"provider": "deepseek-direct","model": "deepseek-v4-flash","alias": "hive_deepseek_1",   "tier": "B"},
+    # FORBIDDEN 2026-09-07 (operator): neither deepseek nor siliconflow may be
+    # used directly, fleet-wide. Both providers removed from the candidate
+    # pool (siliconflow was already disabled 2026-06-03 for an invalid key;
+    # deepseek-direct's two aliases hive_deepseek_1/hive_deepseek_pro_1 are
+    # struck below, not just disabled).
     {"provider": "together",  "model": "minimax-m2.7",         "alias": "hive_together_1",    "tier": "B"},
     {"provider": "xai",       "model": "grok-4.1-fast",        "alias": "hive_xai_1",         "tier": "B"},
-    {"provider": "deepseek-direct","model": "deepseek-v4-pro", "alias": "hive_deepseek_pro_1","tier": "B"},
     # REMOVED 2026-06-17 (operator: "remove ngc-review from all agents" +
     # compute edict: EIH frontier forbidden). hive_ngc_1 (ngc-proxy gpt-5.5 via
     # the .4 EIH gateway) is no longer a coding/review candidate for any agent.
@@ -4129,14 +4132,10 @@ async def knemon_route(req: Request):
     kl = kind.lower()
     review_kind = any(kl.startswith(p) for p in ("review:", "codex", "doctor:codex-fix", "adversarial"))
     arch_kind = any(t in kl for t in ("architecture", "design")) or kl.startswith("heavy:")
-    # DEEPSEEK POLICY (operator directive 2026-06-07, refined same day):
-    # deepseek-v4-PRO = CODE REVIEW fallback or HIGH-LEVEL ARCHITECTURE
-    # fallback ONLY — never a general job model ($166 burn incident).
-    # deepseek-v4-FLASH (hive_deepseek_1) is UNRESTRICTED (~10x cheaper than
-    # pro). Strip only the PRO alias from non-review/non-arch kinds.
-    if not (review_kind or arch_kind):
-        cands = [c for c in cands if c["alias"] != "hive_deepseek_pro_1"]
-        open_weight_chain = [a for a in open_weight_chain if a != "hive_deepseek_pro_1"]
+    # DEEPSEEK POLICY (operator 2026-06-07) SUPERSEDED 2026-09-07: deepseek
+    # direct is now FORBIDDEN fleet-wide, full stop — not just gated to
+    # review/architecture. Both aliases are already struck from
+    # KNEMON_PROVIDERS above; nothing left here to strip.
     # ADVERSARIAL-ONLY codex (operator 2026-06-17): codex/gpt OAuth leads ONLY
     # review/adversarial kinds. Every other kind leads with the open-weight /
     # local lineup (no OAuth lead) so coding goes local-first per the edict.
@@ -4169,21 +4168,23 @@ async def knemon_route(req: Request):
         # minimax via hive_together_1 kept in chain -> promote to lead once the
         # direct $200 MiniMax key is wired into the .4 gateway alias).
         if review_kind:
-            METERED_FALLBACK = ["hive_deepseek_pro_1", "hive_deepseek_1", "hive_groq_3", "hive_xai_1"]
+            METERED_FALLBACK = ["hive_groq_3", "hive_xai_1"]
         elif arch_kind:
-            # High-level architecture: deepseek-PRO (sanctioned), gpt-oss-120b, grok.
-            METERED_FALLBACK = ["hive_deepseek_pro_1", "hive_groq_3", "hive_xai_1"]
+            # High-level architecture: gpt-oss-120b, grok. (deepseek-PRO struck
+            # 2026-09-07 — deepseek direct is forbidden fleet-wide.)
+            METERED_FALLBACK = ["hive_groq_3", "hive_xai_1"]
         else:
-            # General coding rotation (operator 2026-06-19): deepseek-flash lead,
-            # then groq qwen3 (fast coder) + groq gpt-oss-120b, grok funded tail.
-            # MiniMax (hive_together_1) REMOVED from the fleet chain -- reserved
-            # for the sole MiniMax builder (minos) via the host override below.
-            METERED_FALLBACK = ["hive_deepseek_1", "hive_groq_2", "hive_groq_3", "hive_xai_1"]
+            # General coding rotation (operator 2026-09-07: deepseek-flash lead
+            # struck, forbidden fleet-wide). groq qwen3 (fast coder) leads, then
+            # groq gpt-oss-120b, grok funded tail. MiniMax (hive_together_1)
+            # REMOVED from the fleet chain -- reserved for the sole MiniMax
+            # builder (minos) via the host override below.
+            METERED_FALLBACK = ["hive_groq_2", "hive_groq_3", "hive_xai_1"]
         # MINOS = sole MiniMax builder (operator 2026-06-19): only minos leads
         # MiniMax ($200 plan key, TPM-limited @ 1 worker). Everyone else rotates
         # the open-weight lineup above.
         if "minos" in host and not review_kind:
-            METERED_FALLBACK = ["hive_together_1", "hive_deepseek_1", "hive_groq_2"]
+            METERED_FALLBACK = ["hive_together_1", "hive_groq_2"]
         if cap.get("capped"):
             # Half-open breaker: most jobs use metered fallback, but a small share leads
             # OAuth so routed traffic can prove recovery before the 5h stale-report TTL.
@@ -4197,7 +4198,12 @@ async def knemon_route(req: Request):
     # JOB-SELECTABLE LEAD (operator 2026-06-19): a job may request a specific
     # lead alias (e.g. a host-local GPU coder: hive_cerberus_1 / hive_rocm_*).
     # Honor it as the chain head while keeping the rotation as fallback.
-    if lead_alias:
+    # BANNED_LEAD_ALIASES (operator 2026-09-07, codex review 2026-09-14):
+    # a caller could bypass the deepseek/siliconflow removal above by simply
+    # requesting one of the struck aliases directly as lead_alias — this was
+    # the removal's only unvalidated entry point. Refuse it there too.
+    BANNED_LEAD_ALIASES = {"hive_deepseek_1", "hive_deepseek_pro_1", "hive_siliconflow_1"}
+    if lead_alias and lead_alias not in BANNED_LEAD_ALIASES:
         chain = [lead_alias] + [a for a in chain if a != lead_alias]
     return {
         "ok": True,
