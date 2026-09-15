@@ -978,16 +978,21 @@ def agent_kind_aliases(kind: str, runtime: Optional[str]) -> set[str]:
         if kind in kinds:
             aliases.add(rt)
             aliases.update(kinds)
-    # ALL-EXECUTORS-ELIGIBLE (operator 2026-06-01): claude, codex, zeroclaw and
-    # opencode are MUTUALLY eligible for every executor job. They differ only at
-    # DISPATCH (zeroclaw routes per-model by complexity via KNEMON). A job marked
-    # for any one of them is claimable by all of them. This union was dropped in
-    # the 2026-06-06 spark-takeover refactor (regression mem_1780970182796) and is
-    # restored here so non-zeroclaw-kind executor workers can still claim the
-    # zeroclaw-eligible coding jobs that submit-time admission rewrites them into.
-    EXECUTOR_KINDS = {"claude", "codex", "zeroclaw", "opencode"}
-    if aliases & EXECUTOR_KINDS:
-        aliases |= EXECUTOR_KINDS
+    # ALL-EXECUTORS-ELIGIBLE union REMOVED 2026-09-15. It existed so a job
+    # marked for one executor kind (claude/codex/zeroclaw/opencode) was
+    # claimable by any of them, on the premise that "they differ only at
+    # DISPATCH (zeroclaw routes per-model by complexity via KNEMON)" -- true
+    # under the old zc-gateway/zeroclaw_wss_worker_v2.py architecture, where
+    # KNEMON picked the real model server-side regardless of which agent
+    # claimed the job. hive_worker.py (the fleet-wide replacement worker,
+    # deployed to every host this session) does NOT call KNEMON at all --
+    # WORKER_KIND directly selects the execution tool (`zoder loop` for
+    # zeroclaw, `codex exec` for codex). With the union still active, a
+    # codex-kind worker could claim a job with eligible_kinds=["zeroclaw"]
+    # and literally run it via `codex exec` instead of zoder -- reproduced
+    # live 2026-09-15 (TYDEUS's codex worker claimed + ran a zeroclaw smoke
+    # test job). Kind is strict again; a job's eligible_kinds now means what
+    # it says.
     aliases.discard("")
     return aliases
 
