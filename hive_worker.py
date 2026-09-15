@@ -72,6 +72,7 @@ def _find_driver(name: str) -> str:
         os.path.expanduser(f"~/.local/bin/{name}"),
         f"/usr/local/bin/{name}",
         f"/opt/homebrew/bin/{name}",
+        os.path.expanduser(f"~/.npm-global/bin/{name}"),
     ):
         if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
             return candidate
@@ -300,7 +301,16 @@ def _run_job_inner(job: dict) -> None:
         return
 
     if WORKER_KIND == "zeroclaw":
-        cmd = [_find_driver("zoder"), "loop", description, "--agent-timeout", str(JOB_TIMEOUT)]
+        # --loop-timeout must exceed --agent-timeout (the loop watchdog covers
+        # author+check+review, not just the author turn) or zoder prints a
+        # TIMEOUT WARNING on every single run -- harmless here (zoder proceeds
+        # anyway) but noisy, and a real risk if JOB_TIMEOUT is ever raised
+        # close to zoder's own 900s loop-timeout default.
+        cmd = [
+            _find_driver("zoder"), "loop", description,
+            "--agent-timeout", str(JOB_TIMEOUT),
+            "--loop-timeout", str(JOB_TIMEOUT + 300),
+        ]
         if ZODER_AGENT:
             cmd += ["--agent", ZODER_AGENT, "--allow-paid"]
     else:
