@@ -18,24 +18,36 @@ STATE=/var/lib/hive-worker-deploy
 UNITDIR=/etc/systemd/system
 DEPLOY_REF=${DEPLOY_REF:-wip/studio/2026-06-15-register-dedup}
 # graeae-hive is NOT git-daemon-exported on PYTHIA (unlike zeroclaw-fleet) --
-# its canonical remote is the ARGONAS bare repo over SSH. root@ARGONAS git
-# ops can hit the documented pubkey-exhaustion class of failure
-# (kernel-build-checklist.md #0f) on a host whose SSH agent hasn't got
-# root's key trusted, so fall back to password auth when the host provides
-# one via GIT_FLEET_SSH_PASSWORD (never hardcoded here).
+# its canonical remote is the ARGONAS bare repo over SSH.
 SOURCE=ssh://root@192.168.207.101/mnt/datapool/git/graeae-hive.git
-if [ -n "${GIT_FLEET_SSH_PASSWORD:-}" ]; then
-  export GIT_SSH_COMMAND="sshpass -p ${GIT_FLEET_SSH_PASSWORD} ssh -o PubkeyAuthentication=no -o StrictHostKeyChecking=no"
-fi
 
 DRY_RUN=0
 [ "${1:-}" = "--dry-run" ] && DRY_RUN=1
 
 ENABLED=0
+GIT_FLEET_SSH_PASSWORD=""
 [ -f /etc/hive-worker-deploy.conf ] && . /etc/hive-worker-deploy.conf
 if [ "$ENABLED" != 1 ] && [ "$DRY_RUN" != 1 ]; then
   echo "hive-worker-deploy: ENABLED!=1, no-op (set ENABLED=1 in /etc/hive-worker-deploy.conf)"
   exit 0
+fi
+# root@ARGONAS git ops can hit the documented pubkey-exhaustion class of
+# failure (kernel-build-checklist.md #0f) on a host whose SSH agent hasn't
+# got root's key trusted, so fall back to password auth when the config
+# provides one (never hardcoded here). MUST come after sourcing the config
+# above -- an earlier version of this script checked the var before it was
+# ever set, so the fallback silently never engaged (caught live rolling
+# this out to 4 hosts, 2026-09-15: fedora/proteus/tydeus/argos all failed
+# clone with plain-pubkey-style errors despite the config having the
+# password set).
+if [ -n "$GIT_FLEET_SSH_PASSWORD" ]; then
+  # UserKnownHostsFile=/dev/null in addition to StrictHostKeyChecking=no:
+  # OpenSSH disables password/keyboard-interactive auth entirely (not just
+  # the host-key prompt) when a host's key in known_hosts has CHANGED, as
+  # an extra MITM guard -- StrictHostKeyChecking=no alone doesn't override
+  # that. Hit live on ARGOS root, 2026-09-15 (a stale known_hosts entry for
+  # ARGONAS from some earlier session).
+  export GIT_SSH_COMMAND="sshpass -p ${GIT_FLEET_SSH_PASSWORD} ssh -o PubkeyAuthentication=no -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 fi
 
 log() { echo "hive-worker-deploy: $*"; }
