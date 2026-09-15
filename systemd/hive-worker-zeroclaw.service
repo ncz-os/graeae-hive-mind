@@ -1,0 +1,18 @@
+[Unit]
+Description=GRAEAE Hive Mind -- thin zeroclaw claim/execute worker (hive_worker.py)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jasonperlow
+WorkingDirectory=/home/jasonperlow
+Environment=WORKER_KIND=zeroclaw
+Environment=HIVE_URL=http://192.168.207.67:5005
+EnvironmentFile=-/etc/hive-worker-env
+ExecStart=/usr/bin/python3 /opt/graeae/hive_worker.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
