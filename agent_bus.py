@@ -838,6 +838,9 @@ KIND_WORKSPACE_CAPABILITY: dict[str, str] = {
     "build:zeroclaw": "hard:linux-compile",
     "zeroclaw:": "hard:linux-compile",
     "ncz-os-zeroclaw:": "hard:linux-compile",
+    # zoder (ncz-os rust workspace, sibling to zeroclaw) -> linux-compile hosts only
+    "zoder:": "hard:linux-compile",
+    "ncz-os-zoder:": "hard:linux-compile",
     "compile:": "hard:linux-compile",
     # mnemos rust hot-path jobs -> rust+CI hosts only (cerberus/hydra/achilles).
     # Most mnemos work has NO such requirement and stays claimable by any host;
