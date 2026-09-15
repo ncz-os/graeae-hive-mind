@@ -45,6 +45,27 @@ import time
 import urllib.error
 import urllib.request
 
+def _find_driver(name: str) -> str:
+    """Resolve a driver binary's absolute path at import time. A bare PATH
+    lookup is not enough: systemd services and non-interactive SSH sessions
+    don't source the interactive shell's PATH, so `zoder`/`codex` installed
+    under ~/.local/bin (the common fleet install location) silently
+    FileNotFoundError otherwise -- caught deploying to PROTEUS, 2026-09-14,
+    where `which zoder` in a plain ssh command found nothing despite the
+    binary being present and working interactively."""
+    found = shutil.which(name)
+    if found:
+        return found
+    for candidate in (
+        os.path.expanduser(f"~/.local/bin/{name}"),
+        f"/usr/local/bin/{name}",
+        f"/opt/homebrew/bin/{name}",
+    ):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return name  # let it fail loudly with FileNotFoundError at exec time
+
+
 HIVE_URL = os.environ.get("HIVE_URL", "http://192.168.207.67:5005")
 AGENT_HOST = os.environ.get("AGENT_HOST", socket.gethostname().split(".")[0])
 WORKER_KIND = os.environ.get("WORKER_KIND", "").strip().lower()
@@ -232,9 +253,9 @@ def _run_job_inner(job: dict) -> None:
         return
 
     if WORKER_KIND == "zeroclaw":
-        cmd = ["zoder", "loop", description, "--agent-timeout", str(JOB_TIMEOUT)]
+        cmd = [_find_driver("zoder"), "loop", description, "--agent-timeout", str(JOB_TIMEOUT)]
     else:
-        cmd = ["codex", "exec", "--skip-git-repo-check", "-m", CODEX_MODEL, description]
+        cmd = [_find_driver("codex"), "exec", "--skip-git-repo-check", "-m", CODEX_MODEL, description]
 
     print(f"[hive-worker:{WORKER_KIND}] job {job_id}: running {' '.join(cmd[:3])}...", flush=True)
     t0 = time.time()
