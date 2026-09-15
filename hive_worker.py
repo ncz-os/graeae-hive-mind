@@ -29,7 +29,19 @@ Env:
   JOB_TIMEOUT         seconds, hard kill of the driving subprocess (default 7200)
   WORKSPACE_ROOT       default ~/hive-workspaces
   KEEP_WORKSPACE      if "1", don't rm -rf the per-job clone after (debug)
-  CODEX_MODEL         default gpt-5.3-codex-spark (escalation ladder default rung)
+  CODEX_MODEL         default gpt-5.6-luna (see note below)
+
+CODEX_MODEL note (2026-09-15): the escalation ladder's documented default
+rung is gpt-5.3-codex-spark, but this account's live codex model catalog
+(queried via chatgpt-api.com/backend-api/codex/models earlier this session)
+does NOT serve a spark variant -- confirmed on codex-cli 0.144.1 AND after
+upgrading to 0.153.3, same 400 both times: "The 'gpt-5.3-codex-spark' model
+is not supported when using Codex with a ChatGPT account." Every codex-kind
+hive job was failing on this, fleet-wide, regardless of host or codex
+version. gpt-5.6-luna is the cheapest VALIDATED model actually served to
+this account (~/.claude/rules/00-AGENT-DIRECTIVES.md escalation ladder) --
+used as the default here until spark (or an equivalent low-cost rung)
+actually appears in the live catalog.
 """
 from __future__ import annotations
 import json
@@ -74,7 +86,7 @@ HEARTBEAT_INTERVAL = float(os.environ.get("HEARTBEAT_INTERVAL", "20"))
 JOB_TIMEOUT = int(os.environ.get("JOB_TIMEOUT", "7200"))
 WORKSPACE_ROOT = os.path.expanduser(os.environ.get("WORKSPACE_ROOT", "~/hive-workspaces"))
 KEEP_WORKSPACE = os.environ.get("KEEP_WORKSPACE", "0") == "1"
-CODEX_MODEL = os.environ.get("CODEX_MODEL", "gpt-5.3-codex-spark")
+CODEX_MODEL = os.environ.get("CODEX_MODEL", "gpt-5.6-luna")
 
 if WORKER_KIND not in ("zeroclaw", "codex"):
     print("[hive-worker] WORKER_KIND must be 'zeroclaw' or 'codex'", file=sys.stderr)
