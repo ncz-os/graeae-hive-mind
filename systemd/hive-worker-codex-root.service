@@ -1,0 +1,17 @@
+[Unit]
+Description=GRAEAE Hive Mind -- thin codex claim/execute worker (hive_worker.py)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root
+Environment=WORKER_KIND=codex
+Environment=HIVE_URL=http://192.168.207.67:5005
+ExecStart=/usr/bin/python3 /opt/graeae/hive_worker.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
