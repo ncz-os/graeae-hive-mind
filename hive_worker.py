@@ -181,18 +181,28 @@ def resolve_repo_url(job: dict) -> str | None:
 _JOB_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 
-def release_job(job_id: str, reason: str) -> None:
-    code, _ = _http("POST", f"/v1/jobs/{job_id}/release", {"reason": reason}, timeout=10)
-    if code != 200:
-        print(f"[hive-worker:{WORKER_KIND}] WARNING: release({job_id}) got code={code} -- "
-              f"job may be stranded in claimed state", flush=True)
-
-
 def patch_job(job_id: str, status: str, result: dict) -> None:
-    code, _ = _http("PATCH", f"/v1/jobs/{job_id}", {"status": status, "result": result}, timeout=15)
+    # PATCH /v1/jobs/{id} requires claimed_by to match the job's current
+    # claimant (agent_bus.py: "job update requires claimed_by to match the
+    # current claimant") -- omitting it 403s every single call (found live
+    # on PROTEUS, 2026-09-14: every job ended up stranded in 'claimed'
+    # because this worker never sent it).
+    code, _ = _http("PATCH", f"/v1/jobs/{job_id}",
+                     {"status": status, "result": result, "claimed_by": _urn}, timeout=15)
     if code != 200:
         print(f"[hive-worker:{WORKER_KIND}] WARNING: patch({job_id}, {status}) got code={code} -- "
               f"job may be stranded in claimed state", flush=True)
+
+
+def release_job(job_id: str, reason: str) -> None:
+    # NOT /v1/jobs/{id}/release -- that endpoint is a completely different
+    # feature (zc-gate's human-gated "Release & Push" PR workflow, expects a
+    # preview bundle already on the job). The real way to decline a claimed
+    # job back to the queue is a PATCH to status=queued (same claimed_by
+    # requirement as patch_job above), matching the worker_error/note shape
+    # observed from the bus's own existing workers (thrash-guard dead-letters
+    # a job after 3 such declines).
+    patch_job(job_id, "queued", {"worker_error": reason, "via": "hive_worker"})
 
 
 def run_job(job: dict) -> None:
@@ -243,8 +253,20 @@ def _run_job_inner(job: dict) -> None:
             release_job(job_id, "invalid_head_branch")
             return
         clone_cmd[3:3] = ["--branch", head_branch]
+    # root@ARGONAS git ops can hit the documented pubkey-exhaustion class of
+    # failure (kernel-build-checklist.md #0f) on a host whose SSH agent
+    # hasn't got root's key trusted -- found live on PROTEUS, 2026-09-14
+    # ("returned non-zero exit status 128" on a plain ssh:// clone). Fall
+    # back to password auth via GIT_FLEET_SSH_PASSWORD if the host provides
+    # it (systemd EnvironmentFile, never hardcoded/committed here).
+    clone_env = os.environ.copy()
+    fleet_pw = os.environ.get("GIT_FLEET_SSH_PASSWORD")
+    if fleet_pw and repo_url.startswith("ssh://root@"):
+        clone_env["GIT_SSH_COMMAND"] = (
+            f"sshpass -p {fleet_pw!r} ssh -o PubkeyAuthentication=no -o StrictHostKeyChecking=no"
+        )
     try:
-        subprocess.run(clone_cmd, check=True, timeout=300,
+        subprocess.run(clone_cmd, check=True, timeout=300, env=clone_env,
                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     except Exception as e:
         print(f"[hive-worker:{WORKER_KIND}] job {job_id}: clone failed: {e}", flush=True)
