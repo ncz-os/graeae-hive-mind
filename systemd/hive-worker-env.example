@@ -1,0 +1,3 @@
+# Copy to /etc/hive-worker-env on each worker host (chmod 600). Never commit
+# the real fleet password here -- this file is a template only.
+GIT_FLEET_SSH_PASSWORD=<fleet-password>
