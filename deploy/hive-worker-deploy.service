@@ -1,0 +1,7 @@
+[Unit]
+Description=hive_worker.py gitops reconcile (oneshot)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/hive-worker-deploy.sh
