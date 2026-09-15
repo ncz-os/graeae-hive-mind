@@ -1,3 +1,19 @@
+<!--
+UX assessment (2026-09-15)
+- Structure: The dashboard contains the right operational surfaces, but action-required work
+  was below passive production and fleet telemetry, so the primary scan path was unclear.
+- Information density: Compact presentation fits a fleet console, but repeated queue states,
+  always-expanded secondary panels, and weak top-level summaries made exceptions hard to spot.
+- Mobile-friendliness: The grid collapsed, but global column-hiding rules removed unrelated
+  data (including Queue actions), wide tables were difficult to inspect, and touch targets were small.
+- Common-task friction: Refresh failures looked like empty data, submission feedback vanished,
+  multi-job worker cards opened the wrong job, and review loading/errors did not safely gate Release.
+
+This pass promotes review and failure counts, adds explicit refresh health and one-click New Job,
+keeps secondary monitoring visually subordinate, targets responsive rules per table, makes each
+worker job directly inspectable, preserves submission/edit feedback, and makes review release
+fail closed until a preview is successfully loaded.
+-->
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -6,24 +22,46 @@
 <title>GRAEAE Hive Mind</title>
 <style>
 *{box-sizing:border-box}
-body{background:#0d1117;color:#c9d1d9;font-family:-apple-system,Menlo,monospace;margin:0;padding:.75em;font-size:14px}
+html{scroll-behavior:smooth}
+body{background:#0d1117;color:#c9d1d9;font-family:-apple-system,Menlo,monospace;margin:0;padding:.75em;font-size:15px}
 h1{color:#58a6ff;margin:0 0 .2em 0;font-size:1.3em}
 .meta{color:#8b949e;font-size:.8em;margin-bottom:.75em;display:flex;align-items:center;gap:.75em;flex-wrap:wrap}
 .pill{background:#1f2937;border:1px solid #30363d;border-radius:12px;padding:.1em .6em;font-size:.8em}
 .pill.online{border-color:#238636;color:#7ee787}
 .pill.warn{border-color:#9e6a03;color:#d29922}
 .pill.err{border-color:#f85149;color:#f85149}
+.topbar{position:sticky;top:0;z-index:30;background:rgba(13,17,23,.96);border-bottom:1px solid #21262d;margin:-.75em -.75em .75em;padding:.75em .75em .6em;-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px)}
+.topbar-main{display:flex;align-items:center;gap:.75em;justify-content:space-between}
+.topbar-main h1{margin:0}
+.topbar-actions{display:flex;gap:.4em;align-items:center}
+.overview{display:flex;gap:.4em;flex-wrap:wrap;margin-top:.5em}
+.overview a{display:flex;align-items:center;gap:.35em;color:#c9d1d9;text-decoration:none;background:#161b22;border:1px solid #30363d;border-radius:6px;padding:.3em .55em;font-size:.78em}
+.overview a:hover,.overview a:focus-visible{border-color:#58a6ff;background:#21262d}
+.overview b{color:#a5d6ff;font-size:1.08em}
+.overview .attention b{color:#f85149}
+.overview .review b{color:#d29922}
+.refreshing{animation:pulse .9s infinite}
+.status-error{color:#ff7b72!important}
+.status-warn{color:#d29922!important}
+.status-ok{color:#7ee787!important}
+.panel-error{color:#ff7b72;background:#200d0d;border:1px solid #6e2020;border-radius:4px;padding:.55em .65em;font-size:.82em}
+.section-note{color:#6e7681;font-size:.76em;font-weight:normal;margin-left:auto}
+.filter-row{display:flex;gap:.35em;align-items:center;margin:-.15em 0 .55em;flex-wrap:wrap}
+.filter-btn{background:#0d1117;color:#8b949e;border:1px solid #30363d;border-radius:999px;padding:.25em .65em;cursor:pointer;font:inherit;font-size:.76em}
+.filter-btn.active{color:#fff;background:#1f6feb;border-color:#388bfd}
+[id$="-panel"],#workers-wrap,#submit-wrap{scroll-margin-top:8em}
+:focus-visible{outline:2px solid #58a6ff;outline-offset:2px}
 
 /* submit panel */
 #submit-wrap{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:.75em;margin-bottom:.75em}
-#submit-header{display:flex;align-items:center;gap:.5em;cursor:pointer;user-select:none}
-#submit-header h2{color:#58a6ff;font-size:.95em;margin:0;flex:1}
-#submit-toggle{color:#58a6ff;font-size:.9em;background:none;border:none;color:#58a6ff;cursor:pointer;padding:.2em .5em;border-radius:4px}
+#submit-header{display:flex;align-items:center;gap:.5em;cursor:pointer;user-select:none;width:100%;background:none;border:0;color:inherit;font:inherit;text-align:left;padding:.1em}
+#submit-header .submit-heading{color:#58a6ff;font-size:.95em;margin:0;flex:1;font-weight:700}
+#submit-toggle{color:#58a6ff;font-size:.9em;padding:.2em .5em;border-radius:4px}
 #submit-toggle:hover{background:#21262d}
 #submit-body{display:none;margin-top:.75em}
 #submit-body.open{display:block}
 .form-row{margin-bottom:.6em}
-.form-row label{display:block;color:#8b949e;font-size:.8em;margin-bottom:.2em}
+.form-row label{display:block;color:#8b949e;font-size:.8rem;margin-bottom:.2em}
 .form-row input,.form-row textarea,.form-row select{width:100%;background:#0d1117;border:1px solid #30363d;border-radius:4px;color:#c9d1d9;padding:.4em .6em;font-family:inherit;font-size:.9em}
 .form-row textarea{resize:vertical;min-height:80px}
 .form-row input:focus,.form-row textarea:focus,.form-row select:focus{border-color:#58a6ff;outline:none}
@@ -39,9 +77,11 @@ h1{color:#58a6ff;margin:0 0 .2em 0;font-size:1.3em}
 .btn-ghost:hover{background:#30363d}
 .btn-sm{padding:.25em .6em;font-size:.78em}
 .form-actions{display:flex;gap:.5em;align-items:center;flex-wrap:wrap}
-#submit-status{font-size:.8em;color:#7ee787}
+#submit-status{font-size:.8em;color:#7ee787;min-height:1.2em}
 #submit-status.err{color:#f85149}
-#edit-banner{display:none;background:#1a2d4d;border:1px solid #1f6feb;border-radius:4px;padding:.4em .7em;margin-bottom:.6em;font-size:.82em;display:flex;align-items:center;gap:.5em}
+#submit-status.warn{color:#d29922}
+#submit-status.busy{color:#a5d6ff}
+#edit-banner{display:none;background:#1a2d4d;border:1px solid #1f6feb;border-radius:4px;padding:.4em .7em;margin-bottom:.6em;font-size:.82em;align-items:center;gap:.5em}
 #edit-banner.show{display:flex}
 #edit-cancel{background:none;border:none;color:#8b949e;cursor:pointer;padding:0;font-size:1em}
 #edit-cancel:hover{color:#f85149}
@@ -155,7 +195,8 @@ small.dim{font-size:.85em}
 .worker-card .wc-desc{font-size:.75em;color:#8b949e;max-height:2.8em;overflow:hidden;line-height:1.4}
 .worker-card .wc-meta{font-size:.72em;color:#6e7681;margin-top:.3em;display:flex;gap:.5em;flex-wrap:wrap}
 .worker-card .wc-jobs{margin:.2em 0 .1em;display:flex;flex-direction:column;gap:.18em}
-.worker-card .wc-jobline{font-size:.74em;display:flex;gap:.4em;align-items:baseline;overflow:hidden}
+.worker-card .wc-jobline{font-size:.74em;display:flex;gap:.4em;align-items:baseline;overflow:hidden;width:100%;background:#0d1117;border:1px solid transparent;border-radius:3px;color:inherit;font-family:inherit;text-align:left;padding:.18em .3em;cursor:pointer}
+.worker-card .wc-jobline:hover,.worker-card .wc-jobline:focus-visible{border-color:#58a6ff;background:#161b22}
 .worker-card .wc-jk{color:#a5d6ff;font-weight:600;flex:none}
 .worker-card .wc-jr{color:#d2a8ff;font-family:monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .worker-card .wc-jm{color:#7ee787;margin-left:auto;flex:none}
@@ -174,18 +215,39 @@ small.dim{font-size:.85em}
 
 /* responsive */
 @media(max-width:700px){
+  body{padding:.5em}
+  .topbar{position:static;margin:-.5em -.5em .6em;padding:.65em .5em}
+  .topbar-main{align-items:flex-start;flex-wrap:wrap}
+  .topbar-main h1{font-size:1.08em}
+  .topbar-actions{width:100%}
+  .topbar-actions .btn{min-height:44px;flex:1}
+  .overview{display:grid;grid-template-columns:1fr 1fr}
+  .overview a{min-height:44px;justify-content:space-between}
   .grid{grid-template-columns:1fr}
   .full-width{grid-column:1/2}
-  .form-row-3{grid-template-columns:1fr 1fr}
+  .form-row-3{grid-template-columns:1fr}
   table{font-size:.78em}
-  .act-btns .btn-sm{padding:.2em .4em}
-  th:nth-child(4),td:nth-child(4){display:none}
+  .btn,.filter-btn{min-height:44px}
+  .modal-close,#edit-cancel{min-width:44px;min-height:44px}
+  .act-btns .btn-sm{min-width:44px;padding:.2em .4em}
+  .section-note{width:100%;margin-left:0}
+  #jobs-tbl th:nth-child(4),#jobs-tbl td:nth-child(4){display:none}
+  #jobs-tbl th:nth-child(3),#jobs-tbl td:nth-child(3){max-width:42vw}
+  #jobs-tbl{min-width:430px}
+  #agent-tbl{min-width:420px}
+  #gpu-tbl{min-width:560px}
+  #hosts-tbl{min-width:980px}
+  .modal-actions{position:sticky;bottom:0;background:#161b22;padding-bottom:.25em}
+  #review-modal{width:100%;margin:0;padding:.8em}
+  .d2h-wrap{max-height:55vh}
   .worker-grid{grid-template-columns:1fr 1fr}
 }
 @media(max-width:480px){
   .form-row-inline{grid-template-columns:1fr}
-  th:nth-child(5),td:nth-child(5){display:none}
   .worker-grid{grid-template-columns:1fr}
+  .form-actions .btn{flex:1}
+  .rc-head .rc-time{width:100%;margin-left:0!important}
+  #modal-backdrop,#review-backdrop{padding:.35em}
 }
 
 /* completion type coloring + model badge (operator 2026-06-02) */
@@ -239,32 +301,62 @@ small.dim{font-size:.85em}
 .ci-table summary{cursor:pointer;color:#58a6ff}
 .ci-out{margin:.3em 0 0;padding:.5em;background:#0d1117;border:1px solid #21262d;border-radius:6px;max-height:240px;overflow:auto;white-space:pre-wrap;color:#c9d1d9;font-size:.92em}
 </style>
-<h1>🐝 GRAEAE Hive Mind <span style="font-size:.4em;color:#6e7681;font-weight:normal;vertical-align:middle">ui rev 2026-06-21b</span></h1>
+<header class="topbar">
+  <div class="topbar-main">
+    <h1>🐝 GRAEAE Hive Mind <span style="font-size:.4em;color:#6e7681;font-weight:normal;vertical-align:middle">ui rev 2026-09-15</span></h1>
+    <div class="topbar-actions">
+      <button type="button" class="btn btn-ghost" id="refresh-btn" onclick="refreshAll(true)" aria-label="Refresh dashboard now">↻ Refresh</button>
+      <button type="button" class="btn btn-primary" onclick="openNewJob()">＋ New Job</button>
+    </div>
+  </div>
+  <div class="meta">
+    <span id="meta-time" role="status" aria-live="polite">Connecting…</span>
+    <span class="pill" id="meta-reg">agent: registering…</span>
+    <span id="meta-queue"></span>
+  </div>
+  <nav class="overview" aria-label="Dashboard overview">
+    <a class="review" href="#needsreview-panel"><span>Needs review</span><b id="overview-review">—</b></a>
+    <a class="attention" href="#failed-panel"><span>Failed</span><b id="overview-failed">—</b></a>
+    <a href="#queue-panel"><span>Queued</span><b id="overview-queued">—</b></a>
+    <a href="#workers-wrap"><span>Workers busy</span><b id="overview-busy">—</b></a>
+  </nav>
+</header>
 <div id="cap-banner" style="display:none;margin:.4em 0;padding:.5em .8em;border-radius:6px;background:#3d2b00;border:1px solid #8a6d00;color:#ffd866;font-size:.9em"></div>
-<div class="meta">
-  <span id="meta-time">connecting…</span>
-  <span class="pill" id="meta-reg">agent: registering…</span>
-  <span id="meta-queue"></span>
+
+<!-- Action-required work stays ahead of passive telemetry. -->
+<div class="panel" id="needsreview-panel" style="margin-bottom:.75em">
+  <h2>🔎 Needs Review — Pre-Submission Gate <span class="cnt" id="needsreview-cnt"></span><span class="section-note">Open a preview to inspect evidence and diff</span></h2>
+  <div id="needsreview-list" style="font-size:.82em" aria-live="polite"><div class="dim">Loading review queue…</div></div>
+</div>
+
+<div class="panel" id="failed-panel" style="margin-bottom:.75em">
+  <h2>🔧 Triage Queue <span class="cnt" id="failed-cnt"></span><span class="section-note">Failures first; open any job for full context</span></h2>
+  <div class="filter-row" role="group" aria-label="Triage queue filter">
+    <button type="button" class="filter-btn active" aria-pressed="true" data-triage-filter="attention" onclick="setTriageFilter('attention')">Needs attention <span id="triage-attention-cnt"></span></button>
+    <button type="button" class="filter-btn" aria-pressed="false" data-triage-filter="active" onclick="setTriageFilter('active')">In flight <span id="triage-active-cnt"></span></button>
+    <button type="button" class="filter-btn" aria-pressed="false" data-triage-filter="all" onclick="setTriageFilter('all')">All <span id="triage-all-cnt"></span></button>
+  </div>
+  <div id="failed-list" aria-live="polite"><div class="dim">Loading active and failed jobs…</div></div>
 </div>
 
 <!-- Submit / Edit Panel -->
 <div id="submit-wrap">
-  <div id="submit-header" onclick="toggleSubmit()">
-    <h2>📝 <span id="submit-title">New Job</span></h2>
-    <button id="submit-toggle">▼ expand</button>
-  </div>
+  <button type="button" id="submit-header" onclick="toggleSubmit()" aria-expanded="false" aria-controls="submit-body">
+    <span class="submit-heading">📝 <span id="submit-title">New Job</span></span>
+    <span id="submit-toggle" aria-hidden="true">▼ expand</span>
+  </button>
   <div id="submit-body">
     <div id="edit-banner">
       <span>✏️ Editing job — submitting will cancel the original and create a replacement</span>
-      <button id="edit-cancel" title="Discard edit" onclick="cancelEdit()">✕</button>
+      <button type="button" id="edit-cancel" title="Discard edit" aria-label="Discard job edit" onclick="cancelEdit()">✕</button>
     </div>
     <div class="form-row">
-      <label>Description / Prompt</label>
+      <label for="f-desc">Description / Prompt</label>
       <textarea id="f-desc" placeholder="Describe the task for the agent in plain language…" rows="4"></textarea>
     </div>
     <div class="form-row-3">
       <div class="form-row" style="margin:0">
-        <label>Job kind</label>
+        <label for="f-kind">Job kind</label>
         <select id="f-kind">
           <option value="investigation">investigation</option>
           <option value="code-edit">code-edit</option>
@@ -280,11 +372,11 @@ small.dim{font-size:.85em}
         </select>
       </div>
       <div class="form-row" style="margin:0">
-        <label>Priority (0–100)</label>
+        <label for="f-priority">Priority (0–100)</label>
         <input type="number" id="f-priority" value="50" min="0" max="100">
       </div>
       <div class="form-row" style="margin:0">
-        <label>Max cost tier</label>
+        <label for="f-tier">Max cost tier</label>
         <select id="f-tier">
           <option value="A">A (free)</option>
           <option value="B" selected>B (cheap)</option>
@@ -293,17 +385,17 @@ small.dim{font-size:.85em}
       </div>
     </div>
     <div class="form-row">
-      <label>Eligible kinds (comma-separated, blank = any)</label>
+      <label for="f-eligible">Eligible kinds (comma-separated, blank = any)</label>
       <input type="text" id="f-eligible" placeholder="opencode, codex, zeroclaw">
     </div>
     <div class="form-row">
-      <label>Project tag (optional)</label>
+      <label for="f-project">Project tag (optional)</label>
       <input type="text" id="f-project" placeholder="e.g. riskyeats, mnemos-v6, ncz-os">
     </div>
     <div class="form-actions">
-      <button class="btn btn-primary" id="submit-btn" onclick="submitJob()" disabled>Submit Job</button>
-      <button class="btn btn-ghost" onclick="clearForm()">Clear</button>
-      <span id="submit-status"></span>
+      <button type="button" class="btn btn-primary" id="submit-btn" onclick="submitJob()" disabled>Submit Job</button>
+      <button type="button" class="btn btn-ghost" onclick="clearForm()">Clear</button>
+      <span id="submit-status" role="status" aria-live="polite"></span>
     </div>
   </div>
 </div>
@@ -333,12 +425,7 @@ small.dim{font-size:.85em}
 
 <!-- Main Grid -->
 <div class="grid">
-  <div class="panel full-width" id="needsreview-panel">
-    <h2>🔎 Needs Review — Pre-Submission Gate <span class="cnt" id="needsreview-cnt"></span></h2>
-    <div id="needsreview-list" style="font-size:.82em"></div>
-  </div>
-
-  <div class="panel">
+  <div class="panel" id="queue-panel">
     <h2>Queue <span class="cnt" id="queue-cnt"></span></h2>
     <div style="max-height:420px;overflow-y:auto">
     <table id="jobs-tbl">
@@ -348,7 +435,7 @@ small.dim{font-size:.85em}
     </div>
   </div>
 
-  <div class="panel">
+  <div class="panel" id="agents-panel">
     <h2>Online agents <span class="cnt" id="agent-count"></span></h2>
     <table id="agent-tbl">
       <thead><tr><th>kind</th><th>host</th><th>model</th><th>tier</th></tr></thead>
@@ -370,13 +457,6 @@ small.dim{font-size:.85em}
       <thead><tr><th>host</th><th>cpu</th><th>RAM</th><th>gpu</th><th>load avg</th><th>CPU%</th><th>RAM%</th><th>volumes</th><th>caps</th><th>age</th></tr></thead>
       <tbody></tbody>
     </table>
-  </div>
-
-    <!-- Doctor Queue merged into the unified Triage Queue below (operator 2026-06-04) -->
-
-    <div class="panel full-width" id="failed-panel">
-    <h2>🔧 Triage Queue <span class="cnt" id="failed-cnt"></span></h2>
-    <div id="failed-list"></div>
   </div>
 
   <div class="panel full-width">
@@ -417,8 +497,8 @@ small.dim{font-size:.85em}
 
 <!-- Job Detail Modal -->
 <div id="modal-backdrop" onclick="closeModal(event)">
-  <div id="modal" onclick="event.stopPropagation()">
-    <button class="modal-close" onclick="closeModalBtn()">✕</button>
+  <div id="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title" tabindex="-1" onclick="event.stopPropagation()">
+    <button type="button" class="modal-close" aria-label="Close job details" onclick="closeModalBtn()">✕</button>
     <h3 id="modal-title"></h3>
     <div class="modal-meta" id="modal-meta"></div>
     <div class="modal-section">
@@ -439,15 +519,15 @@ small.dim{font-size:.85em}
 
 <!-- PR Preview / Release Modal (zerocode-gate) -->
 <div id="review-backdrop" onclick="closeReview(event)">
-  <div id="review-modal" onclick="event.stopPropagation()">
-    <button class="modal-close" onclick="closeReviewBtn()">✕</button>
+  <div id="review-modal" role="dialog" aria-modal="true" aria-labelledby="rv-title" tabindex="-1" onclick="event.stopPropagation()">
+    <button type="button" class="modal-close" aria-label="Close review preview" onclick="closeReviewBtn()">✕</button>
     <h3 id="rv-title">PR Preview</h3>
     <div class="modal-meta" id="rv-meta"></div>
     <div id="rv-evidence"></div>
     <div id="rv-diff" class="d2h-wrap"></div>
     <div class="modal-actions" style="margin-top:.6em;display:flex;gap:.6em;align-items:center">
-      <button class="btn btn-primary" id="rv-release-btn" onclick="releaseCurrent()">🚀 Release &amp; Push (open PR)</button>
-      <span id="rv-status" style="font-size:.82em;color:#7ee787"></span>
+      <button type="button" class="btn btn-primary" id="rv-release-btn" onclick="releaseCurrent()" disabled>Loading preview…</button>
+      <span id="rv-status" role="status" aria-live="polite" style="font-size:.82em;color:#7ee787"></span>
     </div>
   </div>
 </div>
@@ -456,8 +536,13 @@ small.dim{font-size:.85em}
 'use strict';
 const BUS = location.origin;
 let _myUrn = null;
+let _registering = false;
 let _editingJobId = null;
 let _submitOpen = false;
+let _refreshing = false;
+let _lastRefreshAt = null;
+let _modalReturnFocus = null;
+let _reviewReturnFocus = null;
 
 // ── helpers ──────────────────────────────────────────────────────────
 function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
@@ -471,16 +556,23 @@ async function api(method,path,body){
   if(body)opts.body=JSON.stringify(body);
   const r=await fetch(BUS+path,opts);
   const j=await r.json().catch(()=>({}));
-  if(!r.ok)throw new Error(j.detail||JSON.stringify(j));
+  if(!r.ok)throw new Error(j.detail||j.message||`${r.status} ${r.statusText}`);
   return j;
 }
 function timeStr(ts){if(!ts)return '-';return new Date(ts*1000).toLocaleTimeString();}
 function relTime(ts){if(!ts)return '';const d=(Date.now()/1000-ts);if(d<60)return Math.round(d)+'s ago';if(d<3600)return Math.round(d/60)+'m ago';return Math.round(d/3600)+'h ago';}
 function pbar(p){return `<span class="pbar"><span class="pbar-fill" style="width:${Math.min(100,p)}%"></span></span>`;}
 function badgeCls(s){return 'badge badge-'+(s||'queued');}
+function activateOnKeyboard(el,action,label){
+  el.tabIndex=0;el.setAttribute('role','button');
+  if(label)el.setAttribute('aria-label',label);
+  el.addEventListener('keydown',e=>{if(e.target===el&&(e.key==='Enter'||e.key===' ')){e.preventDefault();action();}});
+}
 
 // ── registration & heartbeat ──────────────────────────────────────────
 async function registerAgent(){
+  if(_registering||_myUrn)return;
+  _registering=true;
   try{
     const r=await api('POST','/v1/agents/register',{
       host:'dashboard-browser',runtime:'human',kind:'human',
@@ -498,6 +590,8 @@ async function registerAgent(){
     const el=document.getElementById('meta-reg');
     el.textContent='agent: reg failed — '+e.message.slice(0,40);
     el.className='pill err';
+  }finally{
+    _registering=false;
   }
 }
 
@@ -506,19 +600,26 @@ function toggleSubmit(){
   _submitOpen=!_submitOpen;
   document.getElementById('submit-body').className=_submitOpen?'open':'';
   document.getElementById('submit-toggle').textContent=_submitOpen?'▲ collapse':'▼ expand';
+  document.getElementById('submit-header').setAttribute('aria-expanded',String(_submitOpen));
 }
-function setStatus(msg,isErr=false){
+function openNewJob(){
+  if(_editingJobId)clearForm();
+  if(!_submitOpen)toggleSubmit();
+  document.getElementById('submit-wrap').scrollIntoView({block:'start'});
+  document.getElementById('f-desc').focus();
+}
+function setStatus(msg,state='ok'){
   const el=document.getElementById('submit-status');
-  el.textContent=msg;el.className=isErr?'err':'';
+  el.textContent=msg;el.className=state==='error'?'err':state;
 }
-function clearForm(){
+function clearForm(preserveStatus=false){
   ['f-desc','f-project'].forEach(id=>document.getElementById(id).value='');
   document.getElementById('f-priority').value=50;
   document.getElementById('f-kind').value='investigation';
   document.getElementById('f-tier').value='B';
   document.getElementById('f-eligible').value='';
   cancelEdit();
-  setStatus('');
+  if(!preserveStatus)setStatus('');
 }
 function cancelEdit(){
   _editingJobId=null;
@@ -553,41 +654,48 @@ function fillFormForEdit(job){
   setStatus('');
 }
 async function submitJob(){
-  if(!_myUrn){setStatus('Not registered yet — wait a moment',true);return;}
+  if(!_myUrn){setStatus('Not registered yet — use Refresh to retry', 'error');return;}
   const desc=document.getElementById('f-desc').value.trim();
-  if(!desc){setStatus('Description required',true);return;}
+  if(!desc){setStatus('Description required', 'error');document.getElementById('f-desc').focus();return;}
   const eligible=document.getElementById('f-eligible').value
     .split(',').map(s=>s.trim()).filter(Boolean);
+  const priority=Number.parseInt(document.getElementById('f-priority').value,10);
   const body={
     submitter_urn:_myUrn,
     kind:document.getElementById('f-kind').value,
     description:desc,
-    priority:parseInt(document.getElementById('f-priority').value,10)||50,
+    priority:Number.isFinite(priority)?Math.max(0,Math.min(100,priority)):50,
     max_cost_tier:document.getElementById('f-tier').value,
     eligible_kinds:eligible.length?eligible:undefined,
     project:document.getElementById('f-project').value.trim()||undefined,
   };
   const btn=document.getElementById('submit-btn');
+  const oldId=_editingJobId;
   btn.disabled=true;
-  setStatus('Submitting…');
+  setStatus(oldId?'Creating replacement…':'Submitting…','busy');
   try{
-    const oldId=_editingJobId;
-    cancelEdit();
     const r=await api('POST','/v1/jobs',body);
+    let cancelError=null;
     if(oldId){
-      try{await api('PATCH','/v1/jobs/'+oldId,{status:'cancelled'});}catch(_){}
+      try{await api('PATCH','/v1/jobs/'+oldId,{status:'cancelled'});}catch(e){cancelError=e;}
     }
     const shortId=r.id.slice(0,8);
-    if(r.cache_hit){
-      setStatus(`✓ Cache hit — job ${shortId} done instantly`);
-    } else {
-      setStatus(`✓ Job ${shortId} queued — watching for agent pickup…`);
+    clearForm(true);
+    if(cancelError){
+      setStatus(`⚠ Replacement ${shortId} was created, but original ${oldId.slice(0,8)} could not be cancelled: ${cancelError.message}`,'warn');
+    }else if(r.cache_hit){
+      setStatus(`✓ Cache hit — job ${shortId} completed immediately`);
+    }else{
+      setStatus(`✓ Job ${shortId} queued — watching for pickup`);
     }
-    clearForm();
     await refreshAll();
   }catch(e){
-    setStatus('Error: '+e.message,true);
-    _editingJobId=_editingJobId; // restore if edit was set
+    setStatus('Submission failed: '+e.message,'error');
+    if(oldId){
+      _editingJobId=oldId;
+      document.getElementById('edit-banner').className='show';
+      document.getElementById('submit-title').textContent='Edit Job';
+    }
   }finally{
     btn.disabled=false;
   }
@@ -606,6 +714,7 @@ async function cancelJob(id,e){
 // ── job detail modal ──────────────────────────────────────────────────
 let _lastJobs={};
 function showJobModal(job){
+  _modalReturnFocus=document.activeElement;
   _lastJobs[job.id]=job;
   document.getElementById('modal-title').textContent=
     `Job ${job.id.slice(0,12)}… · ${job.kind} · P${job.priority}`;
@@ -674,9 +783,15 @@ function showJobModal(job){
   closeBtn.onclick=closeModalBtn;
   acts.appendChild(closeBtn);
   document.getElementById('modal-backdrop').className='open';
+  document.body.style.overflow='hidden';
+  document.getElementById('modal').focus();
 }
 function closeModal(e){if(e&&e.target===document.getElementById('modal-backdrop'))closeModalBtn();}
-function closeModalBtn(){document.getElementById('modal-backdrop').className='';}
+function closeModalBtn(){
+  document.getElementById('modal-backdrop').className='';
+  if(!document.getElementById('review-backdrop').classList.contains('open'))document.body.style.overflow='';
+  if(_modalReturnFocus&&document.contains(_modalReturnFocus))_modalReturnFocus.focus();
+}
 
 // ── refresh panels ────────────────────────────────────────────────────
 async function refreshAgents(){
@@ -711,11 +826,13 @@ async function refreshJobs(){
   const cnt=all.length;
   document.getElementById('queue-cnt').textContent=`(${cnt})`;
   document.getElementById('meta-queue').textContent=cnt?cnt+' queued':'queue clear';
+  document.getElementById('overview-queued').textContent=cnt;
   const tb=document.querySelector('#jobs-tbl tbody');tb.innerHTML='';
   for(const j of all){
     const r=tb.insertRow();
     r.className='row-clickable';
     r.onclick=()=>showJobModal(j);
+    activateOnKeyboard(r,()=>showJobModal(j),`Open ${j.kind} job ${j.id.slice(0,8)}`);
     r.appendChild(td(`${pbar(j.priority)} <b>${j.priority}</b>`));
     r.appendChild(td(`<span style="color:#a5d6ff">${esc(j.kind)}</span><br><span class="s-${esc(j.status)} dim" style="font-size:.78em">${esc(j.status)}</span>`));
     r.appendChild(td(`<small class="dim">${esc((j.description||'').slice(0,55))}</small>`));
@@ -725,11 +842,11 @@ async function refreshJobs(){
     const acts=document.createElement('div');acts.className='act-btns';
     if(j.status==='queued'||j.status==='offered'){
       const eb=document.createElement('button');
-      eb.className='btn btn-ghost btn-sm';eb.title='Edit & Resubmit';eb.textContent='✏️';
+      eb.className='btn btn-ghost btn-sm';eb.title='Edit & Resubmit';eb.setAttribute('aria-label','Edit and resubmit job');eb.textContent='✏️';
       eb.onclick=()=>fillFormForEdit(j);
       acts.appendChild(eb);
       const cb=document.createElement('button');
-      cb.className='btn btn-danger btn-sm';cb.title='Cancel job';cb.textContent='✕';
+      cb.className='btn btn-danger btn-sm';cb.title='Cancel job';cb.setAttribute('aria-label','Cancel job');cb.textContent='✕';
       cb.onclick=(e)=>cancelJob(j.id,e);
       acts.appendChild(cb);
     }
@@ -744,10 +861,22 @@ async function refreshRunning(){
   // kinds, NOT one card per instance. kind==zeroclaw is the build fan-out pool.
   // Maps use Object.create(null) because keys are untrusted URN/host strings
   // (avoids __proto__/constructor prototype-pollution + Object.values drops).
-  const [aj,jj]=await Promise.all([
-    api('GET','/v1/agents?status=online').catch(()=>({agents:null})),
-    api('GET','/v1/jobs?status=running&limit=200').catch(()=>({jobs:[]})),
+  const [ajResult,jjResult]=await Promise.allSettled([
+    api('GET','/v1/agents?status=online'),
+    api('GET','/v1/jobs?status=running&limit=200'),
   ]);
+  if(ajResult.status==='rejected'&&jjResult.status==='rejected'){
+    document.getElementById('workers-cnt').textContent='(unavailable)';
+    document.getElementById('overview-busy').textContent='!';
+    document.getElementById('workers-grid').innerHTML='';
+    const unavailable=document.getElementById('workers-empty');
+    unavailable.textContent='Worker pool data unavailable — use Refresh to retry';unavailable.style.display='';
+    throw new Error('worker pool unavailable');
+  }
+  const aj=ajResult.status==='fulfilled'?ajResult.value:{agents:null};
+  const jj=jjResult.status==='fulfilled'?jjResult.value:{jobs:[]};
+  const agentInventoryKnown=ajResult.status==='fulfilled';
+  const activityKnown=jjResult.status==='fulfilled';
   const agents=(Array.isArray(aj.agents)?aj.agents:[]).filter(a=>a&&a.kind==='zeroclaw');
   const jobs=jj.jobs||[];
   const byClaimer=Object.create(null);
@@ -761,7 +890,7 @@ async function refreshRunning(){
     if(j){ h.busy++; j._model=a.model||(j.result&&(j.result.alias||j.result.model))||'?'; j._provider=a.provider||''; h.jobs.push(j); }
   }
   let list=Object.values(hosts);
-  let degraded=false;
+  let degraded=ajResult.status==='rejected'||jjResult.status==='rejected';
   // degraded fallback: agents fetch failed but jobs run -> group the ZEROCLAW-claimed
   // running jobs (this panel is the zeroclaw pool) by claimer host.
   if(!list.length && jobs.length){
@@ -780,34 +909,47 @@ async function refreshRunning(){
   const empty=document.getElementById('workers-empty');
   const totW=list.reduce((n,h)=>n+h.total,0);
   const totB=list.reduce((n,h)=>n+h.busy,0);
-  document.getElementById('workers-cnt').textContent=
-    list.length?`(${list.length} hosts \u00b7 ${totW} workers \u00b7 ${totB} busy${degraded?' \u00b7 degraded':''})`:'';
+  document.getElementById('workers-cnt').textContent=!list.length?''
+    :!activityKnown?`(${list.length} hosts \u00b7 ${totW} workers \u00b7 activity unavailable)`
+    :!agentInventoryKnown?`(${list.length} hosts \u00b7 ${totB} running \u00b7 agent inventory unavailable)`
+    :`(${list.length} hosts \u00b7 ${totW} workers \u00b7 ${totB} busy)`;
+  document.getElementById('overview-busy').textContent=degraded?'?':(list.length?`${totB}/${totW}`:'0');
   grid.innerHTML='';
-  if(!list.length){empty.style.display='';return;}
+  if(!list.length){
+    empty.textContent=!agentInventoryKnown?'Agent inventory unavailable; no running jobs reported':'No online zeroclaw workers';
+    empty.style.display='';
+    if(degraded)throw new Error(!agentInventoryKnown?'worker agent inventory unavailable':'running-job activity unavailable');
+    return;
+  }
   empty.style.display='none';
   list.sort((a,b)=>(b.busy-a.busy)||a.host.localeCompare(b.host));
   for(const h of list){
     const card=document.createElement('div');
     card.className='worker-card'+(h.busy?'':' idle');
-    if(h.busy){ const j0=h.jobs[0]; card.onclick=()=>showJobModal(j0); }
     const jobRows=h.jobs.map(j=>{
       const repo=esc(String(j.repo||(j.result&&j.result.repo)||'\u2014'));
       const model=esc(j._model||'?');
       const prov=j._provider?` <span class="wc-jp">${esc(j._provider)}</span>`:'';
-      return `<div class="wc-jobline" title="${esc((j.kind||'?')+' \u00b7 '+(j.repo||'\u2014')+' \u00b7 '+(j._model||'?'))}">`+
+      return `<button type="button" class="wc-jobline" title="${esc((j.kind||'?')+' \u00b7 '+(j.repo||'\u2014')+' \u00b7 '+(j._model||'?'))}">`+
              `<span class="wc-jk">${esc(j.kind||'?')}</span>`+
              `<span class="wc-jr">${repo}</span>`+
-             `<span class="wc-jm">${model}${prov}</span></div>`;
+             `<span class="wc-jm">${model}${prov}</span></button>`;
     }).join('');
     const models=[...new Set(h.jobs.map(j=>j._model).filter(m=>m&&m!=='?'))];
     card.innerHTML=`
       <div class="wc-agent"><span class="wc-dot"></span>
         <span class="wc-kind-badge">zeroclaw</span> ${esc(h.host)}</div>
-      <div class="wc-job">${h.busy}/${h.total} active</div>
-      ${h.busy?`<div class="wc-jobs">${jobRows}</div>`:`<div class="wc-desc dim">all idle \u00b7 waiting for work</div>`}
-      <div class="wc-meta"><span>${h.total} worker${h.total===1?'':'s'}</span><span>${h.busy} busy</span>${models.length?`<span class="wc-models" title="models in use">\u2699 ${esc(models.join(', '))}</span>`:''}</div>`;
+      <div class="wc-job">${activityKnown?`${h.busy}/${h.total} active`:'activity unavailable'}</div>
+      ${!activityKnown?`<div class="wc-desc dim">Running-job data could not be loaded</div>`:h.busy?`<div class="wc-jobs">${jobRows}</div>`:`<div class="wc-desc dim">all idle \u00b7 waiting for work</div>`}
+      <div class="wc-meta">${agentInventoryKnown?`<span>${h.total} worker${h.total===1?'':'s'}</span>`:`<span>capacity unknown</span>`}${activityKnown?`<span>${h.busy} busy</span>`:''}${models.length?`<span class="wc-models" title="models in use">\u2699 ${esc(models.join(', '))}</span>`:''}</div>`;
+    card.querySelectorAll('.wc-jobline').forEach((row,i)=>{
+      const job=h.jobs[i];
+      row.setAttribute('aria-label',`Open ${job.kind||'worker'} job on ${h.host}`);
+      row.onclick=()=>showJobModal(job);
+    });
     grid.appendChild(card);
   }
+  if(degraded)throw new Error(!agentInventoryKnown?'worker agent inventory unavailable':'running-job activity unavailable');
 }
 
 async function refreshRealWork(){
@@ -848,7 +990,11 @@ async function refreshRealWork(){
       return '<div>' + t + ' <span style="color:#7ee787">' + sha + '</span> ' + esc(host) + ' ' + esc(j.kind||'').slice(0,55) + mb + '</div>';
     }).join('');
     if (!with_commits_h.length) recentEl.innerHTML = '<div class="dim">no commits in last hour</div>';
-  } catch(e) { console.warn('realwork err', e); }
+  } catch(e) {
+    document.getElementById('realwork-stats').innerHTML=`<div class="panel-error">Real Work data unavailable: ${esc(e.message)}</div>`;
+    document.getElementById('realwork-recent').innerHTML='';
+    throw e;
+  }
 }
 
 async function refreshRemote(){
@@ -885,7 +1031,11 @@ async function refreshRemote(){
       const st=j.status==='done'?'<span style="color:#7ee787">done</span>':esc(j.status||'');
       return '<div>'+t+' '+st+' '+esc(j.kind||'').slice(0,40)+(be?' <span class="dim">['+esc(be)+']</span>':'')+'</div>';
     }).join('')||'<div class="dim">no spark jobs yet</div>';
-  }catch(e){console.warn('remote err',e);}
+  }catch(e){
+    document.getElementById('remote-spark-stats').innerHTML=`<div class="panel-error">Spark activity unavailable: ${esc(e.message)}</div>`;
+    document.getElementById('remote-spark-recent').innerHTML='';
+    throw e;
+  }
 }
 
 const MODEL_NAMES={hive_gpt:'gpt-5.3-codex-spark',hive_gpt_mini:'gpt-5.3-codex-spark',hive_gpt_heavy:'gpt-5.3-codex-spark',hive_codex:'gpt-5.3-codex-spark',hive_deepseek_pro_1:'deepseek-v4-pro',hive_deepseek_1:'deepseek-v4-flash',hive_deepseek_pro_2:'deepseek-v4-pro',hive_deepseek_pro_3:'deepseek-v4-pro',hive_deepseek_pro_4:'deepseek-v4-pro',hive_deepseek_pro_5:'deepseek-v4-pro',hive_deepseek_pro_6:'deepseek-v4-pro',hive_deepseek_pro_7:'deepseek-v4-pro',hive_deepseek_pro_8:'deepseek-v4-pro',hive_deepseek_3:'deepseek-v4-flash',hive_deepseek_4:'deepseek-v4-flash',hive_deepseek_5:'deepseek-v4-flash',hive_deepseek_6:'deepseek-v4-flash',hive_deepseek_7:'deepseek-v4-flash',hive_deepseek_8:'deepseek-v4-flash',hive_groq_8b:'llama-3.1-8b',hive_groq_2:'qwen3-32b',hive_groq_3:'gpt-oss-120b',hive_groq_4:'llama-4-scout',hive_groq_5:'llama-3.3-70b',hive_groq_6:'llama-3.3-70b',hive_groq_7:'llama-3.3-70b',hive_groq_8:'llama-3.3-70b',hive_groq_1:'gpt-5.3-codex',hive_xai_1:'grok-4.3',hive_ngc_1:'gpt-5.5',hive_ngc_2:'gpt-5.5',hive_nvidia_1:'gpt-5.3-codex',hive_siliconflow_3:'qwen3-coder-30b',hive_siliconflow_8:'deepseek-v4-pro(sf)',hive_nvidia_2:'nemotron-120b',hive_nvidia_5:'qwen3-coder-480b',hive_nvidia_6:'qwen3-coder-480b',hive_nvidia_7:'qwen3-coder-480b',hive_nvidia_8:'qwen3-coder-480b',hive_together_2:'kimi-k2.6'};
@@ -955,11 +1105,23 @@ async function refreshResults(){
       ${commits}
     `;
     card.onclick=()=>showJobModal(j);
+    activateOnKeyboard(card,()=>showJobModal(j),`Open completed ${j.kind} job ${j.id.slice(0,8)}`);
     el.appendChild(card);
   }
 }
 
 let _failedJobs={};
+let _triageFilter='attention';
+function setTriageFilter(filter){
+  _triageFilter=filter;
+  document.querySelectorAll('[data-triage-filter]').forEach(btn=>{
+    const selected=btn.dataset.triageFilter===filter;
+    btn.classList.toggle('active',selected);btn.setAttribute('aria-pressed',String(selected));
+  });
+  refreshFailed().catch(e=>{
+    document.getElementById('failed-list').innerHTML=`<div class="panel-error">Could not load triage jobs: ${esc(e.message)}</div>`;
+  });
+}
 async function refreshDoctor(){
   // Pull jobs across all relevant statuses; filter doctor-eligible OR claimed-by-doctor
   const [q,c,r,off]=await Promise.all([
@@ -1012,34 +1174,46 @@ async function refreshDoctor(){
 
 async function refreshDoctor(){ /* merged into unified Triage Queue (refreshFailed) */ }
   async function refreshFailed(){
+    try{
     // UNIFIED TRIAGE QUEUE (operator 2026-06-04): one queue, all non-done/non-cancelled
     // statuses, color-coded + priority. Replaces the separate Failed + Doctor panels.
     const sts=['dead-letter','failed','running','claimed','offered','queued'];
-    const res=await Promise.all(sts.map(st=>api('GET',`/v1/jobs?status=${st}&limit=${st==='queued'?300:100}`).catch(()=>({jobs:[]}))));
+    const res=await Promise.all(sts.map(st=>api('GET',`/v1/jobs?status=${st}&limit=${st==='queued'?300:100}`)));
     let jobs=[];
     sts.forEach((st,i)=>{(res[i].jobs||[]).forEach(j=>{if(!j.status)j.status=st;jobs.push(j);});});
     _failedJobs=Object.fromEntries(jobs.map(j=>[j.id,j]));
     const order={'dead-letter':0,failed:1,running:2,claimed:3,offered:4,queued:5};
     jobs.sort((a,b)=>{const ao=order[a.status]??9,bo=order[b.status]??9;if(ao!==bo)return ao-bo;return (b.priority||0)-(a.priority||0);});
+    const attention=jobs.filter(j=>j.status==='failed'||j.status==='dead-letter');
+    const active=jobs.filter(j=>!['failed','dead-letter'].includes(j.status));
+    const shownJobs=_triageFilter==='attention'?attention:_triageFilter==='active'?active:jobs;
     const cntEl=document.getElementById('failed-cnt');
-    if(cntEl)cntEl.textContent=`(${jobs.length})`;
+    if(cntEl)cntEl.textContent=`(${attention.length} attention · ${active.length} in flight)`;
+    document.getElementById('overview-failed').textContent=attention.length;
+    document.getElementById('triage-attention-cnt').textContent=`${attention.length}`;
+    document.getElementById('triage-active-cnt').textContent=`${active.length}`;
+    document.getElementById('triage-all-cnt').textContent=`${jobs.length}`;
     const el=document.getElementById('failed-list');
     if(!el)return;
     el.innerHTML='';
-    if(!jobs.length){ el.innerHTML='<div class="failed-panel-empty">Queue empty — nothing in flight ✓</div>'; return; }
-    for(const j of jobs.slice(0,150)){
+    if(!shownJobs.length){
+      el.innerHTML=`<div class="failed-panel-empty">${_triageFilter==='attention'?'No failed or dead-letter jobs ✓':_triageFilter==='active'?'Nothing currently in flight':'Queue empty — nothing in flight ✓'}</div>`;
+      return;
+    }
+    for(const j of shownJobs.slice(0,150)){
       const r=j.result||{};
       const reason=r.failure_reason||r.stderr||r.error||r.note||r.worker_error||r.summary||'';
       const card=document.createElement('div');
       card.className='failed-card tq-'+(j.status||'queued');
       card.onclick=()=>showJobModal(j);
+      activateOnKeyboard(card,()=>showJobModal(j),`Open ${j.status} ${j.kind} job ${j.id.slice(0,8)}`);
       const jid=j.id, prio=j.priority||0;
       const pcls=prio>=80?'pri-hi':(prio>=40?'pri-mid':'pri-lo');
       const isTerminal=(j.status==='failed'||j.status==='dead-letter');
       const acts=isTerminal?`<div class="fc-acts" onclick="event.stopPropagation()">
           <button class="btn btn-ghost btn-sm" onclick="resubmitFailed('${jid}')">🔁 Resubmit</button>
           <button class="btn btn-primary btn-sm" onclick="triageAndResubmit('${jid}')">🔍 Triage &amp; Resubmit</button>
-          <button class="btn btn-danger btn-sm" title="Dismiss" onclick="dismissFailed('${jid}',event)">✕</button>
+          <button class="btn btn-danger btn-sm" title="Dismiss" aria-label="Dismiss failed job" onclick="dismissFailed('${jid}',event)">✕</button>
         </div>`:'';
       card.innerHTML=`
         <div class="fc-head">
@@ -1052,6 +1226,12 @@ async function refreshDoctor(){ /* merged into unified Triage Queue (refreshFail
         ${reason?`<div class="fc-reason">${esc(String(reason).slice(0,250))}</div>`:''}
         ${acts}`;
       el.appendChild(card);
+    }
+    }catch(e){
+      document.getElementById('failed-cnt').textContent='(unavailable)';
+      document.getElementById('overview-failed').textContent='!';
+      document.getElementById('failed-list').innerHTML=`<div class="panel-error">Could not load triage jobs: ${esc(e.message)} <button type="button" class="btn btn-ghost btn-sm" onclick="refreshFailed().catch(()=>{})">Retry</button></div>`;
+      throw e;
     }
   }
   function resubmitFailed(id){
@@ -1074,7 +1254,7 @@ async function refreshDoctor(){ /* merged into unified Triage Queue (refreshFail
 
 async function triageAndResubmit(id){
   const j=_failedJobs[id];
-  if(!j||!_myUrn){setStatus('Not registered or job not found',true);return;}
+  if(!j||!_myUrn){setStatus('Not registered or job not found','error');return;}
   const r=j.result||{};
   const reason=r.failure_reason||r.stderr||r.error||r.summary||'(no failure detail)';
   const triageDesc=`Triage this failed Hive job and recommend a corrected resubmit.\n\nFailed kind: ${j.kind}\nPriority: ${j.priority}\nEligible: ${(j.eligible_kinds||[]).join(', ')}\n\nOriginal description:\n${j.description||''}\n\nFailure output:\n${String(reason).slice(0,800)}`;
@@ -1101,7 +1281,7 @@ async function triageAndResubmit(id){
     if(!_submitOpen)toggleSubmit();
     document.getElementById('f-desc').focus();
     await refreshAll();
-  }catch(e){setStatus('Triage error: '+e.message,true);}
+  }catch(e){setStatus('Triage error: '+e.message,'error');}
 }
 
 async function dismissFailed(id,e){
@@ -1165,7 +1345,7 @@ function loadBar(pct){
 }
 
 async function refreshGPU(){
-  const d = await api('GET','/v1/hosts?include_stale=false').catch(()=>({hosts:[]}));
+  const d = await api('GET','/v1/hosts?include_stale=false');
   const hosts = d.hosts || [];
   const rows = [];
   for (const h of hosts) {
@@ -1201,7 +1381,7 @@ async function refreshGPU(){
 }
 
 async function refreshHosts(){
-  const d=await api('GET','/v1/hosts?include_stale=true').catch(()=>({hosts:[]}));
+  const d=await api('GET','/v1/hosts?include_stale=true');
   const hosts=d.hosts||[];
   document.getElementById('hosts-cnt').textContent=`(${hosts.filter(h=>!h.stale).length} live · ${hosts.length} total)`;
   const tb=document.querySelector('#hosts-tbl tbody');tb.innerHTML='';
@@ -1276,7 +1456,8 @@ async function refreshHosts(){
 
 let _capState=null;
 async function refreshCapBanner(){
-  try{const d=await api('GET','/v1/knemon/cap');_capState=d.capped?d:null;renderCapBanner();}catch(_){}
+  try{const d=await api('GET','/v1/knemon/cap');_capState=d.capped?d:null;renderCapBanner();}
+  catch(e){throw new Error('cap status unavailable: '+e.message);}
 }
 function renderCapBanner(){
   const el=document.getElementById('cap-banner');if(!el)return;
@@ -1333,14 +1514,22 @@ function issueInfo(p,j){
   return {url:'https://github.com/'+slug+'/issues/'+pi.num,num:pi.num,slug:slug};
 }
 let _reviewJobId=null;
+let _reviewLoadSeq=0;
 function verdictCls(v){return 'verdict-'+String(v||'').toLowerCase().replace(/[^a-z]/g,'');}
 async function refreshNeedsReview(){
   let d;
-  try{ d=await api('GET','/v1/jobs?status=needs-review&limit=100'); }catch(e){ d={jobs:[]}; }
+  try{ d=await api('GET','/v1/jobs?status=needs-review&limit=100'); }
+  catch(e){
+    document.getElementById('needsreview-cnt').textContent='(unavailable)';
+    document.getElementById('overview-review').textContent='!';
+    document.getElementById('needsreview-list').innerHTML=`<div class="panel-error">Could not load the review queue: ${esc(e.message)} <button type="button" class="btn btn-ghost btn-sm" onclick="refreshNeedsReview().catch(()=>{})">Retry</button></div>`;
+    throw e;
+  }
   let jobs=((d&&d.jobs)||(Array.isArray(d)?d:[])).filter(Boolean);
   // Gate is scoped to designated projects; all others are direct commit/push.
   jobs=jobs.filter(isGated);
   const cntEl=document.getElementById('needsreview-cnt'); if(cntEl)cntEl.textContent='('+jobs.length+')';
+  document.getElementById('overview-review').textContent=jobs.length;
   const el=document.getElementById('needsreview-list'); if(!el)return;
   if(!jobs.length){ el.innerHTML='<div class="dim">No designated-project builds awaiting review.</div>'; return; }
   el.innerHTML='';
@@ -1364,19 +1553,39 @@ async function refreshNeedsReview(){
       ${hasPreview?`<button class="btn btn-primary btn-sm" onclick="openReview('${esc(j.id)}');event.stopPropagation()">Preview</button>`:'<span class="dim">no preview bundle</span>'}
     </div>
     <div class="rc-body">${esc((j.description||'').slice(0,200))}</div>`;
+    if(hasPreview){
+      card.onclick=e=>{if(!e.target.closest('button,a'))openReview(j.id);};
+      activateOnKeyboard(card,()=>openReview(j.id),`Open review preview for ${j.kind||'job'}`);
+    }
     el.appendChild(card);
   }
 }
 async function openReview(id){
+  const loadSeq=++_reviewLoadSeq;
   _reviewJobId=id;
-  document.getElementById('review-backdrop').className='open';
+  const backdrop=document.getElementById('review-backdrop');
+  if(!backdrop.classList.contains('open'))_reviewReturnFocus=document.activeElement;
+  backdrop.className='open';
+  document.body.style.overflow='hidden';
+  document.getElementById('review-modal').focus();
+  document.getElementById('rv-title').textContent='PR Preview · loading…';
   document.getElementById('rv-meta').textContent='loading…';
   document.getElementById('rv-evidence').innerHTML='';
   document.getElementById('rv-diff').innerHTML='';
-  document.getElementById('rv-status').textContent='';
+  const rb=document.getElementById('rv-release-btn');
+  const statusEl=document.getElementById('rv-status');
+  rb.disabled=true;rb.textContent='Loading preview…';
+  statusEl.textContent='';statusEl.className='';
   let d;
   try{ d=await api('GET','/v1/jobs/'+id+'/preview'); }
-  catch(e){ document.getElementById('rv-meta').textContent='error: '+e; return; }
+  catch(e){
+    if(loadSeq!==_reviewLoadSeq)return;
+    document.getElementById('rv-meta').innerHTML=`<div class="panel-error">Preview could not be loaded: ${esc(e.message)} <button type="button" class="btn btn-ghost btn-sm" onclick="openReview(_reviewJobId)">Retry</button></div>`;
+    rb.textContent='Release unavailable';
+    statusEl.textContent='No release action was taken.';statusEl.className='status-error';
+    return;
+  }
+  if(loadSeq!==_reviewLoadSeq)return;
   const p=d.preview||{};
   document.getElementById('rv-title').textContent='PR Preview · '+(p.repo||d.repo||'')+' · '+(p.base_branch||'')+' ← '+(p.head_branch||'');
   const shownVerdict=blockReason(id)?'blocked':p.verdict;
@@ -1417,36 +1626,67 @@ async function openReview(id){
       dv.innerHTML='<pre style="padding:.6em;white-space:pre-wrap;color:#c9d1d9">'+esc(diffStr||'(empty diff)')+'</pre>';
     }
   }catch(e){ dv.innerHTML='<pre style="padding:.6em;white-space:pre-wrap;color:#c9d1d9">'+esc(diffStr)+'</pre>'; }
-  const rb=document.getElementById('rv-release-btn');
   const held=blockReason(id);
   if(held){ rb.disabled=true; rb.textContent='Interim hold — rebuild pending ('+held+')'; }
   else if(String(p.verdict||'').toLowerCase()==='blocked'){ rb.disabled=true; rb.textContent='Blocked — cannot release'; }
+  else if(!diffStr.trim()){ rb.disabled=true; rb.textContent='No diff — cannot release'; }
+  else if(!['green','needs-review','needsreview','approved','pass'].includes(String(p.verdict||'').toLowerCase())){ rb.disabled=true; rb.textContent='Unknown verdict — cannot release'; }
   else{ rb.disabled=false; rb.innerHTML='🚀 Release &amp; Push (open PR)'; }
 }
 async function releaseCurrent(){
   if(!_reviewJobId)return;
+  const jobId=_reviewJobId, loadSeq=_reviewLoadSeq;
   const rb=document.getElementById('rv-release-btn'), st=document.getElementById('rv-status');
   if(!confirm('Release & Push: pushes the branch and opens an upstream PR for human merge. Continue?'))return;
-  rb.disabled=true; st.textContent='releasing…';
+  rb.disabled=true; st.textContent='Releasing…';st.className='';
   try{
-    const r=await api('POST','/v1/jobs/'+_reviewJobId+'/release');
-    st.textContent='release queued: '+(r.release_job_id||'ok');
+    const r=await api('POST','/v1/jobs/'+jobId+'/release');
     refreshNeedsReview().catch(()=>{});
-  }catch(e){ st.textContent='error: '+e; rb.disabled=false; }
+    if(jobId!==_reviewJobId||loadSeq!==_reviewLoadSeq||!document.getElementById('review-backdrop').classList.contains('open'))return;
+    rb.textContent='Release queued';
+    st.textContent='Release queued: '+(r.release_job_id||'ok');st.className='status-ok';
+  }catch(e){
+    if(jobId!==_reviewJobId||loadSeq!==_reviewLoadSeq||!document.getElementById('review-backdrop').classList.contains('open'))return;
+    st.textContent='Release failed: '+e.message;st.className='status-error';rb.disabled=false;rb.innerHTML='🚀 Retry Release &amp; Push';
+  }
 }
 function closeReview(e){ if(e&&e.target===document.getElementById('review-backdrop'))closeReviewBtn(); }
-function closeReviewBtn(){ document.getElementById('review-backdrop').className=''; }
+function closeReviewBtn(){
+  _reviewLoadSeq++;
+  document.getElementById('review-backdrop').className='';
+  if(!document.getElementById('modal-backdrop').classList.contains('open'))document.body.style.overflow='';
+  if(_reviewReturnFocus&&document.contains(_reviewReturnFocus))_reviewReturnFocus.focus();
+}
 
-async function refreshAll(){
-  document.getElementById('meta-time').textContent=`last refresh ${new Date().toLocaleTimeString()} · auto 8s`;
+async function refreshAll(manual=false){
+  if(_refreshing)return;
+  _refreshing=true;
+  if(manual&&!_myUrn)registerAgent();
+  const timeEl=document.getElementById('meta-time');
+  const btn=document.getElementById('refresh-btn');
+  btn.disabled=true;btn.classList.add('refreshing');
+  timeEl.className='';
+  timeEl.textContent=_lastRefreshAt?`Refreshing… last complete ${_lastRefreshAt.toLocaleTimeString()}`:'Refreshing dashboard…';
   try{
-    await Promise.all([
+    const results=await Promise.allSettled([
       refreshRunning(),refreshAgents(),refreshJobs(),refreshResults(),refreshCapBanner(),
       refreshFailed(),refreshCosts(),refreshWorkers(),refreshSchedules(),
-      refreshHosts(),refreshGPU(),
-      refreshRemote(),refreshNeedsReview(),
+      refreshHosts(),refreshGPU(),refreshRealWork(),refreshRemote(),refreshNeedsReview(),
     ]);
-  }catch(e){document.getElementById('meta-time').textContent='error: '+e;}
+    const failures=results.filter(r=>r.status==='rejected');
+    if(failures.length){
+      const reason=failures[0].reason&&failures[0].reason.message?failures[0].reason.message:String(failures[0].reason||'unknown error');
+      timeEl.textContent=`Partial refresh · ${failures.length} source${failures.length===1?'':'s'} unavailable · ${reason.slice(0,70)}`;
+      timeEl.className='status-warn';
+    }else{
+      _lastRefreshAt=new Date();
+      timeEl.textContent=`Updated ${_lastRefreshAt.toLocaleTimeString()} · auto every 8s`;
+      timeEl.className='status-ok';
+    }
+  }finally{
+    _refreshing=false;
+    btn.disabled=false;btn.classList.remove('refreshing');
+  }
 }
 
 // ── SSE live events ───────────────────────────────────────────────────
@@ -1492,6 +1732,12 @@ function initSSE(){
     es.onerror=()=>evLine('<span style="color:#f85149">SSE disconnected — retrying</span>');
   }catch(e){}
 }
+
+document.addEventListener('keydown',e=>{
+  if(e.key!=='Escape')return;
+  if(document.getElementById('review-backdrop').classList.contains('open'))closeReviewBtn();
+  else if(document.getElementById('modal-backdrop').classList.contains('open'))closeModalBtn();
+});
 
 // ── init ──────────────────────────────────────────────────────────────
 registerAgent();
