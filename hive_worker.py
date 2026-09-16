@@ -294,11 +294,23 @@ def _run_job_inner(job: dict) -> None:
     # ("returned non-zero exit status 128" on a plain ssh:// clone). Fall
     # back to password auth via GIT_FLEET_SSH_PASSWORD if the host provides
     # it (systemd EnvironmentFile, never hardcoded/committed here).
+    #
+    # StrictHostKeyChecking=no alone does NOT save a host whose known_hosts
+    # already carries a CONFLICTING entry for ARGONAS (e.g. a stale ECDSA
+    # key from before ARGONAS was reprovisioned to ED25519) -- ssh refuses
+    # with "REMOTE HOST IDENTIFICATION HAS CHANGED" regardless of that flag,
+    # since it exists specifically to catch a changed key. Confirmed live
+    # 2026-09-16 on hydra+cerberus: identical clone_failed exit 128 on every
+    # job, root cause was this mismatch, not a MaxStartups throttle as first
+    # suspected. UserKnownHostsFile=/dev/null sidesteps host-key state
+    # entirely for this break-glass password-auth path, the same way
+    # PubkeyAuthentication=no already sidesteps key-based auth state.
     clone_env = os.environ.copy()
     fleet_pw = os.environ.get("GIT_FLEET_SSH_PASSWORD")
     if fleet_pw and repo_url.startswith("ssh://root@"):
         clone_env["GIT_SSH_COMMAND"] = (
-            f"sshpass -p {fleet_pw!r} ssh -o PubkeyAuthentication=no -o StrictHostKeyChecking=no"
+            f"sshpass -p {fleet_pw!r} ssh -o PubkeyAuthentication=no "
+            "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
         )
     try:
         subprocess.run(clone_cmd, check=True, timeout=300, env=clone_env,
