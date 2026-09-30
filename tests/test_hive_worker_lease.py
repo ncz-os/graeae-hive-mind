@@ -1,6 +1,8 @@
 """Claim renewal behavior during a long blocking driver run."""
 
 import os
+import subprocess
+import sys
 import unittest
 from unittest.mock import patch
 
@@ -90,6 +92,24 @@ class ClaimRenewalTests(unittest.TestCase):
 
         self.assertEqual(patch_count, 1)
         self.assertEqual(worker._claim_renewal_blocked_id, worker._current_job_id)
+
+    def test_gitops_route_overrides_stale_environment_file(self):
+        env = os.environ.copy()
+        env.update({
+            "WORKER_KIND": "zeroclaw",
+            "ZODER_AGENT": "minimax",
+            "ZODER_REVIEWER": "MiniMax-M3",
+            "HIVE_ZODER_AGENT": "coder",
+            "HIVE_ZODER_REVIEWER": "qwen38",
+        })
+        proc = subprocess.run(
+            [sys.executable, "-c", "import hive_worker; print(hive_worker.ZODER_AGENT, hive_worker.ZODER_REVIEWER)"],
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.stdout.strip(), "coder qwen38")
 
 
 if __name__ == "__main__":

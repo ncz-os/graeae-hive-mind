@@ -100,7 +100,10 @@ CODEX_MODEL = os.environ.get("CODEX_MODEL", "gpt-5.6-luna")
 # correctly. Setting ZODER_AGENT sidesteps the broken automatic path
 # entirely by pinning a known-good agent alias, the same way CODEX_MODEL
 # already sidesteps codex's model-catalog drift above.
-ZODER_AGENT = os.environ.get("ZODER_AGENT", "")
+# HIVE_* overrides are set by host GitOps. EnvironmentFile values are applied
+# after systemd Environment= lines, so a stale /etc/hive-worker-env ZODER_AGENT
+# would otherwise override the host route drop-in.
+ZODER_AGENT = os.environ.get("HIVE_ZODER_AGENT") or os.environ.get("ZODER_AGENT", "")
 # `zoder loop`'s adversarial-review phase picks its own reviewer model
 # independently of --agent -- confirmed 2026-09-16 on ARGOS: --agent minimax
 # fixed authoring, but the review phase still auto-routed to "MiniMax-M2.7",
@@ -109,7 +112,7 @@ ZODER_AGENT = os.environ.get("ZODER_AGENT", "")
 # model_corpus.json, which is unfiltered by what a given host can actually
 # reach. `--reviewer <MODEL>` pins it the same way ZODER_AGENT pins the
 # author.
-ZODER_REVIEWER = os.environ.get("ZODER_REVIEWER", "")
+ZODER_REVIEWER = os.environ.get("HIVE_ZODER_REVIEWER") or os.environ.get("ZODER_REVIEWER", "")
 
 if WORKER_KIND not in ("zeroclaw", "codex"):
     print("[hive-worker] WORKER_KIND must be 'zeroclaw' or 'codex'", file=sys.stderr)
