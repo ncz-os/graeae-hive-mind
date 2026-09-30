@@ -128,6 +128,11 @@ REPO_MAP = {
     "graeae-hive":          "ssh://root@192.168.207.101/mnt/datapool/git/graeae-hive.git",
     "zoder":                "https://gitlab.com/ncz-os/zoder.git",
     "artistpack":           "https://gitlab.com/ncz-os/artistpack.git",
+    "ncz-screensavers":     "ssh://root@192.168.207.101/mnt/datapool/git/ncz-screensavers.git",
+    "wayshade":             "ssh://root@192.168.207.101/mnt/datapool/git/wayshade.git",
+    "singularity-plugins":  "ssh://root@192.168.207.101/mnt/datapool/git/singularity-plugins.git",
+    "amd64-kernel-t2":      "ssh://root@192.168.207.101/mnt/datapool/git/amd64-kernel-t2.git",
+    "fleet-ops":            "ssh://root@192.168.207.101/mnt/datapool/git/fleet-ops.git",
 }
 
 _urn: str = ""
@@ -352,7 +357,12 @@ def _run_job_inner(job: dict) -> None:
         # orchestrators on the LAN, not an adversarial source; revisit with a
         # streaming/size-capped reader if a real job ever produces enough
         # output to matter.
-        proc = subprocess.Popen(cmd, cwd=workdir, stdout=subprocess.PIPE,
+        # env=clone_env: the driver (zoder/codex) must be able to `git push` to the
+        # same root@ARGONAS origin it was cloned from; the password-auth
+        # GIT_SSH_COMMAND was previously set only for the clone, so pushes from
+        # inside the job failed and the workspace (deleted on exit) lost the work.
+        # No new exposure: GIT_FLEET_SSH_PASSWORD is already in this environment.
+        proc = subprocess.Popen(cmd, cwd=workdir, stdout=subprocess.PIPE, env=clone_env,
                                  stderr=subprocess.STDOUT, text=True, start_new_session=True)
         try:
             stdout, _ = proc.communicate(timeout=JOB_TIMEOUT)
