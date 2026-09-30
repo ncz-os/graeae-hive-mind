@@ -101,6 +101,15 @@ CODEX_MODEL = os.environ.get("CODEX_MODEL", "gpt-5.6-luna")
 # entirely by pinning a known-good agent alias, the same way CODEX_MODEL
 # already sidesteps codex's model-catalog drift above.
 ZODER_AGENT = os.environ.get("ZODER_AGENT", "")
+# `zoder loop`'s adversarial-review phase picks its own reviewer model
+# independently of --agent -- confirmed 2026-09-16 on ARGOS: --agent minimax
+# fixed authoring, but the review phase still auto-routed to "MiniMax-M2.7",
+# a real but locally-unconfigured catalog entry (sambanova-hosted, no
+# provider for it in this host's config.toml) pulled from zoder's global
+# model_corpus.json, which is unfiltered by what a given host can actually
+# reach. `--reviewer <MODEL>` pins it the same way ZODER_AGENT pins the
+# author.
+ZODER_REVIEWER = os.environ.get("ZODER_REVIEWER", "")
 
 if WORKER_KIND not in ("zeroclaw", "codex"):
     print("[hive-worker] WORKER_KIND must be 'zeroclaw' or 'codex'", file=sys.stderr)
@@ -119,6 +128,11 @@ REPO_MAP = {
     "graeae-hive":          "ssh://root@192.168.207.101/mnt/datapool/git/graeae-hive.git",
     "zoder":                "https://gitlab.com/ncz-os/zoder.git",
     "artistpack":           "https://gitlab.com/ncz-os/artistpack.git",
+    "ncz-screensavers":     "ssh://root@192.168.207.101/mnt/datapool/git/ncz-screensavers.git",
+    "wayshade":             "ssh://root@192.168.207.101/mnt/datapool/git/wayshade.git",
+    "singularity-plugins":  "ssh://root@192.168.207.101/mnt/datapool/git/singularity-plugins.git",
+    "amd64-kernel-t2":      "ssh://root@192.168.207.101/mnt/datapool/git/amd64-kernel-t2.git",
+    "fleet-ops":            "ssh://root@192.168.207.101/mnt/datapool/git/fleet-ops.git",
 }
 
 _urn: str = ""
@@ -322,11 +336,23 @@ def _run_job_inner(job: dict) -> None:
     # ("returned non-zero exit status 128" on a plain ssh:// clone). Fall
     # back to password auth via GIT_FLEET_SSH_PASSWORD if the host provides
     # it (systemd EnvironmentFile, never hardcoded/committed here).
+    #
+    # StrictHostKeyChecking=no alone does NOT save a host whose known_hosts
+    # already carries a CONFLICTING entry for ARGONAS (e.g. a stale ECDSA
+    # key from before ARGONAS was reprovisioned to ED25519) -- ssh refuses
+    # with "REMOTE HOST IDENTIFICATION HAS CHANGED" regardless of that flag,
+    # since it exists specifically to catch a changed key. Confirmed live
+    # 2026-09-16 on hydra+cerberus: identical clone_failed exit 128 on every
+    # job, root cause was this mismatch, not a MaxStartups throttle as first
+    # suspected. UserKnownHostsFile=/dev/null sidesteps host-key state
+    # entirely for this break-glass password-auth path, the same way
+    # PubkeyAuthentication=no already sidesteps key-based auth state.
     clone_env = os.environ.copy()
     fleet_pw = os.environ.get("GIT_FLEET_SSH_PASSWORD")
     if fleet_pw and repo_url.startswith("ssh://root@"):
         clone_env["GIT_SSH_COMMAND"] = (
-            f"sshpass -p {fleet_pw!r} ssh -o PubkeyAuthentication=no -o StrictHostKeyChecking=no"
+            f"sshpass -p {fleet_pw!r} ssh -o PubkeyAuthentication=no "
+            "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
         )
     try:
         subprocess.run(clone_cmd, check=True, timeout=300, env=clone_env,
@@ -350,6 +376,8 @@ def _run_job_inner(job: dict) -> None:
         ]
         if ZODER_AGENT:
             cmd += ["--agent", ZODER_AGENT, "--allow-paid"]
+        if ZODER_REVIEWER:
+            cmd += ["--reviewer", ZODER_REVIEWER]
     else:
         cmd = [_find_driver("codex"), "exec", "--skip-git-repo-check", "-m", CODEX_MODEL, description]
 
@@ -366,7 +394,12 @@ def _run_job_inner(job: dict) -> None:
         # orchestrators on the LAN, not an adversarial source; revisit with a
         # streaming/size-capped reader if a real job ever produces enough
         # output to matter.
-        proc = subprocess.Popen(cmd, cwd=workdir, stdout=subprocess.PIPE,
+        # env=clone_env: the driver (zoder/codex) must be able to `git push` to the
+        # same root@ARGONAS origin it was cloned from; the password-auth
+        # GIT_SSH_COMMAND was previously set only for the clone, so pushes from
+        # inside the job failed and the workspace (deleted on exit) lost the work.
+        # No new exposure: GIT_FLEET_SSH_PASSWORD is already in this environment.
+        proc = subprocess.Popen(cmd, cwd=workdir, stdout=subprocess.PIPE, env=clone_env,
                                  stderr=subprocess.STDOUT, text=True, start_new_session=True)
         try:
             stdout, _ = proc.communicate(timeout=JOB_TIMEOUT)

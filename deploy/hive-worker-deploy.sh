@@ -132,6 +132,19 @@ for KIND in $KINDS; do
   fi
 done
 
+# Optional host-specific, non-secret route for the zeroclaw worker. Keep
+# credentials in /etc/hive-worker-env; this drop-in only pins reachable models.
+ROUTE_SRC="$REPO/hosts/$HOST/hive-worker-zeroclaw-route.conf"
+ROUTE_DST="$UNITDIR/hive-worker-zeroclaw.service.d/20-host-route.conf"
+if [ -f "$ROUTE_SRC" ] && { [ ! -f "$ROUTE_DST" ] || ! cmp -s "$ROUTE_SRC" "$ROUTE_DST"; }; then
+  log "changed: $ROUTE_DST"
+  if [ "$DRY_RUN" != 1 ]; then
+    mkdir -p "$(dirname "$ROUTE_DST")"
+    install -m 0644 "$ROUTE_SRC" "$ROUTE_DST"
+  fi
+  CHANGED="$CHANGED hive-worker-zeroclaw.service"
+fi
+
 if [ -n "$CHANGED" ]; then
   if [ "$DRY_RUN" = 1 ]; then
     log "DRY-RUN: would reload+restart for:$CHANGED"

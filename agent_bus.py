@@ -1649,7 +1649,8 @@ async def reaper_task(app: FastAPI):
                         await db.execute(
                             "UPDATE jobs SET status='queued', claimed_by=NULL, claimed_at=NULL, "
                             "claimed_runtime=NULL, claimed_model=NULL, claimed_provider=NULL, "
-                            "claimed_cost_tier=NULL, claim_lease_expires_at=NULL "
+                            "claimed_cost_tier=NULL, claim_lease_expires_at=NULL, "
+                            "ended_at=NULL, result=NULL "
                             "WHERE claimed_by=? AND status IN ('offered','claimed','running')",
                             (urn,),
                         )
@@ -1740,7 +1741,8 @@ async def reaper_task(app: FastAPI):
                         await db.execute(
                             "UPDATE jobs SET status='queued', claimed_by=NULL, claimed_at=NULL, "
                             "claimed_runtime=NULL, claimed_model=NULL, claimed_provider=NULL, "
-                            "claimed_cost_tier=NULL, claim_lease_expires_at=NULL "
+                            "claimed_cost_tier=NULL, claim_lease_expires_at=NULL, "
+                            "ended_at=NULL, result=NULL "
                             "WHERE id=? AND status IN ('claimed','running')",
                             (job_id,))
                         await emit_event(db, "job.unclaimed", {
@@ -2947,10 +2949,11 @@ async def dequeue_next_job(agent_urn: str):
                 cur2 = await db.execute(
                     "UPDATE jobs SET status='claimed', claimed_by=?, claimed_at=?, "
                     "claimed_runtime=?, claimed_model=?, claimed_provider=?, claimed_cost_tier=?, "
-                    "claim_lease_expires_at=? "
+                    "claim_lease_expires_at=?, last_update_at=?, "
+                    "ended_at=NULL, result=NULL "
                     "WHERE id=? AND status IN ('queued','offered')",
                     (agent_urn, now, a_runtime, a_model, a_provider, a_tier,
-                     now + CLAIM_LEASE_SECONDS, j_id),
+                     now + CLAIM_LEASE_SECONDS, now, j_id),
                 )
                 if cur2.rowcount == 0:
                     continue
@@ -3161,6 +3164,7 @@ async def update_job(job_id: str, req: JobUpdate):
                 fields.extend([
                     "claimed_by=NULL", "claimed_at=NULL", "claimed_runtime=NULL",
                     "claimed_model=NULL", "claimed_provider=NULL", "claimed_cost_tier=NULL",
+                    "ended_at=NULL",
                 ])
                 # GRAEAE dispatch consensus 1.0 (2026-06-04) SHIP-FIRST: backoff on EVERY release
                 # so a job a worker can't run cannot hot-loop (claim->release->reclaim). The serve
@@ -4502,10 +4506,11 @@ async def claim_job(job_id: str, by: str):
         cur = await db.execute(
             "UPDATE jobs SET status='claimed', claimed_by=?, claimed_at=?, "
             "claimed_runtime=?, claimed_model=?, claimed_provider=?, claimed_cost_tier=?, "
-            "claim_lease_expires_at=? "
+            "claim_lease_expires_at=?, last_update_at=?, "
+            "ended_at=NULL, result=NULL "
             "WHERE id=? AND status IN ('queued','offered')",
             (by, now, a_runtime, a_model, a_provider, a_tier,
-             now + CLAIM_LEASE_SECONDS, job_id),
+             now + CLAIM_LEASE_SECONDS, now, job_id),
         )
         await db.commit()
         if cur.rowcount == 0:
