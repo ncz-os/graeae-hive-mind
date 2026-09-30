@@ -124,6 +124,7 @@ REPO_MAP = {
 _urn: str = ""
 _running = True
 _current_job_id: str | None = None
+_claim_renewal_blocked_id: str | None = None
 
 
 def _signal(signum, frame):
@@ -179,14 +180,49 @@ def register() -> None:
 
 
 def heartbeat_loop() -> None:
+    global _claim_renewal_blocked_id
     while _running:
         time.sleep(HEARTBEAT_INTERVAL)
         if not _urn:
             continue
-        _http("POST", "/v1/agents/heartbeat", {
-            "urn": _urn,
-            "metadata": {"current_job": _current_job_id},
-        }, timeout=10)
+        _http(
+            "POST",
+            "/v1/agents/heartbeat",
+            {
+                "urn": _urn,
+                "metadata": {"current_job": _current_job_id},
+            },
+            timeout=10,
+        )
+        job_id = _current_job_id
+        if not job_id or job_id == _claim_renewal_blocked_id:
+            continue
+        # An agent heartbeat does not refresh the job's 30-minute lease.
+        # A same-status PATCH does, without replacing an existing result.
+        code, _ = _http(
+            "PATCH",
+            f"/v1/jobs/{job_id}",
+            {
+                "status": "claimed",
+                "claimed_by": _urn,
+            },
+            timeout=15,
+        )
+        if code in (403, 409):
+            # The claim was reassigned or the job became terminal/cancelled.
+            # Never try to claim it again through this heartbeat.
+            _claim_renewal_blocked_id = job_id
+            print(
+                f"[hive-worker:{WORKER_KIND}] WARNING: claim renewal rejected "
+                f"for {job_id}: code={code}",
+                flush=True,
+            )
+        elif code != 200:
+            print(
+                f"[hive-worker:{WORKER_KIND}] WARNING: claim renewal failed "
+                f"for {job_id}: code={code}",
+                flush=True,
+            )
 
 
 # Jobs are submitted only by registered orchestrator agents (bus-enforced,
@@ -237,8 +273,9 @@ def run_job(job: dict) -> None:
     finding, 2026-09-14: PermissionError/OSError etc previously escaped this
     function entirely, killing the daemon with the job left claimed
     forever)."""
-    global _current_job_id
+    global _current_job_id, _claim_renewal_blocked_id
     job_id = job.get("id", "")
+    _claim_renewal_blocked_id = None
     _current_job_id = job_id
     try:
         _run_job_inner(job)
