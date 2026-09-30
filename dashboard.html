@@ -861,11 +861,12 @@ async function refreshRunning(){
   // kinds, NOT one card per instance. kind==zeroclaw is the build fan-out pool.
   // Maps use Object.create(null) because keys are untrusted URN/host strings
   // (avoids __proto__/constructor prototype-pollution + Object.values drops).
-  const [ajResult,jjResult]=await Promise.allSettled([
+  const [ajResult,claimedResult,runningResult]=await Promise.allSettled([
     api('GET','/v1/agents?status=online'),
+    api('GET','/v1/jobs?status=claimed&limit=200'),
     api('GET','/v1/jobs?status=running&limit=200'),
   ]);
-  if(ajResult.status==='rejected'&&jjResult.status==='rejected'){
+  if(ajResult.status==='rejected'&&claimedResult.status==='rejected'&&runningResult.status==='rejected'){
     document.getElementById('workers-cnt').textContent='(unavailable)';
     document.getElementById('overview-busy').textContent='!';
     document.getElementById('workers-grid').innerHTML='';
@@ -874,11 +875,11 @@ async function refreshRunning(){
     throw new Error('worker pool unavailable');
   }
   const aj=ajResult.status==='fulfilled'?ajResult.value:{agents:null};
-  const jj=jjResult.status==='fulfilled'?jjResult.value:{jobs:[]};
   const agentInventoryKnown=ajResult.status==='fulfilled';
-  const activityKnown=jjResult.status==='fulfilled';
+  const activityKnown=claimedResult.status==='fulfilled'&&runningResult.status==='fulfilled';
   const agents=(Array.isArray(aj.agents)?aj.agents:[]).filter(a=>a&&a.kind==='zeroclaw');
-  const jobs=jj.jobs||[];
+  const jobs=[...(claimedResult.status==='fulfilled'?(claimedResult.value.jobs||[]):[]),
+              ...(runningResult.status==='fulfilled'?(runningResult.value.jobs||[]):[])];
   const byClaimer=Object.create(null);
   for(const j of jobs){ if(j.claimed_by) byClaimer[j.claimed_by]=j; }
   const hosts=Object.create(null);
@@ -890,7 +891,7 @@ async function refreshRunning(){
     if(j){ h.busy++; j._model=a.model||(j.result&&(j.result.alias||j.result.model))||'?'; j._provider=a.provider||''; h.jobs.push(j); }
   }
   let list=Object.values(hosts);
-  let degraded=ajResult.status==='rejected'||jjResult.status==='rejected';
+  let degraded=ajResult.status==='rejected'||!activityKnown;
   // degraded fallback: agents fetch failed but jobs run -> group the ZEROCLAW-claimed
   // running jobs (this panel is the zeroclaw pool) by claimer host.
   if(!list.length && jobs.length){
