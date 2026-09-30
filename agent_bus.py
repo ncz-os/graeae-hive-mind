@@ -1806,9 +1806,10 @@ async def lifespan(app: FastAPI):
                         # statement below and is idempotent, so apply it here, in the
                         # same guarded-DDL block that already adds decline_count and
                         # relaxes CK_HIVE_JOBS_STATUS.
-                        log.warning(
+                        print(
                             "HIVE_JOBS.EXECUTION_SPEC absent; applying "
-                            "migrations/2026-08-10-system-job-execution.sql inline"
+                            "migrations/2026-08-10-system-job-execution.sql inline",
+                            flush=True,
                         )
                         await rcur.execute("ALTER TABLE HIVE_JOBS ADD (execution_spec CLOB)")
                         await rcur.execute(
