@@ -776,7 +776,7 @@ ACTIVE_AGENT_STATUSES = {"online", "idle"}
 
 # ROLE SPLIT (user directive 2026-05-23): opencode + codex + hermes +
 # claw-family + ic-engine + unknown = WORKERS (claim-only). Cannot submit jobs.
-# Orchestrators: claude-code, human, mnemos. They submit work; workers execute it.
+# Orchestrators include a distinct Codex role. Ordinary Codex workers stay claim-only.
 WORKER_ONLY_RUNTIMES: set[str] = {
     "opencode", "opencode-cli",
     "opencode", "opencode-cli",
@@ -788,6 +788,7 @@ WORKER_ONLY_RUNTIMES: set[str] = {
 }
 ORCHESTRATOR_RUNTIMES: set[str] = {
     "claude-code", "claude-cli", "claude",
+    "codex-orchestrator",
     "human",
     "mnemos",
     "doctor",   # PYTHIA triage authority — submits codex sub-jobs + auto-triage
