@@ -187,6 +187,13 @@ def _http(
 
 def register() -> None:
     global _urn
+    driver = _find_driver("zoder" if WORKER_KIND == "zeroclaw" else "codex")
+    if not os.path.isfile(driver) or not os.access(driver, os.X_OK):
+        print(
+            f"[hive-worker:{WORKER_KIND}] driver unavailable; refusing registration",
+            flush=True,
+        )
+        raise SystemExit(2)
     caps = ["python", "git", "bash", "linux-compile", WORKER_KIND]
     body = {
         "runtime": WORKER_KIND,

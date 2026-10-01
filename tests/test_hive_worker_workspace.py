@@ -24,6 +24,15 @@ class _Driver:
 
 
 class WorkspaceRetentionTests(unittest.TestCase):
+    def test_missing_driver_never_advertises_worker_capability(self):
+        with (
+            patch.object(worker, "_find_driver", return_value="/does/not/exist"),
+            patch.object(worker, "_http") as http,
+        ):
+            with self.assertRaises(SystemExit):
+                worker.register()
+            http.assert_not_called()
+
     def test_existing_workspace_is_never_erased_on_reclaim(self):
         with tempfile.TemporaryDirectory() as root:
             checkout = Path(root, JOB_ID)
