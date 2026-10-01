@@ -43,6 +43,7 @@ class WorkspaceRetentionTests(unittest.TestCase):
         body = http.call_args.args[2]
         self.assertIn("verified-git-delivery", body["capabilities"])
         self.assertEqual(body["version"], "hive_worker.py/2")
+        self.assertEqual(body["instance"], "hive-worker-zeroclaw-1")
         required = ["hard:verified-git-delivery"]
         self.assertFalse(match(required, ["python", "git", "zeroclaw"]).eligible)
         self.assertTrue(match(required, body["capabilities"]).eligible)

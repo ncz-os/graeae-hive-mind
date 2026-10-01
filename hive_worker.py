@@ -12,17 +12,16 @@ second independent routing layer (KNEMON, or an in-process build harness).
 This script claims exactly ONE kind of job (--kind zeroclaw|codex), resolves
 the job's repo to a fresh per-job clone (never a shared mutable workspace --
 that was zc_oneshot's bug, fixed here the same way zc_native_build.py fixed
-it), runs the driving tool inside it, and reports the result. No model
-selection happens here: zeroclaw jobs get `zoder loop`, which reads that
-host's own ~/.zoder/config.toml escalation ladder; codex jobs always get
+it), runs the driving tool inside it, and reports the result. Normal zeroclaw
+jobs use the host's ~/.zoder/config.toml escalation ladder. Strict rescue
+jobs pin an exact local/EIH route allowlist; codex jobs always get
 `codex exec -m $CODEX_MODEL` -- a single fixed rung set per host via env,
-NOT negotiated per job. required_capabilities is not consulted for model
-choice; if per-job model escalation is wanted later, it needs to be added
-here explicitly, not assumed.
+NOT negotiated per job.
 
 Env:
   HIVE_URL            default http://192.168.207.67:5005
   AGENT_HOST          default hostname -s
+  HIVE_WORKER_SLOT    stable per-host worker slot (default 1)
   WORKER_KIND         "zeroclaw" or "codex" (required)
   POLL_INTERVAL       seconds between /v1/jobs/next polls (default 5)
   HEARTBEAT_INTERVAL  seconds (default 20)
@@ -312,14 +311,15 @@ def register() -> None:
         "runtime": WORKER_KIND,
         "kind": WORKER_KIND,
         "host": AGENT_HOST,
+        "instance": f"hive-worker-{WORKER_KIND}-{os.environ.get('HIVE_WORKER_SLOT', '1')}",
         "pid": os.getpid(),
         "model": "zoder" if WORKER_KIND == "zeroclaw" else CODEX_MODEL,
         "provider": "local",
         "autonomy_level": "autonomous",
         "capabilities": caps,
         "version": "hive_worker.py/2",
-        # Each process gets a UUID-backed URN from the bus. The systemd slot
-        # is only an operator-facing label; job UUIDs isolate workspaces.
+        # The stable slot lets the bus replace stale registrations on restart;
+        # job UUIDs still isolate workspaces.
         "metadata": {
             "driver": WORKER_KIND,
             "workspace_root": WORKSPACE_ROOT,
