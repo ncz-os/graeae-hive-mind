@@ -48,6 +48,7 @@ actually appears in the live catalog.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -61,6 +62,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 
 def _find_driver(name: str) -> str:
@@ -113,6 +115,100 @@ def _driver_supports_verified_delivery(driver: str) -> bool:
     return result.returncode == 0 and all(flag in output for flag in required)
 
 
+def load_strict_routes():
+    """Consume the pinned FleetOps validator; never guess an unready role."""
+    def require(cond, msg="strict role readiness unavailable"):
+        if not cond:
+            raise ValueError(msg)
+
+    try:
+        manifest = Path(
+            os.environ.get("HIVE_STRICT_ROLE_CONFIG", "~/.zoder/role-readiness.json")
+        ).expanduser()
+        vpath = Path(
+            os.environ.get("HIVE_STRICT_ROLE_VALIDATOR", "~/.zoder/role_readiness.py")
+        ).expanduser()
+        require(vpath.is_file(), "validator missing")
+        with vpath.open("rb") as stream:
+            raw = stream.read(65537)
+        require(len(raw) <= 65536, "validator size")
+        sha = os.environ.get("HIVE_STRICT_ROLE_VALIDATOR_SHA256", "")
+        require(
+            re.fullmatch(r"[0-9a-f]{64}", sha)
+            and hashlib.sha256(raw).hexdigest() == sha,
+            "sha mismatch",
+        )
+        proc = subprocess.run(
+            [sys.executable, "-", "--manifest", str(manifest), "--json"],
+            input=raw,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        require(proc.returncode == 0, "nonzero exit")
+        out = proc.stdout
+        require(len(out) <= 16384, "stdout too large")
+        data = json.loads(out)
+        require(isinstance(data, dict), "bad json")
+        require(
+            set(data.keys())
+            == {"schema_version", "coder", "reviewer", "secondary", "eih_reviewers"},
+            "keys mismatch",
+        )
+        require(
+            type(data["schema_version"]) is int and data["schema_version"] == 1,
+            "schema version",
+        )
+        coder = data["coder"]
+        require(
+            coder
+            == {
+                "provider_id": "tydeus-coder",
+                "model_id": "qwen38",
+                "base_url": "http://192.168.207.73:8006/v1",
+            },
+            "coder mismatch",
+        )
+        reviewer = data["reviewer"]
+        require(isinstance(reviewer, dict), "reviewer dict")
+        require(reviewer.get("provider_id") == "cerberus-reviewer", "reviewer provider")
+        model = reviewer.get("model_id", "")
+        require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", model), "reviewer model")
+        secondary = data["secondary"]
+        eih = data["eih_reviewers"]
+        require(isinstance(eih, list) and 1 <= len(eih) <= 16, "eih count")
+        seen = set()
+        for r in eih:
+            require(isinstance(r, dict), "eih dict")
+            require(r.get("provider_id") == "nvidia-eih", "eih provider")
+            require(
+                r.get("base_url") == "https://integrate.api.nvidia.com/v1", "eih base"
+            )
+            m = r.get("model_id", "")
+            require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", m), "eih model")
+            key = (r["provider_id"], m)
+            require(key not in seen, "eih dup")
+            seen.add(key)
+        require(secondary in eih, "secondary not in pool")
+        author = "qwen38"
+        rev_model = model
+        author_pair = f"tydeus-coder={author}"
+        gemma_pair = f"cerberus-reviewer={rev_model}"
+        eih_pairs = [f"nvidia-eih={r['model_id']}" for r in eih]
+        allowed = ",".join([author_pair, gemma_pair] + eih_pairs)
+        rev_allowed = ",".join([gemma_pair] + eih_pairs)
+        rev_pool = ",".join(eih_pairs)
+        return {
+            "author": author,
+            "reviewer": rev_model,
+            "allowed_routes": allowed,
+            "reviewer_allowed_routes": rev_allowed,
+            "reviewer_pool_routes": rev_pool,
+        }
+    except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError):
+        raise ValueError("strict role readiness unavailable") from None
+
+
 def _driver_supports_strict_routes(driver: str) -> bool:
     try:
         result = subprocess.run(
@@ -125,7 +221,16 @@ def _driver_supports_strict_routes(driver: str) -> bool:
         )
     except (OSError, subprocess.SubprocessError):
         return False
-    return result.returncode == 0 and "--allowed-routes" in (result.stdout or "")
+    out = result.stdout or ""
+    flags = set(re.findall(r"--[a-z][a-z0-9-]*", out))
+    return result.returncode == 0 and all(
+        f in flags
+        for f in [
+            "--allowed-routes",
+            "--reviewer-allowed-routes",
+            "--reviewer-pool-routes",
+        ]
+    )
 
 
 HIVE_URL = os.environ.get("HIVE_URL", "http://192.168.207.67:5005")
@@ -168,10 +273,6 @@ ZODER_AGENT = os.environ.get("HIVE_ZODER_AGENT") or os.environ.get("ZODER_AGENT"
 # author.
 ZODER_REVIEWER = os.environ.get("HIVE_ZODER_REVIEWER") or os.environ.get(
     "ZODER_REVIEWER", ""
-)
-RESCUE_ALLOWED_ROUTES = (
-    "tydeus-coder=nemotron35,tydeus-reviewer=qwen38,"
-    "nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b"
 )
 
 # ARGONAS canonical bare repos. Extend as needed -- a job whose `repo` field
@@ -306,7 +407,11 @@ def register() -> None:
         "verified-git-delivery",
     ]
     if WORKER_KIND == "zeroclaw" and _driver_supports_strict_routes(driver):
-        caps.append("strict-rescue-routes")
+        try:
+            load_strict_routes()
+            caps.append("strict-rescue-routes")
+        except ValueError:
+            pass
     body = {
         "runtime": WORKER_KIND,
         "kind": WORKER_KIND,
@@ -679,17 +784,31 @@ def _run_job_inner(job: dict) -> None:
         strict_rescue = "hard:strict-rescue-routes" in (
             job.get("required_capabilities") or []
         )
-        if strict_rescue and not _driver_supports_strict_routes(_find_driver("zoder")):
-            patch_job(
-                job_id,
-                "failed",
-                {
-                    "via": "hive_worker",
-                    "error": "strict_route_driver_unavailable",
-                    "retryable": False,
-                },
-            )
-            return
+        if strict_rescue:
+            try:
+                routes = load_strict_routes()
+            except ValueError:
+                patch_job(
+                    job_id,
+                    "failed",
+                    {
+                        "via": "hive_worker",
+                        "error": "strict_role_readiness_unavailable",
+                        "retryable": False,
+                    },
+                )
+                return
+            if not _driver_supports_strict_routes(_find_driver("zoder")):
+                patch_job(
+                    job_id,
+                    "failed",
+                    {
+                        "via": "hive_worker",
+                        "error": "strict_route_driver_unavailable",
+                        "retryable": False,
+                    },
+                )
+                return
         # --loop-timeout must exceed --agent-timeout (the loop watchdog covers
         # author+check+review, not just the author turn) or zoder prints a
         # TIMEOUT WARNING on every single run -- harmless here (zoder proceeds
@@ -721,11 +840,15 @@ def _run_job_inner(job: dict) -> None:
         if strict_rescue:
             cmd += [
                 "-m",
-                "nemotron35",
+                routes["author"],
                 "--reviewer",
-                "qwen38",
+                routes["reviewer"],
                 "--allowed-routes",
-                RESCUE_ALLOWED_ROUTES,
+                routes["allowed_routes"],
+                "--reviewer-allowed-routes",
+                routes["reviewer_allowed_routes"],
+                "--reviewer-pool-routes",
+                routes["reviewer_pool_routes"],
             ]
         else:
             if ZODER_AGENT:
