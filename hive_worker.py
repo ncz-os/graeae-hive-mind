@@ -98,6 +98,8 @@ WORKSPACE_ROOT = os.path.expanduser(
 KEEP_WORKSPACE = os.environ.get("KEEP_WORKSPACE", "0") == "1"
 CODEX_MODEL = os.environ.get("CODEX_MODEL", "gpt-5.6-luna")
 CODEX_SANDBOX = os.environ.get("CODEX_SANDBOX", "danger-full-access")
+AUTO_RESTART = os.environ.get("HIVE_WORKER_AUTO_RESTART", "0") == "1"
+SOURCE_MTIME_NS = os.stat(__file__).st_mtime_ns
 # Optional per-host override for zeroclaw jobs. Unset by default -- bare
 # `zoder loop` (no --agent) is meant to defer entirely to that host's own
 # ~/.zoder/config.toml escalation ladder, per this worker's original design.
@@ -150,6 +152,54 @@ _urn: str = ""
 _running = True
 _current_job_id: str | None = None
 _claim_renewal_blocked_id: str | None = None
+
+
+def _cgroup_has_other_processes() -> bool:
+    """Keep a shared engine child alive even after this worker becomes idle."""
+    try:
+        with open("/proc/self/cgroup", encoding="ascii") as handle:
+            group = next(
+                line.split(":", 2)[2].strip()
+                for line in handle
+                if line.startswith("0::")
+            )
+        root = os.path.join("/sys/fs/cgroup", group.lstrip("/"))
+        if not os.path.isdir(root):
+            return True
+        seen = False
+
+        def _walk_error(error: OSError) -> None:
+            raise error
+
+        for directory, _, filenames in os.walk(root, onerror=_walk_error):
+            if "cgroup.procs" not in filenames:
+                continue
+            seen = True
+            with open(
+                os.path.join(directory, "cgroup.procs"), encoding="ascii"
+            ) as handle:
+                if any(int(pid) != os.getpid() for pid in handle.read().split()):
+                    return True
+        return not seen
+    except (OSError, StopIteration, ValueError):
+        # Unknown cgroup layout: defer the restart rather than risk its children.
+        return True
+
+
+def restart_after_source_update() -> None:
+    """Exit only between claims; systemd then loads the installed revision."""
+    if not AUTO_RESTART:
+        return
+    try:
+        changed = os.stat(__file__).st_mtime_ns != SOURCE_MTIME_NS
+    except OSError:
+        return
+    if changed and not _cgroup_has_other_processes():
+        print(
+            f"[hive-worker:{WORKER_KIND}] source updated; restarting while idle",
+            flush=True,
+        )
+        raise SystemExit(75)
 
 
 def _signal(signum, frame):
@@ -703,6 +753,7 @@ def main() -> None:
     threading.Thread(target=heartbeat_loop, daemon=True).start()
     print(f"[hive-worker:{WORKER_KIND}] polling {HIVE_URL} as {_urn}", flush=True)
     while _running:
+        restart_after_source_update()
         code, job = _http("POST", f"/v1/jobs/next?agent_urn={_urn}", timeout=10)
         if code == 200 and job:
             run_job(job)

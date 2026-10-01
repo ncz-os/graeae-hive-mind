@@ -8,6 +8,7 @@ Type=simple
 User=jasonperlow
 WorkingDirectory=/home/jasonperlow
 Environment=WORKER_KIND=codex
+Environment=HIVE_WORKER_AUTO_RESTART=1
 Environment=HIVE_URL=http://192.168.207.67:5005
 EnvironmentFile=-/etc/hive-worker-env
 ExecStart=/usr/bin/python3 /opt/graeae/hive_worker.py

@@ -8,6 +8,7 @@ Type=simple
 User=jasonperlow
 WorkingDirectory=/home/jasonperlow
 Environment=WORKER_KIND=zeroclaw
+Environment=HIVE_WORKER_AUTO_RESTART=1
 Environment=HIVE_WORKER_SLOT=%i
 Environment=HIVE_URL=http://192.168.207.67:5005
 EnvironmentFile=-/etc/hive-worker-env

@@ -8,6 +8,7 @@ Type=simple
 User=root
 WorkingDirectory=/root
 Environment=WORKER_KIND=codex
+Environment=HIVE_WORKER_AUTO_RESTART=1
 Environment=HIVE_URL=http://192.168.207.67:5005
 ExecStart=/usr/bin/python3 /opt/graeae/hive_worker.py
 Restart=on-failure

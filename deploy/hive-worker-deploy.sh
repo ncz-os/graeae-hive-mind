@@ -1,8 +1,9 @@
 #!/bin/sh
 # hive-worker-deploy — GitOps reconcile for hive_worker.py + its systemd units.
 # POSIX sh. Runs as root. Idempotent: pulls the pinned graeae-hive ref, installs
-# hive_worker.py + the zeroclaw/codex unit files only if changed, restarts only
-# the units whose script or unit file changed. Sibling to zeroclaw-deploy.sh
+# hive_worker.py + the zeroclaw/codex unit files only if changed. Active units
+# drain their current job and restart themselves before claiming another.
+# Sibling to zeroclaw-deploy.sh
 # (gitops/zeroclaw/deploy.sh) but for the thin claim/execute worker introduced
 # 2026-09-14 to replace the zc-gateway/zc-worker@ stack (GRAEAE architecture
 # consult, 7-muse consensus 0.95) -- kept as a SEPARATE script rather than
@@ -187,21 +188,28 @@ fi
 
 if [ -n "$CHANGED" ]; then
   if [ "$DRY_RUN" = 1 ]; then
-    log "DRY-RUN: would reload+restart for:$CHANGED"
+    log "DRY-RUN: would reload and defer active worker upgrades for:$CHANGED"
     exit 0
   fi
   systemctl daemon-reload
+  # A unit-only change must also notify a running worker. Its next idle poll
+  # detects the source mtime and exits after checking for shared child engines.
+  # A script install already changed the mtime.
+  case " $CHANGED " in
+    *" script "*) ;;
+    *) touch "$SCRIPT_DST" ;;
+  esac
   if [ "$FANOUT_ONLY" != 1 ]; then
     for KIND in $KINDS; do
       UNIT="hive-worker-$KIND.service"
+      # enable --now starts an inactive unit but does not restart an active one.
       systemctl enable --now "$UNIT"
-      case " $CHANGED " in
-        *" script "*|*" $UNIT "*) systemctl restart "$UNIT"; log "restarted $UNIT" ;;
-      esac
     done
   else
     log "fanout-only: singleton service operations deferred"
   fi
+  log "active workers will reload after their current job and shared child engines exit"
+  log "first migration: idle-restart workers started before HIVE_WORKER_AUTO_RESTART=1"
 else
   log "no changes"
 fi

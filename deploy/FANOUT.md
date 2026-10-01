@@ -8,9 +8,15 @@ Hive agent URN and uses the job UUID as its workspace directory. Root hosts
 use the corresponding `hive-worker-zeroclaw-root@.service` source template;
 the deployed unit name is the same `hive-worker-zeroclaw@N.service`.
 
-Run `hive-worker-deploy.sh --fanout-only` when adding slots while a singleton
-worker is busy. This installs the configured worker script and units but does
-not restart the singleton. The regular reconcile maintains the slots afterward.
+The periodic deploy installs the configured worker script and units without
+restarting an active worker. A worker checks the installed source before each
+claim and exits for systemd to relaunch it after its current job completes.
+It defers this exit while a model engine or other process remains in its
+service cgroup. Unit-only changes update the source timestamp to trigger the
+same drain. `--fanout-only` continues to defer singleton enable/start while
+adding slots. Workers started before the `HIVE_WORKER_AUTO_RESTART=1` unit
+setting need one explicit idle restart during the first migration; the timer
+does not interrupt them.
 
 Four processes provide claim capacity, not permission to edit overlapping
 source. Submit concurrent code jobs on isolated branches with separate file
