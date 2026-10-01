@@ -73,9 +73,21 @@ class WorkspaceRetentionTests(unittest.TestCase):
             ):
                 worker._run_job_inner(JOB)
                 command = driver.call_args.args[0]
-                self.assertIn("--require-approval", command)
-                self.assertEqual(command[command.index("--approve") + 1], "all")
+                if worker.WORKER_KIND == "zeroclaw":
+                    self.assertIn("--require-approval", command)
+                    self.assertEqual(command[command.index("--approve") + 1], "all")
+                else:
+                    self.assertEqual(
+                        command[command.index("--sandbox") + 1], worker.CODEX_SANDBOX
+                    )
+                    self.assertIn('approval_policy="never"', command)
             return checkout.exists(), patch_status.call_args.args[2]
+
+    def test_codex_uses_explicit_fleet_sandbox_policy(self):
+        with patch.object(worker, "WORKER_KIND", "codex"):
+            exists, result = self._run_driver(0, True)
+        self.assertTrue(exists)
+        self.assertIn("workspace_preserved", result)
 
     def test_failed_driver_preserves_workspace(self):
         exists, result = self._run_driver(1, True)

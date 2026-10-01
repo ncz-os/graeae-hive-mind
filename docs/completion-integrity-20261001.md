@@ -4,6 +4,11 @@
 
 - Worker invocations omitted `--approve all`; zoder defaults to read-only tool
   approval. Autonomous implementation requires explicit write/shell approval.
+- Bare `codex exec` inherited read-only sandbox configuration on HYDRA. Its
+  actual canary reported Git, docs, network and SSH access denied, then exited 0.
+  Trusted fleet coding workers now select `CODEX_SANDBOX` explicitly (default
+  `danger-full-access`) and noninteractive approval policy; restricted hosts can
+  select another Codex sandbox. Delivery proof still determines completion.
 
 - Worker success was the process return code; it did not inspect Git delivery.
 - The bus checked a worker-supplied result kind absent from real worker results,

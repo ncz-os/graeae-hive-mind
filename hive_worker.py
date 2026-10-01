@@ -30,6 +30,7 @@ Env:
   WORKSPACE_ROOT       default ~/hive-workspaces
   KEEP_WORKSPACE      if "1", don't rm -rf the per-job clone after (debug)
   CODEX_MODEL         default gpt-5.6-luna (see note below)
+  CODEX_SANDBOX       default danger-full-access for trusted fleet coding jobs
 
 CODEX_MODEL note (2026-09-15): the escalation ladder's documented default
 rung is gpt-5.3-codex-spark, but this account's live codex model catalog
@@ -93,6 +94,7 @@ WORKSPACE_ROOT = os.path.expanduser(
 )
 KEEP_WORKSPACE = os.environ.get("KEEP_WORKSPACE", "0") == "1"
 CODEX_MODEL = os.environ.get("CODEX_MODEL", "gpt-5.6-luna")
+CODEX_SANDBOX = os.environ.get("CODEX_SANDBOX", "danger-full-access")
 # Optional per-host override for zeroclaw jobs. Unset by default -- bare
 # `zoder loop` (no --agent) is meant to defer entirely to that host's own
 # ~/.zoder/config.toml escalation ladder, per this worker's original design.
@@ -542,6 +544,10 @@ def _run_job_inner(job: dict) -> None:
         cmd = [
             _find_driver("codex"),
             "exec",
+            "--sandbox",
+            CODEX_SANDBOX,
+            "-c",
+            'approval_policy="never"',
             "--skip-git-repo-check",
             "-m",
             CODEX_MODEL,
