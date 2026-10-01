@@ -197,6 +197,23 @@ def heartbeat_loop() -> None:
         time.sleep(HEARTBEAT_INTERVAL)
         if not _urn:
             continue
+        # Renew the same job claim via PATCH at each heartbeat so the reaper
+        # never expires it while we're still working.  Do not replace the result.
+        if _current_job_id:
+            try:
+                code, _ = _http(
+                    "PATCH",
+                    f"/v1/jobs/{_current_job_id}",
+                    {"status": "claimed", "claimed_by": _urn},
+                    timeout=15,
+                )
+                if code not in (200, 204):
+                    # 403 = claimed_by mismatch (someone else claimed it),
+                    # 409 = conflict — both normal during concurrent access
+                    print(f"[hive-worker:{WORKER_KIND}] heartbeat PATCH job {_current_job_id} code={code}", flush=True)
+            except Exception as e:
+                print(f"[hive-worker:{WORKER_KIND}] heartbeat PATCH error for {_current_job_id}: {e}", flush=True)
+        # Agent heartbeat (keeps the agent session alive)
         _http("POST", "/v1/agents/heartbeat", {
             "urn": _urn,
             "metadata": {"current_job": _current_job_id},
