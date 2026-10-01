@@ -588,20 +588,20 @@ class WorkerAndRestoreDefectTests(unittest.TestCase):
         self.assertIsNotNone(worker.register())
         self.assertIn("codex", captured["capabilities"])
 
-    def test_auto_restore_uses_admin_requeue_results(self):
+    def test_auto_restore_uses_guarded_admin_retry_results(self):
         restore = _load_script("hive_auto_restore_for_test", "hive-auto-restore.py")
         captured = {}
 
         def fake_http(method, path, body=None, timeout=0, *, admin=False):
             captured.update(method=method, path=path, body=body, admin=admin)
-            return 200, {"ok": ["job-1"], "not_found": [], "skipped_done": ["job-2"]}
+            return (200, {"ok": True}) if "job-1" in path else (409, {"detail": "held"})
 
         restore._http = fake_http
         restored, error = restore.restore_jobs(["job-1", "job-2"])
-        self.assertEqual(restored, {"job-1": "ok", "job-2": "skipped_done"})
+        self.assertEqual(restored, {"job-1": "ok", "job-2": "skipped_policy"})
         self.assertEqual(error, "")
         self.assertEqual(captured["method"], "POST")
-        self.assertEqual(captured["path"], "/v1/admin/jobs/requeue")
+        self.assertEqual(captured["path"], "/v1/jobs/job-2/auto-retry")
         self.assertTrue(captured["admin"])
 
     def test_auto_restore_fetch_failure_is_not_an_empty_success(self):
@@ -613,7 +613,7 @@ class WorkerAndRestoreDefectTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "missing field 'jobs'"):
             restore.fetch_failed_jobs()
 
-    def test_auto_restore_omits_job_results(self):
+    def test_auto_restore_fetches_results_for_hold_policy(self):
         restore = _load_script("hive_auto_restore_projection_test", "hive-auto-restore.py")
         captured = {}
 
@@ -623,7 +623,7 @@ class WorkerAndRestoreDefectTests(unittest.TestCase):
 
         restore._http = fake_http
         self.assertEqual(restore.fetch_failed_jobs(), [])
-        self.assertIn("include_result=false", captured["path"])
+        self.assertIn("include_result=true", captured["path"])
 
     def test_goose_uses_files_and_returns_bounded_output_tails(self):
         worker = _load_script("goose_worker_output_test", "goose_worker.py")
@@ -692,6 +692,8 @@ class WorkerAndRestoreDefectTests(unittest.TestCase):
         restore.save_state = lambda state: None
         restore.fetch_failed_jobs = lambda: [{
             "id": "job-restore", "kind": "build", "ended_at": 0,
+            "status": "failed", "max_retries": 3, "retry_count": 0,
+            "result": {"retryable": True},
         }]
         restore.restore_jobs = lambda job_ids: ({}, "http=401")
         self.assertEqual(restore.main(), 1)
