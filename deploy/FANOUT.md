@@ -18,6 +18,10 @@ adding slots. Workers started before the `HIVE_WORKER_AUTO_RESTART=1` unit
 setting need one explicit idle restart during the first migration; the timer
 does not interrupt them.
 
+New source-delivery jobs should require
+`hard:verified-git-delivery`. Worker version `hive_worker.py/2` advertises that
+capability; earlier processes cannot claim such jobs while hosts migrate.
+
 Four processes provide claim capacity, not permission to edit overlapping
 source. Submit concurrent code jobs on isolated branches with separate file
 scopes; sequence jobs that may edit the same files or branch. Keep ARGOS's

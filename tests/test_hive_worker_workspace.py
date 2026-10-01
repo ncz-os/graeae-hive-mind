@@ -12,6 +12,7 @@ from unittest.mock import patch
 os.environ["WORKER_KIND"] = "zeroclaw"
 
 import hive_worker as worker
+from queue_logic import match
 
 JOB_ID = "00000000-0000-0000-0000-000000000001"
 JOB = {"id": JOB_ID, "repo": "graeae-hive", "description": "workspace retention test"}
@@ -26,6 +27,23 @@ class _Driver:
 
 
 class WorkspaceRetentionTests(unittest.TestCase):
+    def test_registration_advertises_verified_delivery_version(self):
+        with (
+            patch.object(worker, "_find_driver", return_value="/usr/bin/zoder"),
+            patch.object(worker.os.path, "isfile", return_value=True),
+            patch.object(worker.os, "access", return_value=True),
+            patch.object(
+                worker, "_http", return_value=(200, {"urn": "urn:test"})
+            ) as http,
+        ):
+            worker.register()
+        body = http.call_args.args[2]
+        self.assertIn("verified-git-delivery", body["capabilities"])
+        self.assertEqual(body["version"], "hive_worker.py/2")
+        required = ["hard:verified-git-delivery"]
+        self.assertFalse(match(required, ["python", "git", "zeroclaw"]).eligible)
+        self.assertTrue(match(required, body["capabilities"]).eligible)
+
     def test_missing_driver_never_advertises_worker_capability(self):
         with (
             patch.object(worker, "_find_driver", return_value="/does/not/exist"),

@@ -245,7 +245,14 @@ def register() -> None:
             flush=True,
         )
         raise SystemExit(2)
-    caps = ["python", "git", "bash", "linux-compile", WORKER_KIND]
+    caps = [
+        "python",
+        "git",
+        "bash",
+        "linux-compile",
+        WORKER_KIND,
+        "verified-git-delivery",
+    ]
     body = {
         "runtime": WORKER_KIND,
         "kind": WORKER_KIND,
@@ -255,7 +262,7 @@ def register() -> None:
         "provider": "local",
         "autonomy_level": "autonomous",
         "capabilities": caps,
-        "version": "hive_worker.py/1",
+        "version": "hive_worker.py/2",
         # Each process gets a UUID-backed URN from the bus. The systemd slot
         # is only an operator-facing label; job UUIDs isolate workspaces.
         "metadata": {

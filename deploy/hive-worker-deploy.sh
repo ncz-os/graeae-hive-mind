@@ -84,7 +84,12 @@ REPO_SELF="$REPO/deploy/hive-worker-deploy.sh"
 if [ -f "$REPO_SELF" ] && [ -f "$SELF" ] && ! cmp -s "$REPO_SELF" "$SELF"; then
   log "self-update: $SELF changed, installing and re-execing"
   if [ "$DRY_RUN" != 1 ]; then
-    install -m 0755 "$REPO_SELF" "$SELF"
+    # Never truncate the script inode this running shell is still reading.
+    SELF_TMP="$SELF.$$.new"
+    trap 'rm -f "$SELF_TMP"' 0 1 2 3 15
+    install -m 0755 "$REPO_SELF" "$SELF_TMP"
+    mv -f "$SELF_TMP" "$SELF"
+    trap - 0 1 2 3 15
     exec "$SELF" "$@"
   fi
 fi
