@@ -171,7 +171,8 @@ ZODER_REVIEWER = os.environ.get("HIVE_ZODER_REVIEWER") or os.environ.get(
     "ZODER_REVIEWER", ""
 )
 RESCUE_ALLOWED_ROUTES = (
-    "tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b"
+    "tydeus-coder=nemotron35,tydeus-reviewer=qwen38,"
+    "nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b"
 )
 
 # ARGONAS canonical bare repos. Extend as needed -- a job whose `repo` field
@@ -719,10 +720,10 @@ def _run_job_inner(job: dict) -> None:
         ]
         if strict_rescue:
             cmd += [
-                "-m",
-                "qwen38",
+                "--agent",
+                "coder",
                 "--reviewer",
-                "nvidia/nemotron-3-ultra-550b-a55b",
+                "qwen38",
                 "--allowed-routes",
                 RESCUE_ALLOWED_ROUTES,
             ]
