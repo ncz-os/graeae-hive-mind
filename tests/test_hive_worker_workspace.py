@@ -1,7 +1,9 @@
 """A failed or unrecorded job must leave its checkout available for rescue."""
 
 import os
+import shlex
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -34,7 +36,7 @@ class WorkspaceRetentionTests(unittest.TestCase):
             http.assert_not_called()
 
     def test_existing_workspace_is_never_erased_on_reclaim(self):
-        with tempfile.TemporaryDirectory() as root:
+        with tempfile.TemporaryDirectory(prefix="hive workspace '") as root:
             checkout = Path(root, JOB_ID)
             checkout.mkdir()
             (checkout / "unfinished.patch").write_text("rescue me")
@@ -52,18 +54,20 @@ class WorkspaceRetentionTests(unittest.TestCase):
             )
 
     def _run_driver(self, exit_code, recorded):
-        with tempfile.TemporaryDirectory() as root:
+        with tempfile.TemporaryDirectory(prefix="hive workspace '") as root:
             checkout = Path(root, JOB_ID)
 
             def clone(cmd, **kwargs):
-                Path(cmd[-1]).mkdir()
+                if cmd[1] == "clone":
+                    Path(cmd[-1]).mkdir()
 
             with (
                 patch.object(worker, "WORKSPACE_ROOT", root),
                 patch.object(worker, "KEEP_WORKSPACE", False),
+                patch.dict(os.environ, {"GIT_FLEET_SSH_PASSWORD": "test-not-a-secret"}),
                 patch.object(worker.subprocess, "check_output", return_value="a" * 40),
                 patch.object(worker, "completion_evidence", return_value={}),
-                patch.object(worker.subprocess, "run", side_effect=clone),
+                patch.object(worker.subprocess, "run", side_effect=clone) as git_runs,
                 patch.object(
                     worker.subprocess, "Popen", return_value=_Driver(exit_code)
                 ) as driver,
@@ -72,10 +76,30 @@ class WorkspaceRetentionTests(unittest.TestCase):
                 ) as patch_status,
             ):
                 worker._run_job_inner(JOB)
+                self.assertEqual(
+                    [call.args[0][4:6] for call in git_runs.call_args_list[1:]],
+                    [["--local", "user.name"], ["--local", "user.email"]],
+                )
                 command = driver.call_args.args[0]
+                driver_env = driver.call_args.kwargs["env"]
+                self.assertEqual(driver_env["SSHPASS"], "test-not-a-secret")
+                self.assertIn("sshpass -e", driver_env["GIT_SSH_COMMAND"])
+                self.assertNotIn("test-not-a-secret", driver_env["GIT_SSH_COMMAND"])
                 if worker.WORKER_KIND == "zeroclaw":
                     self.assertIn("--require-approval", command)
                     self.assertEqual(command[command.index("--approve") + 1], "all")
+                    self.assertEqual(
+                        shlex.split(command[command.index("--check") + 1]),
+                        [
+                            sys.executable,
+                            os.path.abspath(worker.__file__),
+                            "--verify-delivery",
+                            str(checkout),
+                            "a" * 40,
+                        ],
+                    )
+                    self.assertIn("checkout a dedicated branch", command[3])
+                    self.assertIn("explicit job-specific restriction", command[3])
                 else:
                     self.assertEqual(
                         command[command.index("--sandbox") + 1], worker.CODEX_SANDBOX

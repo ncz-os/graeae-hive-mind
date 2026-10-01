@@ -31,6 +31,8 @@ Env:
   KEEP_WORKSPACE      if "1", don't rm -rf the per-job clone after (debug)
   CODEX_MODEL         default gpt-5.6-luna (see note below)
   CODEX_SANDBOX       default danger-full-access for trusted fleet coding jobs
+  HIVE_GIT_AUTHOR_NAME   repo-local identity, default Jason Perlow
+  HIVE_GIT_AUTHOR_EMAIL  repo-local identity, default jperlow@gmail.com
 
 CODEX_MODEL note (2026-09-15): the escalation ladder's documented default
 rung is gpt-5.3-codex-spark, but this account's live codex model catalog
@@ -50,6 +52,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -122,10 +125,6 @@ ZODER_AGENT = os.environ.get("HIVE_ZODER_AGENT") or os.environ.get("ZODER_AGENT"
 ZODER_REVIEWER = os.environ.get("HIVE_ZODER_REVIEWER") or os.environ.get(
     "ZODER_REVIEWER", ""
 )
-
-if WORKER_KIND not in ("zeroclaw", "codex"):
-    print("[hive-worker] WORKER_KIND must be 'zeroclaw' or 'codex'", file=sys.stderr)
-    sys.exit(1)
 
 # ARGONAS canonical bare repos. Extend as needed -- a job whose `repo` field
 # isn't a URL and isn't in this map gets DECLINED, never guessed at.
@@ -380,6 +379,48 @@ def completion_ready(evidence: dict) -> bool:
     )
 
 
+def verify_delivery(workdir: str, baseline: str) -> int:
+    """Return bounded, actionable evidence to zoder's check/fix loop."""
+    evidence = completion_evidence(workdir, baseline, os.environ.copy())
+    ready = completion_ready(evidence)
+    # Lists and paths can grow without bound; neither Git stderr nor remote URLs
+    # belong in model-visible output (they can contain credentials).
+    report = {
+        "delivery_ready": ready,
+        "commit_count": len(evidence["commits"]),
+        "changed_file_count": len(evidence["files_changed"]),
+        "files_changed": [p[:240] for p in evidence["files_changed"][:20]],
+        "worktree_clean": evidence["worktree_clean"],
+        "remote_verified": evidence["remote_verified"],
+        "verification_error": evidence.get("verification_error"),
+        "required": (
+            "Delivery verified."
+            if ready
+            else "Checkout a dedicated branch; commit legitimate task changes with "
+            "the configured Git identity; push with upstream tracking; leave a clean "
+            "worktree and remote HEAD matching local HEAD. Respect explicit job "
+            "restrictions; report blockers instead of inventing edits."
+        ),
+    }
+    print(json.dumps(report, ensure_ascii=True))
+    return 0 if ready else 1
+
+
+def configure_git_identity(workdir: str, env: dict) -> None:
+    """Supply the authorized fleet identity even on hosts without global config."""
+    for key, value in (
+        ("user.name", env.get("HIVE_GIT_AUTHOR_NAME") or "Jason Perlow"),
+        ("user.email", env.get("HIVE_GIT_AUTHOR_EMAIL") or "jperlow@gmail.com"),
+    ):
+        subprocess.run(
+            ["git", "-C", workdir, "config", "--local", key, value],
+            check=True,
+            timeout=30,
+            env=env,
+            capture_output=True,
+        )
+
+
 def run_job(job: dict) -> None:
     """Guarantees a terminal disposition (patch or release) for every claimed
     job, even on an exception type we didn't anticipate (codex review
@@ -477,8 +518,9 @@ def _run_job_inner(job: dict) -> None:
         clone_env["HIVE_PARENT_JOB_ID"] = job["parent_job_id"]
     fleet_pw = os.environ.get("GIT_FLEET_SSH_PASSWORD")
     if fleet_pw and repo_url.startswith("ssh://root@"):
+        clone_env["SSHPASS"] = fleet_pw
         clone_env["GIT_SSH_COMMAND"] = (
-            f"sshpass -p {fleet_pw!r} ssh -o PubkeyAuthentication=no "
+            "sshpass -e ssh -o PubkeyAuthentication=no "
             "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
         )
     try:
@@ -500,13 +542,17 @@ def _run_job_inner(job: dict) -> None:
         patch_job(job_id, "failed", result)
         return
 
+    configure_git_identity(workdir, clone_env)
     baseline = subprocess.check_output(
         ["git", "-C", workdir, "rev-parse", "HEAD"], text=True, timeout=30
     ).strip()
     description += (
         "\n\nDelivery policy: commit the task's legitimate changes using explicit paths, "
         "including documentation or tests when those are the requested deliverables, "
-        "and push a dedicated branch with upstream tracking. Verify clean status and "
+        "and checkout a dedicated branch (creating a branch alone does not switch "
+        "HEAD). Push that checked-out branch with upstream tracking. Keep the "
+        "configured repository Git author identity; do not invent or override it. "
+        "Verify clean status and "
         "remote SHA. Only an explicit job-specific restriction overrides this policy. "
         "Never manufacture edits just to satisfy completion. If blocked, report why."
     )
@@ -531,6 +577,16 @@ def _run_job_inner(job: dict) -> None:
             "--require-approval",
             "--approve",
             "all",
+            "--check",
+            shlex.join(
+                [
+                    sys.executable,
+                    os.path.abspath(__file__),
+                    "--verify-delivery",
+                    workdir,
+                    baseline,
+                ]
+            ),
             "--agent-timeout",
             str(JOB_TIMEOUT),
             "--loop-timeout",
@@ -638,6 +694,11 @@ def _run_job_inner(job: dict) -> None:
 
 
 def main() -> None:
+    if WORKER_KIND not in ("zeroclaw", "codex"):
+        print(
+            "[hive-worker] WORKER_KIND must be 'zeroclaw' or 'codex'", file=sys.stderr
+        )
+        raise SystemExit(1)
     register()
     threading.Thread(target=heartbeat_loop, daemon=True).start()
     print(f"[hive-worker:{WORKER_KIND}] polling {HIVE_URL} as {_urn}", flush=True)
@@ -654,4 +715,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:2] == ["--verify-delivery"]:
+        if len(sys.argv) != 4:
+            print(json.dumps({"error": "usage: --verify-delivery WORKDIR BASELINE"}))
+            raise SystemExit(2)
+        raise SystemExit(verify_delivery(sys.argv[2], sys.argv[3]))
+    else:
+        main()

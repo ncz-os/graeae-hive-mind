@@ -29,6 +29,17 @@ not `done`. Checkouts remain available for recovery after every outcome. The bus
 uses its stored job kind and rejects missing proof with HTTP 409, preventing old
 workers from treating rejection as successful recording and deleting work.
 
+Fresh clones set repository-local Git identity to Jason Perlow
+`<jperlow@gmail.com>`; `HIVE_GIT_AUTHOR_NAME` and `HIVE_GIT_AUTHOR_EMAIL` provide
+explicit operator overrides. Agents must retain that identity and check out their
+delivery branch before committing and pushing with upstream tracking. The worker
+passes its standalone `--verify-delivery WORKDIR BASELINE` command as zoder's
+`--check`, allowing the loop to repair missing delivery before it returns. The
+check prints bounded JSON and succeeds only when the same completion evidence
+passes; explicit job restrictions still take precedence, and blocked/no-change
+tasks must not manufacture commits. Password fallback uses `SSHPASS` and
+`sshpass -e` so the password is absent from the SSH command arguments.
+
 Repository task results are not reused from the result cache. New zoder workers
 require explicit review approval. Job IDs enter the subprocess environment and,
 when MNEMOS is configured, prompts describe the ledger lookup/write commands.
