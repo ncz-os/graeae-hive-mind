@@ -185,7 +185,13 @@ def register() -> None:
         "autonomy_level": "autonomous",
         "capabilities": caps,
         "version": "hive_worker.py/1",
-        "metadata": {"driver": WORKER_KIND, "workspace_root": WORKSPACE_ROOT},
+        # Each process gets a UUID-backed URN from the bus. The systemd slot
+        # is only an operator-facing label; job UUIDs isolate workspaces.
+        "metadata": {
+            "driver": WORKER_KIND,
+            "workspace_root": WORKSPACE_ROOT,
+            "slot": os.environ.get("HIVE_WORKER_SLOT", "1"),
+        },
     }
     code, resp = _http("POST", "/v1/agents/register", body)
     if code == 200 and resp:

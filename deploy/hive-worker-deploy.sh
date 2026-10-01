@@ -10,7 +10,7 @@
 # manage the podman zeroclaw-stack image) doesn't apply here at all.
 #
 # Gate:   /etc/hive-worker-deploy.conf must set ENABLED=1 (default off = no-op).
-# Usage:  hive-worker-deploy.sh [--dry-run]
+# Usage:  hive-worker-deploy.sh [--dry-run] [--fanout-only]
 set -eu
 
 REPO=/var/lib/graeae-hive                          # git checkout of graeae-hive
@@ -22,7 +22,14 @@ DEPLOY_REF=${DEPLOY_REF:-wip/studio/2026-06-15-register-dedup}
 SOURCE=ssh://root@192.168.207.101/mnt/datapool/git/graeae-hive.git
 
 DRY_RUN=0
-[ "${1:-}" = "--dry-run" ] && DRY_RUN=1
+FANOUT_ONLY=0
+for ARG do
+  case "$ARG" in
+    --dry-run) DRY_RUN=1 ;;
+    --fanout-only) FANOUT_ONLY=1 ;;
+    *) echo "usage: $0 [--dry-run] [--fanout-only]" >&2; exit 2 ;;
+  esac
+done
 
 ENABLED=0
 GIT_FLEET_SSH_PASSWORD=""
@@ -87,10 +94,24 @@ if [ ! -f "$CONF" ]; then
 fi
 KINDS=""
 RUN_AS=""
+ZEROCLAW_FANOUT=1
 . "$CONF"
 if [ -z "$KINDS" ]; then
   log "hosts/$HOST/hive-worker.conf has no KINDS set; nothing to do"
   exit 0
+fi
+case "$ZEROCLAW_FANOUT" in
+  ''|*[!0-9]*) log "invalid ZEROCLAW_FANOUT=$ZEROCLAW_FANOUT"; exit 1 ;;
+esac
+if [ "$ZEROCLAW_FANOUT" -lt 1 ]; then
+  log "ZEROCLAW_FANOUT must be at least 1"
+  exit 1
+fi
+if [ "$ZEROCLAW_FANOUT" -gt 1 ]; then
+  case " $KINDS " in
+    *" zeroclaw "*) ;;
+    *) log "ZEROCLAW_FANOUT requires zeroclaw in KINDS"; exit 1 ;;
+  esac
 fi
 # RUN_AS=root selects the *-root.service template (User=root, WorkingDirectory=
 # /root) instead of the default jasonperlow one. Real bug this fixed, 2026-09-15:
@@ -132,6 +153,25 @@ for KIND in $KINDS; do
   fi
 done
 
+# Keep the existing singleton as slot 1. Additional systemd instances have
+# distinct agent URNs and job-ID workspaces, so a busy singleton is not
+# interrupted when capacity is added.
+if [ "$ZEROCLAW_FANOUT" -gt 1 ]; then
+  FANOUT_SRC="$REPO/systemd/hive-worker-zeroclaw$UNIT_SUFFIX@.service"
+  FANOUT_DST="$UNITDIR/hive-worker-zeroclaw@.service"
+  if [ ! -f "$FANOUT_SRC" ]; then
+    log "missing fanout unit $FANOUT_SRC"
+    exit 1
+  fi
+  if [ ! -f "$FANOUT_DST" ] || ! cmp -s "$FANOUT_SRC" "$FANOUT_DST"; then
+    log "changed: $FANOUT_DST"
+    if [ "$DRY_RUN" != 1 ]; then
+      install -m 0644 "$FANOUT_SRC" "$FANOUT_DST"
+    fi
+    CHANGED="$CHANGED fanout-template"
+  fi
+fi
+
 # Optional host-specific, non-secret route for the zeroclaw worker. Keep
 # credentials in /etc/hive-worker-env; this drop-in only pins reachable models.
 ROUTE_SRC="$REPO/hosts/$HOST/hive-worker-zeroclaw-route.conf"
@@ -151,13 +191,30 @@ if [ -n "$CHANGED" ]; then
     exit 0
   fi
   systemctl daemon-reload
-  for KIND in $KINDS; do
-    UNIT="hive-worker-$KIND.service"
-    systemctl enable --now "$UNIT"
-    case " $CHANGED " in
-      *" script "*|*" $UNIT "*) systemctl restart "$UNIT"; log "restarted $UNIT" ;;
-    esac
-  done
+  if [ "$FANOUT_ONLY" != 1 ]; then
+    for KIND in $KINDS; do
+      UNIT="hive-worker-$KIND.service"
+      systemctl enable --now "$UNIT"
+      case " $CHANGED " in
+        *" script "*|*" $UNIT "*) systemctl restart "$UNIT"; log "restarted $UNIT" ;;
+      esac
+    done
+  else
+    log "fanout-only: singleton service operations deferred"
+  fi
 else
   log "no changes"
+fi
+
+if [ "$ZEROCLAW_FANOUT" -gt 1 ]; then
+  SLOT=2
+  while [ "$SLOT" -le "$ZEROCLAW_FANOUT" ]; do
+    UNIT="hive-worker-zeroclaw@$SLOT.service"
+    if [ "$DRY_RUN" = 1 ]; then
+      log "DRY-RUN: would enable $UNIT"
+    else
+      systemctl enable --now "$UNIT"
+    fi
+    SLOT=$((SLOT + 1))
+  done
 fi
