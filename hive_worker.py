@@ -266,7 +266,7 @@ def resolve_repo_url(job: dict) -> str | None:
 _JOB_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 
-def patch_job(job_id: str, status: str, result: dict) -> None:
+def patch_job(job_id: str, status: str, result: dict) -> bool:
     # PATCH /v1/jobs/{id} requires claimed_by to match the job's current
     # claimant (agent_bus.py: "job update requires claimed_by to match the
     # current claimant") -- omitting it 403s every single call (found live
@@ -277,6 +277,7 @@ def patch_job(job_id: str, status: str, result: dict) -> None:
     if code != 200:
         print(f"[hive-worker:{WORKER_KIND}] WARNING: patch({job_id}, {status}) got code={code} -- "
               f"job may be stranded in claimed state", flush=True)
+    return code == 200
 
 
 def release_job(job_id: str, reason: str) -> None:
@@ -323,14 +324,28 @@ def _run_job_inner(job: dict) -> None:
 
     repo_url = resolve_repo_url(job)
     if not repo_url:
-        print(f"[hive-worker:{WORKER_KIND}] job {job_id} kind={kind!r}: no resolvable repo, declining", flush=True)
+        print(
+            f"[hive-worker:{WORKER_KIND}] job {job_id} kind={kind!r}: no resolvable repo, declining",
+            flush=True,
+        )
         release_job(job_id, "no_repo_mapping")
         return
 
     workdir = os.path.join(WORKSPACE_ROOT, job_id)
     os.makedirs(WORKSPACE_ROOT, exist_ok=True)
     if os.path.exists(workdir):
-        shutil.rmtree(workdir, ignore_errors=True)
+        # A restored claim may carry unfinished edits from an earlier run.
+        # Never erase those edits to make room for another clone.
+        patch_job(
+            job_id,
+            "failed",
+            {
+                "via": "hive_worker",
+                "error": "workspace_exists_needs_rescue",
+                "workspace_preserved": workdir,
+            },
+        )
+        return
 
     clone_cmd = ["git", "clone", "--quiet", repo_url, workdir]
     if head_branch:
@@ -364,12 +379,22 @@ def _run_job_inner(job: dict) -> None:
             "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
         )
     try:
-        subprocess.run(clone_cmd, check=True, timeout=300, env=clone_env,
-                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        subprocess.run(
+            clone_cmd,
+            check=True,
+            timeout=300,
+            env=clone_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
     except Exception as e:
-        print(f"[hive-worker:{WORKER_KIND}] job {job_id}: clone failed: {e}", flush=True)
-        patch_job(job_id, "failed", {"via": "hive_worker", "error": f"clone_failed: {e}"})
-        shutil.rmtree(workdir, ignore_errors=True)
+        print(
+            f"[hive-worker:{WORKER_KIND}] job {job_id}: clone failed: {e}", flush=True
+        )
+        result = {"via": "hive_worker", "error": f"clone_failed: {e}"}
+        if os.path.exists(workdir):
+            result["workspace_preserved"] = workdir
+        patch_job(job_id, "failed", result)
         return
 
     if WORKER_KIND == "zeroclaw":
@@ -406,10 +431,17 @@ def _run_job_inner(job: dict) -> None:
         # env=clone_env: the driver (zoder/codex) must be able to `git push` to the
         # same root@ARGONAS origin it was cloned from; the password-auth
         # GIT_SSH_COMMAND was previously set only for the clone, so pushes from
-        # inside the job failed and the workspace (deleted on exit) lost the work.
+        # inside the job failed and the workspace (formerly deleted on exit) lost the work.
         # No new exposure: GIT_FLEET_SSH_PASSWORD is already in this environment.
-        proc = subprocess.Popen(cmd, cwd=workdir, stdout=subprocess.PIPE, env=clone_env,
-                                 stderr=subprocess.STDOUT, text=True, start_new_session=True)
+        proc = subprocess.Popen(
+            cmd,
+            cwd=workdir,
+            stdout=subprocess.PIPE,
+            env=clone_env,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
         try:
             stdout, _ = proc.communicate(timeout=JOB_TIMEOUT)
             exit_code = proc.returncode
@@ -422,11 +454,20 @@ def _run_job_inner(job: dict) -> None:
             stdout, _ = proc.communicate()
             exit_code = -1
             tail = (stdout or "")[-4000:]
-            print(f"[hive-worker:{WORKER_KIND}] job {job_id}: TIMEOUT after {JOB_TIMEOUT}s, process group killed", flush=True)
+            print(
+                f"[hive-worker:{WORKER_KIND}] job {job_id}: TIMEOUT after {JOB_TIMEOUT}s, process group killed",
+                flush=True,
+            )
     except FileNotFoundError as e:
-        patch_job(job_id, "failed", {"via": "hive_worker", "error": f"driver_not_found: {e}"})
-        if not KEEP_WORKSPACE:
-            shutil.rmtree(workdir, ignore_errors=True)
+        patch_job(
+            job_id,
+            "failed",
+            {
+                "via": "hive_worker",
+                "error": f"driver_not_found: {e}",
+                "workspace_preserved": workdir,
+            },
+        )
         return
 
     elapsed = round(time.time() - t0, 1)
@@ -434,9 +475,11 @@ def _run_job_inner(job: dict) -> None:
               "elapsed_s": elapsed, "tail": tail}
     status = "done" if exit_code == 0 else "failed"
     print(f"[hive-worker:{WORKER_KIND}] job {job_id}: {status} exit={exit_code} elapsed={elapsed}s", flush=True)
-    patch_job(job_id, status, result)
+    if status == "failed":
+        result["workspace_preserved"] = workdir
+    recorded = patch_job(job_id, status, result)
 
-    if not KEEP_WORKSPACE:
+    if status == "done" and recorded and not KEEP_WORKSPACE:
         shutil.rmtree(workdir, ignore_errors=True)
 
 

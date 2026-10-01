@@ -22,3 +22,9 @@ remains at one slot; this preserves its existing six-agent capacity.
 Verify capacity with `/v1/agents?status=online`: count distinct online
 `zeroclaw` URNs for each host. A claimed job occupies one process; a host can
 claim another job while it has an idle zeroclaw instance.
+
+Failed jobs keep their per-job checkout for rescue, even when
+`KEEP_WORKSPACE=0`. A repeat claim with the same job ID fails with
+`workspace_exists_needs_rescue` rather than replacing the checkout. Inspect
+and commit or export any edits before manually removing that workspace.
+Successful jobs are cleaned only after Hive records the terminal result.
