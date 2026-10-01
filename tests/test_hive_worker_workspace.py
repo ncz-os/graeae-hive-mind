@@ -79,6 +79,59 @@ class WorkspaceRetentionTests(unittest.TestCase):
                 worker._driver_supports_verified_delivery("/usr/bin/zoder")
             )
 
+    def test_strict_route_capability_requires_exact_driver_flag(self):
+        with (
+            patch.object(worker, "_find_driver", return_value="/usr/bin/zoder"),
+            patch.object(worker.os.path, "isfile", return_value=True),
+            patch.object(worker.os, "access", return_value=True),
+            patch.object(
+                worker, "_driver_supports_verified_delivery", return_value=True
+            ),
+            patch.object(worker, "_driver_supports_strict_routes", return_value=True),
+            patch.object(
+                worker, "_http", return_value=(200, {"urn": "urn:test"})
+            ) as http,
+        ):
+            worker.register()
+        self.assertIn("strict-rescue-routes", http.call_args.args[2]["capabilities"])
+        self.assertTrue(
+            match(
+                ["hard:strict-rescue-routes"],
+                http.call_args.args[2]["capabilities"],
+            ).eligible
+        )
+
+    def test_strict_rescue_pins_allowed_routes_and_delivery_gate(self):
+        strict_job = dict(JOB, required_capabilities=["hard:strict-rescue-routes"])
+        with tempfile.TemporaryDirectory(prefix="hive strict route ") as root:
+
+            def clone(cmd, **kwargs):
+                if cmd[1] == "clone":
+                    Path(cmd[-1]).mkdir()
+
+            with (
+                patch.object(worker, "WORKSPACE_ROOT", root),
+                patch.object(
+                    worker, "_driver_supports_strict_routes", return_value=True
+                ),
+                patch.object(worker.subprocess, "check_output", return_value="a" * 40),
+                patch.object(worker.subprocess, "run", side_effect=clone),
+                patch.object(
+                    worker.subprocess, "Popen", return_value=_Driver(1)
+                ) as driver,
+                patch.object(worker, "patch_job", return_value=True),
+            ):
+                worker._run_job_inner(strict_job)
+            command = driver.call_args.args[0]
+            self.assertIn("--require-approval", command)
+            self.assertIn("--check", command)
+            self.assertEqual(command[command.index("-m") + 1], "qwen38")
+            self.assertEqual(
+                command[command.index("--allowed-routes") + 1],
+                worker.RESCUE_ALLOWED_ROUTES,
+            )
+            self.assertNotIn("minimax", " ".join(command).lower())
+
     def test_missing_driver_never_advertises_worker_capability(self):
         with (
             patch.object(worker, "_find_driver", return_value="/does/not/exist"),

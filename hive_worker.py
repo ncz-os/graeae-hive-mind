@@ -114,6 +114,21 @@ def _driver_supports_verified_delivery(driver: str) -> bool:
     return result.returncode == 0 and all(flag in output for flag in required)
 
 
+def _driver_supports_strict_routes(driver: str) -> bool:
+    try:
+        result = subprocess.run(
+            [driver, "loop", "--help"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0 and "--allowed-routes" in (result.stdout or "")
+
+
 HIVE_URL = os.environ.get("HIVE_URL", "http://192.168.207.67:5005")
 AGENT_HOST = os.environ.get("AGENT_HOST", socket.gethostname().split(".")[0])
 WORKER_KIND = os.environ.get("WORKER_KIND", "").strip().lower()
@@ -154,6 +169,9 @@ ZODER_AGENT = os.environ.get("HIVE_ZODER_AGENT") or os.environ.get("ZODER_AGENT"
 # author.
 ZODER_REVIEWER = os.environ.get("HIVE_ZODER_REVIEWER") or os.environ.get(
     "ZODER_REVIEWER", ""
+)
+RESCUE_ALLOWED_ROUTES = (
+    "tydeus-reviewer=qwen38,nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b"
 )
 
 # ARGONAS canonical bare repos. Extend as needed -- a job whose `repo` field
@@ -287,6 +305,8 @@ def register() -> None:
         WORKER_KIND,
         "verified-git-delivery",
     ]
+    if WORKER_KIND == "zeroclaw" and _driver_supports_strict_routes(driver):
+        caps.append("strict-rescue-routes")
     body = {
         "runtime": WORKER_KIND,
         "kind": WORKER_KIND,
@@ -655,6 +675,20 @@ def _run_job_inner(job: dict) -> None:
             "Never store credentials, private environment values, or raw secrets."
         )
     if WORKER_KIND == "zeroclaw":
+        strict_rescue = "hard:strict-rescue-routes" in (
+            job.get("required_capabilities") or []
+        )
+        if strict_rescue and not _driver_supports_strict_routes(_find_driver("zoder")):
+            patch_job(
+                job_id,
+                "failed",
+                {
+                    "via": "hive_worker",
+                    "error": "strict_route_driver_unavailable",
+                    "retryable": False,
+                },
+            )
+            return
         # --loop-timeout must exceed --agent-timeout (the loop watchdog covers
         # author+check+review, not just the author turn) or zoder prints a
         # TIMEOUT WARNING on every single run -- harmless here (zoder proceeds
@@ -683,10 +717,20 @@ def _run_job_inner(job: dict) -> None:
             "--loop-timeout",
             str(JOB_TIMEOUT + 300),
         ]
-        if ZODER_AGENT:
-            cmd += ["--agent", ZODER_AGENT, "--allow-paid"]
-        if ZODER_REVIEWER:
-            cmd += ["--reviewer", ZODER_REVIEWER]
+        if strict_rescue:
+            cmd += [
+                "-m",
+                "qwen38",
+                "--reviewer",
+                "nvidia/nemotron-3-ultra-550b-a55b",
+                "--allowed-routes",
+                RESCUE_ALLOWED_ROUTES,
+            ]
+        else:
+            if ZODER_AGENT:
+                cmd += ["--agent", ZODER_AGENT, "--allow-paid"]
+            if ZODER_REVIEWER:
+                cmd += ["--reviewer", ZODER_REVIEWER]
     else:
         cmd = [
             _find_driver("codex"),
