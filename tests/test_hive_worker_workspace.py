@@ -52,6 +52,8 @@ class WorkspaceRetentionTests(unittest.TestCase):
             with (
                 patch.object(worker, "WORKSPACE_ROOT", root),
                 patch.object(worker, "KEEP_WORKSPACE", False),
+                patch.object(worker.subprocess, "check_output", return_value="a" * 40),
+                patch.object(worker, "completion_evidence", return_value={}),
                 patch.object(worker.subprocess, "run", side_effect=clone),
                 patch.object(
                     worker.subprocess, "Popen", return_value=_Driver(exit_code)
@@ -88,9 +90,9 @@ class WorkspaceRetentionTests(unittest.TestCase):
                 recorded.call_args.args[2]["workspace_preserved"], str(checkout)
             )
 
-    def test_success_only_cleans_after_bus_records_result(self):
+    def test_success_without_delivery_proof_always_preserves_workspace(self):
         exists, _ = self._run_driver(0, True)
-        self.assertFalse(exists)
+        self.assertTrue(exists)
         exists, _ = self._run_driver(0, False)
         self.assertTrue(exists)
 

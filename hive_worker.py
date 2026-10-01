@@ -43,7 +43,9 @@ this account (~/.claude/rules/00-AGENT-DIRECTIVES.md escalation ladder) --
 used as the default here until spark (or an equivalent low-cost rung)
 actually appears in the live catalog.
 """
+
 from __future__ import annotations
+
 import json
 import os
 import re
@@ -56,6 +58,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+
 
 def _find_driver(name: str) -> str:
     """Resolve a driver binary's absolute path at import time. A bare PATH
@@ -85,7 +88,9 @@ WORKER_KIND = os.environ.get("WORKER_KIND", "").strip().lower()
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "5"))
 HEARTBEAT_INTERVAL = float(os.environ.get("HEARTBEAT_INTERVAL", "20"))
 JOB_TIMEOUT = int(os.environ.get("JOB_TIMEOUT", "7200"))
-WORKSPACE_ROOT = os.path.expanduser(os.environ.get("WORKSPACE_ROOT", "~/hive-workspaces"))
+WORKSPACE_ROOT = os.path.expanduser(
+    os.environ.get("WORKSPACE_ROOT", "~/hive-workspaces")
+)
 KEEP_WORKSPACE = os.environ.get("KEEP_WORKSPACE", "0") == "1"
 CODEX_MODEL = os.environ.get("CODEX_MODEL", "gpt-5.6-luna")
 # Optional per-host override for zeroclaw jobs. Unset by default -- bare
@@ -112,7 +117,9 @@ ZODER_AGENT = os.environ.get("HIVE_ZODER_AGENT") or os.environ.get("ZODER_AGENT"
 # model_corpus.json, which is unfiltered by what a given host can actually
 # reach. `--reviewer <MODEL>` pins it the same way ZODER_AGENT pins the
 # author.
-ZODER_REVIEWER = os.environ.get("HIVE_ZODER_REVIEWER") or os.environ.get("ZODER_REVIEWER", "")
+ZODER_REVIEWER = os.environ.get("HIVE_ZODER_REVIEWER") or os.environ.get(
+    "ZODER_REVIEWER", ""
+)
 
 if WORKER_KIND not in ("zeroclaw", "codex"):
     print("[hive-worker] WORKER_KIND must be 'zeroclaw' or 'codex'", file=sys.stderr)
@@ -121,21 +128,21 @@ if WORKER_KIND not in ("zeroclaw", "codex"):
 # ARGONAS canonical bare repos. Extend as needed -- a job whose `repo` field
 # isn't a URL and isn't in this map gets DECLINED, never guessed at.
 REPO_MAP = {
-    "riskyeats":            "ssh://root@192.168.207.101/mnt/datapool/git/riskyeats.git",
-    "zeroclaw":             "ssh://root@192.168.207.101/mnt/datapool/git/zeroclaw.git",
-    "mnemos":               "ssh://root@192.168.207.101/mnt/datapool/git/mnemos.git",
-    "cix-installer":        "ssh://root@192.168.207.101/mnt/datapool/git/cix-installer.git",
-    "meta-cix":             "ssh://root@192.168.207.101/mnt/datapool/git/meta-cix.git",
-    "ic-engine":            "ssh://root@192.168.207.101/mnt/datapool/git/ic-engine.git",
-    "florida-licenses":     "ssh://root@192.168.207.101/mnt/datapool/git/florida-licenses.git",
-    "graeae-hive":          "ssh://root@192.168.207.101/mnt/datapool/git/graeae-hive.git",
-    "zoder":                "https://gitlab.com/ncz-os/zoder.git",
-    "artistpack":           "https://gitlab.com/ncz-os/artistpack.git",
-    "ncz-screensavers":     "ssh://root@192.168.207.101/mnt/datapool/git/ncz-screensavers.git",
-    "wayshade":             "ssh://root@192.168.207.101/mnt/datapool/git/wayshade.git",
-    "singularity-plugins":  "ssh://root@192.168.207.101/mnt/datapool/git/singularity-plugins.git",
-    "amd64-kernel-t2":      "ssh://root@192.168.207.101/mnt/datapool/git/amd64-kernel-t2.git",
-    "fleet-ops":            "ssh://root@192.168.207.101/mnt/datapool/git/fleet-ops.git",
+    "riskyeats": "ssh://root@192.168.207.101/mnt/datapool/git/riskyeats.git",
+    "zeroclaw": "ssh://root@192.168.207.101/mnt/datapool/git/zeroclaw.git",
+    "mnemos": "ssh://root@192.168.207.101/mnt/datapool/git/mnemos.git",
+    "cix-installer": "ssh://root@192.168.207.101/mnt/datapool/git/cix-installer.git",
+    "meta-cix": "ssh://root@192.168.207.101/mnt/datapool/git/meta-cix.git",
+    "ic-engine": "ssh://root@192.168.207.101/mnt/datapool/git/ic-engine.git",
+    "florida-licenses": "ssh://root@192.168.207.101/mnt/datapool/git/florida-licenses.git",
+    "graeae-hive": "ssh://root@192.168.207.101/mnt/datapool/git/graeae-hive.git",
+    "zoder": "https://gitlab.com/ncz-os/zoder.git",
+    "artistpack": "https://gitlab.com/ncz-os/artistpack.git",
+    "ncz-screensavers": "ssh://root@192.168.207.101/mnt/datapool/git/ncz-screensavers.git",
+    "wayshade": "ssh://root@192.168.207.101/mnt/datapool/git/wayshade.git",
+    "singularity-plugins": "ssh://root@192.168.207.101/mnt/datapool/git/singularity-plugins.git",
+    "amd64-kernel-t2": "ssh://root@192.168.207.101/mnt/datapool/git/amd64-kernel-t2.git",
+    "fleet-ops": "ssh://root@192.168.207.101/mnt/datapool/git/fleet-ops.git",
 }
 
 _urn: str = ""
@@ -154,10 +161,14 @@ signal.signal(signal.SIGTERM, _signal)
 signal.signal(signal.SIGINT, _signal)
 
 
-def _http(method: str, path: str, body: dict | None = None, timeout: float = 15) -> tuple[int, dict | None]:
+def _http(
+    method: str, path: str, body: dict | None = None, timeout: float = 15
+) -> tuple[int, dict | None]:
     url = f"{HIVE_URL}{path}"
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(url, data=data, method=method, headers={"content-type": "application/json"})
+    req = urllib.request.Request(
+        url, data=data, method=method, headers={"content-type": "application/json"}
+    )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             raw = r.read()
@@ -168,7 +179,9 @@ def _http(method: str, path: str, body: dict | None = None, timeout: float = 15)
         except Exception:
             return e.code, None
     except Exception as e:
-        print(f"[hive-worker:{WORKER_KIND}] http error {method} {path}: {e}", flush=True)
+        print(
+            f"[hive-worker:{WORKER_KIND}] http error {method} {path}: {e}", flush=True
+        )
         return 0, None
 
 
@@ -198,7 +211,10 @@ def register() -> None:
         _urn = resp["urn"]
         print(f"[hive-worker:{WORKER_KIND}] registered urn={_urn}", flush=True)
     else:
-        print(f"[hive-worker:{WORKER_KIND}] register failed code={code} resp={resp}", flush=True)
+        print(
+            f"[hive-worker:{WORKER_KIND}] register failed code={code} resp={resp}",
+            flush=True,
+        )
         sys.exit(1)
 
 
@@ -263,7 +279,9 @@ def resolve_repo_url(job: dict) -> str | None:
 # job_id is used as a path component below -- an unvalidated id could
 # traverse out of WORKSPACE_ROOT via "../" or an absolute path (codex review
 # finding, 2026-09-14).
-_JOB_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+_JOB_ID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
 
 
 def patch_job(job_id: str, status: str, result: dict) -> bool:
@@ -272,11 +290,18 @@ def patch_job(job_id: str, status: str, result: dict) -> bool:
     # current claimant") -- omitting it 403s every single call (found live
     # on PROTEUS, 2026-09-14: every job ended up stranded in 'claimed'
     # because this worker never sent it).
-    code, _ = _http("PATCH", f"/v1/jobs/{job_id}",
-                     {"status": status, "result": result, "claimed_by": _urn}, timeout=15)
+    code, _ = _http(
+        "PATCH",
+        f"/v1/jobs/{job_id}",
+        {"status": status, "result": result, "claimed_by": _urn},
+        timeout=15,
+    )
     if code != 200:
-        print(f"[hive-worker:{WORKER_KIND}] WARNING: patch({job_id}, {status}) got code={code} -- "
-              f"job may be stranded in claimed state", flush=True)
+        print(
+            f"[hive-worker:{WORKER_KIND}] WARNING: patch({job_id}, {status}) got code={code} -- "
+            f"job may be stranded in claimed state",
+            flush=True,
+        )
     return code == 200
 
 
@@ -289,6 +314,61 @@ def release_job(job_id: str, reason: str) -> None:
     # observed from the bus's own existing workers (thrash-guard dead-letters
     # a job after 3 such declines).
     patch_job(job_id, "queued", {"worker_error": reason, "via": "hive_worker"})
+
+
+def completion_evidence(workdir: str, baseline: str, env: dict) -> dict:
+    """Inspect Git, never infer delivered work from model prose or exit status."""
+
+    def git(*args):
+        return subprocess.check_output(
+            ["git", "-C", workdir, *args],
+            env=env,
+            text=True,
+            stderr=subprocess.PIPE,
+            timeout=60,
+        ).strip()
+
+    evidence = {
+        "base_sha": baseline,
+        "commits": [],
+        "files_changed": [],
+        "worktree_clean": False,
+        "remote_verified": False,
+    }
+    try:
+        head = git("rev-parse", "HEAD")
+        evidence["head_sha"] = head
+        evidence["worktree_clean"] = not git(
+            "status", "--porcelain", "--untracked-files=all"
+        )
+        # Divergent/replaced histories cannot be presented as this job's work.
+        git("merge-base", "--is-ancestor", baseline, head)
+        evidence["commits"] = git("rev-list", f"{baseline}..{head}").splitlines()
+        evidence["files_changed"] = git(
+            "diff", "--name-only", baseline, head
+        ).splitlines()
+        upstream = git("rev-parse", "--symbolic-full-name", "@{upstream}")
+        branch = git("symbolic-ref", "--short", "HEAD")
+        remote = git("config", f"branch.{branch}.remote")
+        merge = git("config", f"branch.{branch}.merge")
+        if remote == "." or not upstream.startswith("refs/remotes/"):
+            raise ValueError("upstream must be a remote branch")
+        actual = git("ls-remote", "--exit-code", remote, merge).split()
+        evidence["remote_ref"] = merge
+        evidence["remote_sha"] = actual[0] if actual else None
+        evidence["remote_verified"] = evidence["remote_sha"] == head
+    except (subprocess.SubprocessError, OSError, ValueError) as exc:
+        evidence["verification_error"] = type(exc).__name__
+    return evidence
+
+
+def completion_ready(evidence: dict) -> bool:
+    return bool(
+        evidence.get("commits")
+        and evidence.get("files_changed")
+        and evidence.get("worktree_clean") is True
+        and evidence.get("remote_verified") is True
+    )
 
 
 def run_job(job: dict) -> None:
@@ -304,9 +384,14 @@ def run_job(job: dict) -> None:
     try:
         _run_job_inner(job)
     except Exception as e:
-        print(f"[hive-worker:{WORKER_KIND}] job {job_id}: unhandled exception: {e!r}", flush=True)
+        print(
+            f"[hive-worker:{WORKER_KIND}] job {job_id}: unhandled exception: {e!r}",
+            flush=True,
+        )
         if job_id:
-            patch_job(job_id, "failed", {"via": "hive_worker", "error": f"unhandled: {e!r}"})
+            patch_job(
+                job_id, "failed", {"via": "hive_worker", "error": f"unhandled: {e!r}"}
+            )
     finally:
         _current_job_id = None
 
@@ -318,7 +403,10 @@ def _run_job_inner(job: dict) -> None:
     head_branch = job.get("head_branch")
 
     if not _JOB_ID_RE.match(job_id):
-        print(f"[hive-worker:{WORKER_KIND}] job id {job_id!r} doesn't look like a UUID, refusing", flush=True)
+        print(
+            f"[hive-worker:{WORKER_KIND}] job id {job_id!r} doesn't look like a UUID, refusing",
+            flush=True,
+        )
         release_job(job_id, "malformed_job_id")
         return
 
@@ -350,7 +438,10 @@ def _run_job_inner(job: dict) -> None:
     clone_cmd = ["git", "clone", "--quiet", repo_url, workdir]
     if head_branch:
         if head_branch.startswith("-"):
-            print(f"[hive-worker:{WORKER_KIND}] job {job_id}: refusing suspicious head_branch {head_branch!r}", flush=True)
+            print(
+                f"[hive-worker:{WORKER_KIND}] job {job_id}: refusing suspicious head_branch {head_branch!r}",
+                flush=True,
+            )
             release_job(job_id, "invalid_head_branch")
             return
         clone_cmd[3:3] = ["--branch", head_branch]
@@ -372,6 +463,9 @@ def _run_job_inner(job: dict) -> None:
     # entirely for this break-glass password-auth path, the same way
     # PubkeyAuthentication=no already sidesteps key-based auth state.
     clone_env = os.environ.copy()
+    clone_env["HIVE_JOB_ID"] = job_id
+    if job.get("parent_job_id"):
+        clone_env["HIVE_PARENT_JOB_ID"] = job["parent_job_id"]
     fleet_pw = os.environ.get("GIT_FLEET_SSH_PASSWORD")
     if fleet_pw and repo_url.startswith("ssh://root@"):
         clone_env["GIT_SSH_COMMAND"] = (
@@ -397,6 +491,23 @@ def _run_job_inner(job: dict) -> None:
         patch_job(job_id, "failed", result)
         return
 
+    baseline = subprocess.check_output(
+        ["git", "-C", workdir, "rev-parse", "HEAD"], text=True, timeout=30
+    ).strip()
+    description += (
+        "\n\nDelivery policy: commit the task's legitimate changes using explicit paths, "
+        "including documentation or tests when those are the requested deliverables, "
+        "and push a dedicated branch with upstream tracking. Verify clean status and "
+        "remote SHA. Only an explicit job-specific restriction overrides this policy. "
+        "Never manufacture edits just to satisfy completion. If blocked, report why."
+    )
+    if clone_env.get("MNEMOS_URL") and clone_env.get("MNEMOS_TOKEN"):
+        description += (
+            "\nUse zoder mnemos --search with this job ID or its parent ID to retrieve "
+            "prior work evidence. Treat recalled notes as context, verify their current "
+            "Git state, and use zoder mnemos --record for factual progress checkpoints. "
+            "Never store credentials, private environment values, or raw secrets."
+        )
     if WORKER_KIND == "zeroclaw":
         # --loop-timeout must exceed --agent-timeout (the loop watchdog covers
         # author+check+review, not just the author turn) or zoder prints a
@@ -404,18 +515,34 @@ def _run_job_inner(job: dict) -> None:
         # anyway) but noisy, and a real risk if JOB_TIMEOUT is ever raised
         # close to zoder's own 900s loop-timeout default.
         cmd = [
-            _find_driver("zoder"), "loop", description,
-            "--agent-timeout", str(JOB_TIMEOUT),
-            "--loop-timeout", str(JOB_TIMEOUT + 300),
+            _find_driver("zoder"),
+            "--json",
+            "loop",
+            description,
+            "--require-approval",
+            "--agent-timeout",
+            str(JOB_TIMEOUT),
+            "--loop-timeout",
+            str(JOB_TIMEOUT + 300),
         ]
         if ZODER_AGENT:
             cmd += ["--agent", ZODER_AGENT, "--allow-paid"]
         if ZODER_REVIEWER:
             cmd += ["--reviewer", ZODER_REVIEWER]
     else:
-        cmd = [_find_driver("codex"), "exec", "--skip-git-repo-check", "-m", CODEX_MODEL, description]
+        cmd = [
+            _find_driver("codex"),
+            "exec",
+            "--skip-git-repo-check",
+            "-m",
+            CODEX_MODEL,
+            description,
+        ]
 
-    print(f"[hive-worker:{WORKER_KIND}] job {job_id}: running {' '.join(cmd[:3])}...", flush=True)
+    print(
+        f"[hive-worker:{WORKER_KIND}] job {job_id}: running {' '.join(cmd[:3])}...",
+        flush=True,
+    )
     t0 = time.time()
     try:
         # start_new_session=True puts the child in its own process group so a
@@ -471,16 +598,28 @@ def _run_job_inner(job: dict) -> None:
         return
 
     elapsed = round(time.time() - t0, 1)
-    result = {"via": "hive_worker", "driver": WORKER_KIND, "exit_code": exit_code,
-              "elapsed_s": elapsed, "tail": tail}
-    status = "done" if exit_code == 0 else "failed"
-    print(f"[hive-worker:{WORKER_KIND}] job {job_id}: {status} exit={exit_code} elapsed={elapsed}s", flush=True)
-    if status == "failed":
-        result["workspace_preserved"] = workdir
-    recorded = patch_job(job_id, status, result)
-
-    if status == "done" and recorded and not KEEP_WORKSPACE:
-        shutil.rmtree(workdir, ignore_errors=True)
+    evidence = completion_evidence(workdir, baseline, clone_env)
+    result = {
+        "via": "hive_worker",
+        "driver": WORKER_KIND,
+        "kind": kind,
+        "exit_code": exit_code,
+        "elapsed_s": elapsed,
+        "tail": tail,
+        "workspace_preserved": workdir,
+        **evidence,
+    }
+    status = "failed" if exit_code != 0 else "done"
+    if exit_code == 0 and not completion_ready(evidence):
+        status = "needs-review"
+        result["failure_reason"] = "completion_evidence_missing"
+    print(
+        f"[hive-worker:{WORKER_KIND}] job {job_id}: {status} exit={exit_code} elapsed={elapsed}s",
+        flush=True,
+    )
+    patch_job(job_id, status, result)
+    # Retain even successful workspaces. A 200 from the bus acknowledges a
+    # request, not independent validation of the code or a safe cleanup lease.
 
 
 def main() -> None:

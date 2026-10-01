@@ -1266,6 +1266,22 @@ async def require_orchestrator_submitter(submitter_urn: str) -> str:
     return runtime
 
 
+def valid_completion_proof(proof: dict) -> bool:
+    """Fail closed on missing Git evidence, including successful subprocesses."""
+    sha = proof.get("head_sha")
+    commits = proof.get("commits")
+    files = proof.get("files_changed")
+    return bool(
+        isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha)
+        and isinstance(commits, list) and sha in commits
+        and all(isinstance(c, str) and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", c) for c in commits)
+        and isinstance(files, list) and files and all(isinstance(f, str) and f for f in files)
+        and proof.get("worktree_clean") is True
+        and proof.get("remote_verified") is True
+        and proof.get("remote_sha") == sha
+    )
+
+
 def normalize_result_payload(status: str, result: Optional[dict]) -> Optional[dict]:
     if result is None or status != "done":
         return result
@@ -2703,6 +2719,10 @@ async def create_job(req: JobCreate):
     ck = cache_key_for(req.kind, req.description, max_cost_tier, req.required_capabilities)
     async with connect_db() as db:
         cached = await cache_lookup(db, ck)
+        # Repository jobs must execute against their actual checkout. A cached
+        # narrative is not evidence of delivery, even if it contains old SHAs.
+        if req.repo:
+            cached = None
         if cached:
             # short-circuit: store job as done with cached result + cost=0
             await db.execute(
@@ -3029,6 +3049,7 @@ async def update_job(job_id: str, req: JobUpdate):
     original_result_mnemos_was_set = field_was_set(req, "result_mnemos_id")
     # #3 FIX: Hallucination guard now surfaces failure_reason + exit_code=-2 (per review 2026-05-23)
     halluc_reason = None
+    completion_rejected = False
     if req.status == "done" and req.result:
         halluc_reason = hallucination_check(req.result)
         if halluc_reason:
@@ -3042,27 +3063,6 @@ async def update_job(job_id: str, req: JobUpdate):
                 result=patched,
                 claimed_by=req.claimed_by, tokens_in=req.tokens_in,
                 tokens_out=req.tokens_out, result_mnemos_id=req.result_mnemos_id,
-            )
-    # WORK CONTRACT (GRAEAE worker-accountability consensus 1.0, 2026-06-04): a commit-mandatory
-    # job marked done with ZERO commits is a contract breach — a silent fake-completion (model
-    # confabulated off-task instead of committing; observed 23/40 riskyeats/code "done" w/ 0
-    # commits + off-task chatter like "Hetzner API"/"SRRS"). Reclassify to failed so it never
-    # counts as done + feeds fault-attribution/backoff. kind from worker-stamped result;
-    # exit_code=-3 (vs hallucination_guard -2).
-    if req.status == "done" and isinstance(req.result, dict) and not halluc_reason:
-        _k = str(req.result.get("kind") or "")
-        _commits = req.result.get("commits") or []
-        _mand = (_k in ("riskyeats", "code") or _k.startswith((
-            "riskyeats:", "feat:", "fix:", "argonaut:", "riskybiz:", "mnemos:",
-            "ic-engine", "investorclaw", "ncz-os")))
-        if _mand and not _commits:
-            _p = dict(req.result or {})
-            _p["exit_code"] = -3
-            _p["failure_reason"] = "contract_breach:commit_mandatory_no_commits"
-            req = JobUpdate(
-                status="failed", result=_p, claimed_by=req.claimed_by,
-                tokens_in=req.tokens_in, tokens_out=req.tokens_out,
-                result_mnemos_id=req.result_mnemos_id,
             )
     req.result = normalize_result_payload(req.status, req.result)
 
@@ -3093,14 +3093,14 @@ async def update_job(job_id: str, req: JobUpdate):
         try:
             async with db.execute(
                 "SELECT status, claimed_by, claimed_provider, claimed_model, retry_count, "
-                "max_retries, COALESCE(decline_count, 0) FROM jobs WHERE id=?",
+                "max_retries, COALESCE(decline_count, 0), kind, repo FROM jobs WHERE id=?",
                 (job_id,),
             ) as cur:
                 current = await cur.fetchone()
             if not current:
                 await db.execute("ROLLBACK")
                 raise HTTPException(404, f"job not found: {job_id}")
-            old_status, old_claimed_by, prov, mod, retry_count, max_retries, decline_count = current
+            old_status, old_claimed_by, prov, mod, retry_count, max_retries, decline_count, job_kind, job_repo = current
 
             if req.status not in STATUS_TRANSITIONS.get(old_status, set()):
                 await db.execute("ROLLBACK")
@@ -3152,6 +3152,19 @@ async def update_job(job_id: str, req: JobUpdate):
             if req.status in {"claimed", "running"} and not effective_claimed_by:
                 await db.execute("ROLLBACK")
                 raise HTTPException(422, f"status={req.status!r} requires an existing or explicit claimed_by")
+
+            commit_required = str(job_kind) in ("riskyeats", "code") or str(job_kind).startswith((
+                "riskyeats:", "feat:", "fix:", "argonaut:", "riskybiz:", "mnemos:",
+                "ic-engine", "investorclaw", "ncz-os",
+            )) or bool(job_repo and str(job_kind).startswith("build:"))
+            if req.status == "done" and commit_required:
+                proof = req.result or {}
+                if not valid_completion_proof(proof):
+                    req.status = "needs-review"
+                    completion_rejected = True
+                    req.result = {**proof, "failure_reason": "completion_evidence_missing"}
+                    patch_payload["status"] = req.status
+                    patch_payload["result"] = req.result
 
             fields = ["status=?", "last_update_at=?"]
             args: list = [req.status, now]
@@ -3430,6 +3443,12 @@ async def update_job(job_id: str, req: JobUpdate):
                 "tokens_in": req.tokens_in, "tokens_out": req.tokens_out,
                 "estimated_cost_usd": cost_estimate,
             })
+    if completion_rejected:
+        # Older workers delete successful checkouts after HTTP 200. Returning
+        # non-200 is necessary until those workers have all been upgraded.
+        return JSONResponse(status_code=409, content={
+            "ok": False, "status": "needs-review", "reason": "completion_evidence_missing"
+        })
     return {"ok": True, "ts": now, "estimated_cost_usd": cost_estimate,
             "dead_lettered": dead_lettered}
 
