@@ -125,7 +125,7 @@ class WorkspaceRetentionTests(unittest.TestCase):
             command = driver.call_args.args[0]
             self.assertIn("--require-approval", command)
             self.assertIn("--check", command)
-            self.assertEqual(command[command.index("--agent") + 1], "coder")
+            self.assertEqual(command[command.index("-m") + 1], "nemotron35")
             self.assertEqual(command[command.index("--reviewer") + 1], "qwen38")
             self.assertEqual(
                 command[command.index("--allowed-routes") + 1],

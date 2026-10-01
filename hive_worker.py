@@ -720,8 +720,8 @@ def _run_job_inner(job: dict) -> None:
         ]
         if strict_rescue:
             cmd += [
-                "--agent",
-                "coder",
+                "-m",
+                "nemotron35",
                 "--reviewer",
                 "qwen38",
                 "--allowed-routes",
