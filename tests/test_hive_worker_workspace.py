@@ -33,6 +33,9 @@ class WorkspaceRetentionTests(unittest.TestCase):
             patch.object(worker.os.path, "isfile", return_value=True),
             patch.object(worker.os, "access", return_value=True),
             patch.object(
+                worker, "_driver_supports_verified_delivery", return_value=True
+            ),
+            patch.object(
                 worker, "_http", return_value=(200, {"urn": "urn:test"})
             ) as http,
         ):
@@ -43,6 +46,38 @@ class WorkspaceRetentionTests(unittest.TestCase):
         required = ["hard:verified-git-delivery"]
         self.assertFalse(match(required, ["python", "git", "zeroclaw"]).eligible)
         self.assertTrue(match(required, body["capabilities"]).eligible)
+
+    def test_old_driver_refuses_registration_without_verified_contract(self):
+        with (
+            patch.object(worker, "_find_driver", return_value="/usr/bin/zoder"),
+            patch.object(worker.os.path, "isfile", return_value=True),
+            patch.object(worker.os, "access", return_value=True),
+            patch.object(
+                worker, "_driver_supports_verified_delivery", return_value=False
+            ),
+            patch.object(worker, "_http") as http,
+        ):
+            with self.assertRaises(SystemExit):
+                worker.register()
+            http.assert_not_called()
+
+    def test_zoder_help_probe_requires_delivery_flags(self):
+        result = subprocess.CompletedProcess(
+            ["zoder", "loop", "--help"],
+            0,
+            "loop --require-approval --approve POLICY --check COMMAND",
+            "",
+        )
+        with patch.object(worker.subprocess, "run", return_value=result) as run:
+            self.assertTrue(worker._driver_supports_verified_delivery("/usr/bin/zoder"))
+        run.assert_called_once()
+
+    def test_zoder_help_probe_rejects_old_flags(self):
+        result = subprocess.CompletedProcess(["zoder", "loop", "--help"], 0, "loop", "")
+        with patch.object(worker.subprocess, "run", return_value=result):
+            self.assertFalse(
+                worker._driver_supports_verified_delivery("/usr/bin/zoder")
+            )
 
     def test_missing_driver_never_advertises_worker_capability(self):
         with (

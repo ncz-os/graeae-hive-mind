@@ -86,6 +86,34 @@ def _find_driver(name: str) -> str:
     return name  # let it fail loudly with FileNotFoundError at exec time
 
 
+def _driver_supports_verified_delivery(driver: str) -> bool:
+    """Require the CLI contract used by the delivery/completion gate.
+
+    A binary that can start but lacks these flags would either fail every
+    queued job or bypass the check, so it must not register as a verified
+    delivery worker during a rolling fleet update.
+    """
+    if WORKER_KIND == "zeroclaw":
+        command = [driver, "loop", "--help"]
+        required = ("--require-approval", "--approve", "--check")
+    else:
+        command = [driver, "exec", "--help"]
+        required = ("--sandbox",)
+    try:
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    output = result.stdout or ""
+    return result.returncode == 0 and all(flag in output for flag in required)
+
+
 HIVE_URL = os.environ.get("HIVE_URL", "http://192.168.207.67:5005")
 AGENT_HOST = os.environ.get("AGENT_HOST", socket.gethostname().split(".")[0])
 WORKER_KIND = os.environ.get("WORKER_KIND", "").strip().lower()
@@ -242,6 +270,12 @@ def register() -> None:
     if not os.path.isfile(driver) or not os.access(driver, os.X_OK):
         print(
             f"[hive-worker:{WORKER_KIND}] driver unavailable; refusing registration",
+            flush=True,
+        )
+        raise SystemExit(2)
+    if not _driver_supports_verified_delivery(driver):
+        print(
+            f"[hive-worker:{WORKER_KIND}] driver lacks verified-delivery CLI contract; refusing registration",
             flush=True,
         )
         raise SystemExit(2)
