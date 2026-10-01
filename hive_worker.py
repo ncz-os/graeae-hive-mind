@@ -520,6 +520,8 @@ def _run_job_inner(job: dict) -> None:
             "loop",
             description,
             "--require-approval",
+            "--approve",
+            "all",
             "--agent-timeout",
             str(JOB_TIMEOUT),
             "--loop-timeout",

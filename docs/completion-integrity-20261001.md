@@ -2,6 +2,9 @@
 
 ## Verified causes
 
+- Worker invocations omitted `--approve all`; zoder defaults to read-only tool
+  approval. Autonomous implementation requires explicit write/shell approval.
+
 - Worker success was the process return code; it did not inspect Git delivery.
 - The bus checked a worker-supplied result kind absent from real worker results,
   and omitted `build:zeroclaw` from the delivery contract.

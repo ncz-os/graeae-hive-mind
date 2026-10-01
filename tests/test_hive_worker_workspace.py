@@ -57,12 +57,15 @@ class WorkspaceRetentionTests(unittest.TestCase):
                 patch.object(worker.subprocess, "run", side_effect=clone),
                 patch.object(
                     worker.subprocess, "Popen", return_value=_Driver(exit_code)
-                ),
+                ) as driver,
                 patch.object(
                     worker, "patch_job", return_value=recorded
                 ) as patch_status,
             ):
                 worker._run_job_inner(JOB)
+                command = driver.call_args.args[0]
+                self.assertIn("--require-approval", command)
+                self.assertEqual(command[command.index("--approve") + 1], "all")
             return checkout.exists(), patch_status.call_args.args[2]
 
     def test_failed_driver_preserves_workspace(self):
