@@ -4573,7 +4573,7 @@ async def list_jobs(
             )
     sql = ("SELECT id, submitter_urn, parent_job_id, kind, description, priority, status, "
            "claimed_by, started_at, ended_at, result, estimated_cost_usd, "
-           "required_capabilities, eligible_kinds, eligible_hosts, site, repo, head_branch, pr_number FROM jobs WHERE 1=1")
+           "required_capabilities, eligible_kinds, eligible_hosts, site, repo, head_branch, pr_number, max_retries, retry_count FROM jobs WHERE 1=1")
     args: list = []
     cnt_sql = "SELECT COUNT(*) FROM jobs WHERE 1=1"
     cnt_args: list = []
@@ -4627,6 +4627,7 @@ async def list_jobs(
                     "eligible_hosts": json.loads(r[14]) if r[14] else None,
                     "site": r[15], "repo": r[16],
                     "head_branch": r[17], "pr_number": r[18],
+                    "max_retries": r[19], "retry_count": r[20],
                 })
     return {"count": len(rows), "total": total, "jobs": rows}
 
@@ -4639,7 +4640,7 @@ async def get_job(job_id: str):
         async with db.execute(
             "SELECT id, submitter_urn, parent_job_id, kind, description, priority, status, "
             "claimed_by, started_at, ended_at, result, estimated_cost_usd, "
-            "required_capabilities, eligible_kinds, eligible_hosts, site, repo, head_branch, pr_number FROM jobs WHERE id=?",
+            "required_capabilities, eligible_kinds, eligible_hosts, site, repo, head_branch, pr_number, max_retries, retry_count FROM jobs WHERE id=?",
             (job_id,)) as cur:
             r = await cur.fetchone()
     if not r:
@@ -4656,6 +4657,7 @@ async def get_job(job_id: str):
         "eligible_hosts": json.loads(r[14]) if r[14] else None,
         "site": r[15], "repo": r[16],
         "head_branch": r[17], "pr_number": r[18],
+        "max_retries": r[19], "retry_count": r[20],
     }
 
 
