@@ -24,13 +24,15 @@ class CompletionApiTests(unittest.TestCase):
             import sqlite3
 
             with closing(sqlite3.connect(bus.DB_PATH)) as db, db:
-                for jid in ("missing", "forged", "valid"):
+                for jid in ("missing", "forged", "valid", "hyphenated-audit"):
                     db.execute(
                         "INSERT INTO jobs (id,submitter_urn,kind,repo,status,claimed_by,started_at,max_retries,retry_count) VALUES (?,?,?,?,?,?,?,?,?)",
                         (
                             jid,
                             "orchestrator",
-                            "build:zeroclaw",
+                            "riskyeats-audit"
+                            if jid == "hyphenated-audit"
+                            else "build:zeroclaw",
                             "example",
                             "claimed",
                             "worker",
@@ -41,6 +43,7 @@ class CompletionApiTests(unittest.TestCase):
                     )
             for jid, result in [
                 ("missing", {"exit_code": 0}),
+                ("hyphenated-audit", {"exit_code": 0}),
                 ("forged", {"exit_code": 0, "kind": "research", "commits": []}),
             ]:
                 response = client.patch(

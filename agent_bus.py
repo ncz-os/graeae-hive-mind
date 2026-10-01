@@ -3153,10 +3153,10 @@ async def update_job(job_id: str, req: JobUpdate):
                 await db.execute("ROLLBACK")
                 raise HTTPException(422, f"status={req.status!r} requires an existing or explicit claimed_by")
 
-            commit_required = str(job_kind) in ("riskyeats", "code") or str(job_kind).startswith((
+            commit_required = bool(job_repo) or str(job_kind) in ("riskyeats", "code") or str(job_kind).startswith((
                 "riskyeats:", "feat:", "fix:", "argonaut:", "riskybiz:", "mnemos:",
                 "ic-engine", "investorclaw", "ncz-os",
-            )) or bool(job_repo and str(job_kind).startswith("build:"))
+            ))
             if req.status == "done" and commit_required:
                 proof = req.result or {}
                 if not valid_completion_proof(proof):
