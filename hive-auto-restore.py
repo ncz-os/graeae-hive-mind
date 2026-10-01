@@ -21,6 +21,7 @@ import urllib.request
 from pathlib import Path
 
 from hive.auth import client_token
+from retry_policy import auto_retry_allowed, _is_non_negative_int
 
 HIVE_URL = os.environ.get("HIVE_URL", "http://192.168.207.67:5005")
 # C1: bus transport auth bearer token (env-sourced, never baked in).
@@ -30,9 +31,12 @@ STATE_DIR = Path("/var/lib/hive-auto-restore")
 STATE_FILE = STATE_DIR / "retry_counts.json"
 LOG_FILE = "/var/log/hive-auto-restore.log"
 
-MAX_RETRIES = 5          # never restore more than 5 times per job
-BACKOFF_BASE = 300       # 5 min after 1st fail, doubles each
-MIN_FAIL_AGE_SEC = 300    # only restore failures older than 60s (give workers time to truly finish)
+MAX_RETRIES = 5  # never restore more than 5 times per job
+BACKOFF_BASE = 300  # 5 min after 1st fail, doubles each
+MIN_FAIL_AGE_SEC = (
+    300  # only restore failures older than 60s (give workers time to truly finish)
+)
+
 
 def log(msg):
     line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}"
@@ -43,6 +47,7 @@ def log(msg):
     except Exception:
         pass
 
+
 def load_state():
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     if STATE_FILE.exists():
@@ -52,13 +57,21 @@ def load_state():
             return {}
     return {}
 
+
 def save_state(state):
     tmp = STATE_FILE.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(state))
     tmp.replace(STATE_FILE)
 
-def _http(method: str, path: str, body: dict | None = None, timeout: float = 15.0,
-          *, admin: bool = False) -> tuple[int, dict | None]:
+
+def _http(
+    method: str,
+    path: str,
+    body: dict | None = None,
+    timeout: float = 15.0,
+    *,
+    admin: bool = False,
+) -> tuple[int, dict | None]:
     url = f"{HIVE_URL}{path}"
     data = json.dumps(body).encode() if body is not None else None
     headers = {"content-type": "application/json"}
@@ -84,10 +97,15 @@ def _http(method: str, path: str, body: dict | None = None, timeout: float = 15.
         log(f"http {method} {path}: {e}")
         return 0, None
 
+
 def fetch_failed_jobs(limit: int = 1000) -> list[dict]:
-    query = urllib.parse.urlencode({
-        "status": "failed", "limit": str(limit), "include_result": "false",
-    })
+    query = urllib.parse.urlencode(
+        {
+            "status": "failed",
+            "limit": str(limit),
+            "include_result": "true",
+        }
+    )
     code, resp = _http("GET", f"/v1/jobs?{query}", timeout=15.0)
     if code != 200 or not isinstance(resp, dict):
         raise RuntimeError(f"fetch_failed_jobs http={code} resp={str(resp)[:200]}")
@@ -99,22 +117,25 @@ def fetch_failed_jobs(limit: int = 1000) -> list[dict]:
     jobs.sort(key=lambda j: j.get("ended_at") or 0, reverse=True)
     return jobs
 
+
 def restore_jobs(job_ids: list[str]) -> tuple[dict[str, str], str]:
-    code, resp = _http(
-        "POST",
-        "/v1/admin/jobs/requeue",
-        {"job_ids": job_ids, "reason": "auto-restore"},
-        timeout=15.0,
-        admin=True,
-    )
-    if code == 200 and isinstance(resp, dict):
-        results = {
-            jid: outcome
-            for outcome in ("ok", "not_found", "skipped_done")
-            for jid in (resp.get(outcome) or [])
-        }
-        return results, ""
-    return {}, f"http={code} resp={str(resp)[:200]}"
+    results, errors = {}, []
+    for jid in job_ids:
+        code, resp = _http(
+            "POST",
+            f"/v1/jobs/{urllib.parse.quote(jid, safe='')}/auto-retry",
+            {},
+            timeout=15.0,
+            admin=True,
+        )
+        if code == 200 and isinstance(resp, dict) and resp.get("ok") is True:
+            results[jid] = "ok"
+        elif code in (404, 409):
+            results[jid] = "not_found" if code == 404 else "skipped_policy"
+        else:
+            errors.append(f"{jid}: http={code} resp={str(resp)[:200]}")
+    return results, "; ".join(errors)
+
 
 def main():
     state = load_state()
@@ -123,6 +144,7 @@ def main():
     skipped_capped = 0
     skipped_backoff = 0
     skipped_too_fresh = 0
+    skipped_policy = 0
 
     failed = fetch_failed_jobs()
     log(f"poll: {len(failed)} failed jobs to consider")
@@ -138,8 +160,15 @@ def main():
         if age < MIN_FAIL_AGE_SEC:
             skipped_too_fresh += 1
             continue
+        if not auto_retry_allowed(job):
+            skipped_policy += 1
+            continue
         entry = state.get(jid, {"count": 0, "next_at": 0})
-        if entry["count"] >= MAX_RETRIES:
+        local_count = entry.get("count", 0)
+        if not _is_non_negative_int(local_count):
+            skipped_policy += 1
+            continue
+        if local_count >= min(MAX_RETRIES, job["max_retries"]):
             skipped_capped += 1
             continue
         if entry.get("next_at", 0) > now:
@@ -148,7 +177,11 @@ def main():
 
         candidates.append((job, entry))
 
-    restore_results, restore_error = restore_jobs([job["id"] for job, _entry in candidates]) if candidates else ({}, "")
+    restore_results, restore_error = (
+        restore_jobs([job["id"] for job, _entry in candidates])
+        if candidates
+        else ({}, "")
+    )
     restore_failed = bool(restore_error)
     for job, entry in candidates:
         jid = job["id"]
@@ -159,8 +192,10 @@ def main():
             entry["next_at"] = now + BACKOFF_BASE * (2 ** (entry["count"] - 1))
             entry["last_kind"] = kind
             state[jid] = entry
-            log(f"restored {jid[:13]} kind={kind[:40]} attempt={entry['count']}/{MAX_RETRIES}")
-        elif restore_results.get(jid) in {"not_found", "skipped_done"}:
+            log(
+                f"restored {jid[:13]} kind={kind[:40]} attempt={entry['count']}/{min(MAX_RETRIES, job['max_retries'])}"
+            )
+        elif restore_results.get(jid) in {"not_found", "skipped_policy"}:
             log(f"skipped restoring {jid[:13]}: {restore_results[jid]}")
         else:
             restore_failed = True
@@ -168,8 +203,11 @@ def main():
             log(f"err restoring {jid[:13]}: {restore_error or outcome}")
 
     save_state(state)
-    log(f"summary: restored={restored} skipped_capped={skipped_capped} skipped_backoff={skipped_backoff} skipped_too_fresh={skipped_too_fresh}")
+    log(
+        f"summary: restored={restored} skipped_capped={skipped_capped} skipped_backoff={skipped_backoff} skipped_too_fresh={skipped_too_fresh} skipped_policy={skipped_policy}"
+    )
     return 1 if restore_failed else 0
+
 
 if __name__ == "__main__":
     sys.exit(main())

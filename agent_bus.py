@@ -13,6 +13,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import secrets
@@ -24,6 +25,7 @@ from contextlib import suppress
 from typing import Optional, Any, Literal
 
 import queue_logic
+import retry_policy
 from hive.persistence.factory import get_hive_repository
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -1805,7 +1807,7 @@ async def lifespan(app: FastAPI):
                         # statement below and is idempotent, so apply it here, in the
                         # same guarded-DDL block that already adds decline_count and
                         # relaxes CK_HIVE_JOBS_STATUS.
-                        log.warning(
+                        logging.warning(
                             "HIVE_JOBS.EXECUTION_SPEC absent; applying "
                             "migrations/2026-08-10-system-job-execution.sql inline"
                         )
@@ -3161,6 +3163,55 @@ async def update_job(job_id: str, req: JobUpdate, request: Request = None):
 
 
 
+@app.post("/v1/jobs/{job_id}/auto-retry", dependencies=[Depends(require_bus_admin)])
+async def auto_retry_job(job_id: str):
+    """Recheck stored retry policy under a row lock before consuming a retry."""
+    async with connect_db() as db:
+        try:
+            if HIVE_BACKEND == "sqlite":
+                await db.execute("BEGIN IMMEDIATE")
+            lock_clause = {
+                "sqlite": "",
+                "oracle": " FOR UPDATE",
+                "db2": " FOR UPDATE WITH RS USE AND KEEP UPDATE LOCKS",
+            }[HIVE_BACKEND]
+            async with db.execute(
+                "SELECT status, kind, max_retries, retry_count, result "
+                "FROM jobs WHERE id=?" + lock_clause,
+                (job_id,),
+            ) as cur:
+                row = await cur.fetchone()
+            if row is None:
+                raise HTTPException(404, "job not found")
+            status, kind, max_retries, retry_count, raw_result = row
+            try:
+                result = json.loads(raw_result) if raw_result else None
+            except (ValueError, TypeError):
+                result = None
+            job = {
+                "status": status,
+                "kind": kind,
+                "max_retries": max_retries,
+                "retry_count": retry_count,
+                "result": result,
+            }
+            if not retry_policy.auto_retry_allowed(job):
+                raise HTTPException(409, "job is not eligible for automatic retry")
+            await db.execute(
+                "UPDATE jobs SET status='queued', retry_count=retry_count+1, "
+                "claimed_by=NULL, claimed_at=NULL, claimed_runtime=NULL, "
+                "claimed_model=NULL, claimed_provider=NULL, claimed_cost_tier=NULL, "
+                "claim_lease_expires_at=NULL, ended_at=NULL, retry_backoff_until=NULL "
+                "WHERE id=?",
+                (job_id,),
+            )
+            await db.commit()
+        except BaseException:
+            await db.rollback()
+            raise
+    return {"ok": True, "id": job_id, "retry_count": retry_count + 1}
+
+
 class RequeueRequest(BaseModel):
     job_ids: list[str]
     reason: str = "manual-requeue"
@@ -3797,7 +3848,7 @@ async def list_jobs(
         columns.append("result")
     columns.extend([
         "estimated_cost_usd", "required_capabilities", "eligible_kinds",
-        "eligible_hosts", "execution_spec",
+        "eligible_hosts", "execution_spec", "max_retries", "retry_count",
     ])
     sql = f"SELECT {', '.join(columns)} FROM jobs WHERE 1=1"
     args: list = []
@@ -3855,6 +3906,7 @@ async def list_jobs(
                     "status": values["status"], "claimed_by": values["claimed_by"],
                     "started_at": values["started_at"], "ended_at": values["ended_at"],
                     "estimated_cost_usd": values["estimated_cost_usd"],
+                    "max_retries": values["max_retries"], "retry_count": values["retry_count"],
                     "required_capabilities": json.loads(values["required_capabilities"])
                     if values["required_capabilities"] else None,
                     "eligible_kinds": json.loads(values["eligible_kinds"])
