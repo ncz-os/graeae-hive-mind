@@ -822,6 +822,18 @@ NARROW_ALLOWLIST = ("cixmini-os:", "ncz-os-", "fleet-infra:")
 # of tearing down another owner's host. Remove once its gateway is fixed.
 QUARANTINED_HOSTS = set()  # all hosts un-quarantined 2026-06-14: proteus+typhon now proxmox workers, spark DGX-verified (operator directive)
 
+# 2026-10-02 (operator): hold sentinels are DEPRECATED. They existed to park jobs
+# behind the zeroclaw pre-submission gate, which is no longer enforced. Treat
+# these as unrestricted so their jobs are schedulable by capable workers.
+# ``rescue-superseded-hold`` is deliberately NOT in this set: those jobs are
+# superseded and must be cancelled rather than run.
+_HOLD_HOSTS = {
+    "codex-manual-rescue",
+    "rescue-guard-hold",
+    "completion-repair-hold",
+    "zcgate-release-sink",
+}
+
 # WORKSPACE AFFINITY — automatic required_capabilities injection + claim guard.
 # Workspace-scoped jobs must only be offered to workers that explicitly
 # advertise the matching workspace capability. This protects both newly
@@ -1190,6 +1202,7 @@ def job_agent_eligible(job: dict[str, Any], agent: dict[str, Any]) -> tuple[bool
         return False, f"agent kind aliases={sorted(eligible_aliases)!r} not in eligible_kinds={sorted(kinds)}"
 
     hosts = _norm_str_set(job.get("eligible_hosts"))
+    hosts = {h for h in hosts if h not in _HOLD_HOSTS}
     if hosts and "*" not in hosts and agent_host not in hosts:
         return False, f"agent host={agent_host!r} not in eligible_hosts={sorted(hosts)}"
 
