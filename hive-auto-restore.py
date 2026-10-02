@@ -11,6 +11,7 @@ Skip after MAX_RETRIES per job. After skip, leave in 'failed' permanently.
 """
 
 from __future__ import annotations
+
 import json
 import os
 import sys
@@ -25,9 +26,18 @@ STATE_DIR = Path("/var/lib/hive-auto-restore")
 STATE_FILE = STATE_DIR / "retry_counts.json"
 LOG_FILE = "/var/log/hive-auto-restore.log"
 
-MAX_RETRIES = 5          # never restore more than 5 times per job
-BACKOFF_BASE = 300       # 5 min after 1st fail, doubles each
-MIN_FAIL_AGE_SEC = 300    # only restore failures older than 60s (give workers time to truly finish)
+MAX_RETRIES = 5  # never restore more than 5 times per job
+BACKOFF_BASE = 300  # 5 min after 1st fail, doubles each
+MIN_FAIL_AGE_SEC = 300  # give workers five minutes to finish before retrying
+
+
+def auto_retry_allowed(job: dict) -> bool:
+    """Build jobs need an explicit retry signal; repeating failed code work is unsafe."""
+    if (job.get("kind") or "").startswith("build:"):
+        result = job.get("result") or {}
+        return isinstance(result, dict) and result.get("retryable") is True
+    return True
+
 
 def log(msg):
     line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}"
@@ -38,6 +48,7 @@ def log(msg):
     except Exception:
         pass
 
+
 def load_state():
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     if STATE_FILE.exists():
@@ -47,12 +58,16 @@ def load_state():
             return {}
     return {}
 
+
 def save_state(state):
     tmp = STATE_FILE.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(state))
     tmp.replace(STATE_FILE)
 
-def _http(method: str, path: str, body: dict | None = None, timeout: float = 15.0) -> tuple[int, dict | None]:
+
+def _http(
+    method: str, path: str, body: dict | None = None, timeout: float = 15.0
+) -> tuple[int, dict | None]:
     url = f"{HIVE_URL}{path}"
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(
@@ -74,6 +89,7 @@ def _http(method: str, path: str, body: dict | None = None, timeout: float = 15.
         log(f"http {method} {path}: {e}")
         return 0, None
 
+
 def fetch_failed_jobs(limit: int = 1000) -> list[dict]:
     query = urllib.parse.urlencode({"status": "failed", "limit": str(limit)})
     code, resp = _http("GET", f"/v1/jobs?{query}", timeout=15.0)
@@ -83,6 +99,7 @@ def fetch_failed_jobs(limit: int = 1000) -> list[dict]:
     jobs = resp.get("jobs", []) or []
     jobs.sort(key=lambda j: j.get("ended_at") or 0, reverse=True)
     return jobs
+
 
 def restore_job(jid: str) -> tuple[bool, str]:
     body = {
@@ -97,10 +114,13 @@ def restore_job(jid: str) -> tuple[bool, str]:
         "ended_at": None,
         "retry_backoff_until": None,
     }
-    code, resp = _http("PATCH", f"/v1/jobs/{urllib.parse.quote(jid, safe='')}", body, timeout=15.0)
+    code, resp = _http(
+        "PATCH", f"/v1/jobs/{urllib.parse.quote(jid, safe='')}", body, timeout=15.0
+    )
     if code in (200, 204):
         return True, ""
     return False, f"http={code} resp={str(resp)[:200]}"
+
 
 def main():
     state = load_state()
@@ -109,6 +129,7 @@ def main():
     skipped_capped = 0
     skipped_backoff = 0
     skipped_too_fresh = 0
+    skipped_nonretryable = 0
 
     failed = fetch_failed_jobs()
     log(f"poll: {len(failed)} failed jobs to consider")
@@ -118,6 +139,9 @@ def main():
         kind = job.get("kind") or ""
         ended_at = job.get("ended_at")
         if not jid:
+            continue
+        if not auto_retry_allowed(job):
+            skipped_nonretryable += 1
             continue
         age = now - (ended_at or 0)
         if age < MIN_FAIL_AGE_SEC:
@@ -138,13 +162,18 @@ def main():
             entry["next_at"] = now + BACKOFF_BASE * (2 ** (entry["count"] - 1))
             entry["last_kind"] = kind
             state[jid] = entry
-            log(f"restored {jid[:13]} kind={kind[:40]} attempt={entry['count']}/{MAX_RETRIES}")
+            log(
+                f"restored {jid[:13]} kind={kind[:40]} attempt={entry['count']}/{MAX_RETRIES}"
+            )
         else:
             log(f"err restoring {jid[:13]}: {err}")
 
     save_state(state)
-    log(f"summary: restored={restored} skipped_capped={skipped_capped} skipped_backoff={skipped_backoff} skipped_too_fresh={skipped_too_fresh}")
+    log(
+        f"summary: restored={restored} skipped_capped={skipped_capped} skipped_backoff={skipped_backoff} skipped_too_fresh={skipped_too_fresh} skipped_nonretryable={skipped_nonretryable}"
+    )
     return 0
+
 
 if __name__ == "__main__":
     sys.exit(main())
