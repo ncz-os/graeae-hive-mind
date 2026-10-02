@@ -71,6 +71,103 @@ def _http(method: str, path: str, body: dict | None = None) -> tuple[int, dict |
 _IS_MACOS = platform.system() == "Darwin"
 
 
+def _ipv4_for_iface(iface: str) -> str | None:
+    """First global IPv4 on a named interface (macOS fallback path)."""
+    try:
+        r = subprocess.run(["ifconfig", iface], capture_output=True, text=True, timeout=5)
+        m = re.search(r"inet\s+(?!127\.)(\d+\.\d+\.\d+\.\d+)", r.stdout)
+        return m.group(1) if m else None
+    except Exception:
+        return None
+
+
+def _primary_ipv4() -> str | None:
+    """The address the kernel would source outbound traffic from.
+
+    That is the LAN address a peer actually SSHes to, which is why it is not
+    simply the first address on the first interface.
+    """
+    if _IS_MACOS:
+        try:
+            r = subprocess.run(["route", "-n", "get", "default"],
+                               capture_output=True, text=True, timeout=5)
+            m = re.search(r"\binterface:\s*(\S+)", r.stdout)
+            if m:
+                return _ipv4_for_iface(m.group(1))
+        except Exception:
+            pass
+        return None
+    try:
+        r = subprocess.run(["ip", "-4", "route", "get", "1.1.1.1"],
+                           capture_output=True, text=True, timeout=5)
+        m = re.search(r"\bsrc\s+(\d+\.\d+\.\d+\.\d+)", r.stdout)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return None
+
+
+def network_specs() -> dict:
+    """Addresses peers should use to reach this host.
+
+    Published so any agent can refresh its own infrastructure notes from one
+    source instead of sweeping the segment and guessing. `primary_ip` is the
+    routable LAN address; `addresses` lists every global IPv4 so a host that
+    moves via DHCP leaves a recoverable trail. Refreshed on every heartbeat
+    because a DHCP lease can change under a long-lived watcher.
+    """
+    out: dict = {"addresses": [], "ipv6": [], "primary_ip": None}
+    try:
+        if _IS_MACOS:
+            r = subprocess.run(["ifconfig", "-a"], capture_output=True, text=True, timeout=5)
+            out["addresses"] = sorted(set(
+                re.findall(r"inet\s+(?!127\.)(\d+\.\d+\.\d+\.\d+)", r.stdout)))
+            out["ipv6"] = sorted(set(
+                re.findall(r"inet6\s+([0-9a-fA-F:]+)", r.stdout)))[:4]
+        else:
+            r = subprocess.run(["ip", "-4", "-j", "addr", "show"],
+                               capture_output=True, text=True, timeout=5)
+            for iface in (json.loads(r.stdout) if r.stdout.strip() else []):
+                if iface.get("ifname") == "lo":
+                    continue
+                out["addresses"].extend(
+                    a["local"] for a in iface.get("addr_info", [])
+                    if a.get("family") == "inet" and a.get("scope") == "global")
+            out["addresses"] = sorted(set(out["addresses"]))
+            r6 = subprocess.run(["ip", "-6", "-j", "addr", "show"],
+                                capture_output=True, text=True, timeout=5)
+            for iface in (json.loads(r6.stdout) if r6.stdout.strip() else []):
+                if iface.get("ifname") == "lo":
+                    continue
+                out["ipv6"].extend(
+                    a["local"] for a in iface.get("addr_info", [])
+                    if a.get("family") == "inet6" and a.get("scope") == "global")
+            out["ipv6"] = sorted(set(out["ipv6"]))[:4]
+    except Exception:
+        pass
+    # Drop the well-known container bridges. They are real interfaces, but a
+    # peer can never reach the host on them, and leaving them in the list
+    # invites an agent to record 172.17.0.1 as the host address.
+    def _is_bridge(addr: str) -> bool:
+        try:
+            o = [int(p) for p in addr.split(".")]
+        except ValueError:
+            return True
+        if o[0] == 172 and 16 <= o[1] <= 31:      # docker/podman default pools
+            return True
+        if o[:3] == [10, 0, 2]:                    # qemu slirp
+            return True
+        if o[0] == 169 and o[1] == 254:            # link-local
+            return True
+        return False
+
+    out["all_addresses"] = list(out["addresses"])
+    out["addresses"] = [a for a in out["addresses"] if not _is_bridge(a)]
+    out["primary_ip"] = _primary_ipv4() or (out["addresses"][0] if out["addresses"] else None)
+    return out
+
+
 def static_specs() -> dict:
     """One-shot specs gathered at startup."""
     out = {
@@ -80,6 +177,7 @@ def static_specs() -> dict:
         "kernel": platform.release(),
         "arch": platform.machine(),
         "python": sys.version.split()[0],
+        "network": network_specs(),
     }
     # CPU
     out["cpu_count"] = os.cpu_count()
@@ -434,6 +532,9 @@ def dynamic_load() -> dict:
         out["gpus_runtime"] = gpus_rt
     except Exception:
         pass
+    # Refresh addresses each beat: a DHCP lease can change under a
+    # long-lived watcher, and a stale address is worse than none.
+    out["network"] = network_specs()
     return out
 
 

@@ -2462,6 +2462,12 @@ async def list_hosts(include_stale: bool = False):
     Agents that last heartbeated > 60s ago are flagged as stale unless
     include_stale=true, in which case all are returned.
     Used by workers to make resource-aware routing decisions.
+
+    Also the single source of truth for host ADDRESSES: `ip` is the routable
+    LAN address a peer SSHes to, `addresses` lists every reachable IPv4, and
+    `network` carries the raw block (ipv6, all_addresses). The system watcher
+    reports these, so an agent can refresh its own infrastructure notes from
+    this response instead of sweeping the segment and guessing.
     """
     cutoff = time.time() - 60  # 60s stale threshold
     sql = ("SELECT urn, host, status, last_heartbeat, capabilities, metadata, subscription_pools "
@@ -2483,7 +2489,13 @@ async def list_hosts(include_stale: bool = False):
                 specs = meta.get("specs", {})
                 load  = meta.get("load", {})
                 age_s = time.time() - (r[3] or 0)
+                # Addresses arrive in specs at registration and are refreshed in load on
+                # every heartbeat; prefer load so a DHCP change is picked up promptly.
+                net = load.get("network") or specs.get("network") or {}
                 seen_hosts[h] = {
+                    "ip":               net.get("primary_ip"),
+                    "addresses":        net.get("addresses") or [],
+                    "network":          net,
                     "host":           h,
                     "urn":            r[0],
                     "status":         r[2],
