@@ -26,6 +26,7 @@ except ModuleNotFoundError:
     from hive.persistence import _sqlite_async as aiosqlite
 
 import queue_logic
+import retry_policy
 from hive.persistence.factory import get_hive_repository
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -821,6 +822,18 @@ NARROW_ALLOWLIST = ("cixmini-os:", "ncz-os-", "fleet-infra:")
 # of tearing down another owner's host. Remove once its gateway is fixed.
 QUARANTINED_HOSTS = set()  # all hosts un-quarantined 2026-06-14: proteus+typhon now proxmox workers, spark DGX-verified (operator directive)
 
+# 2026-10-02 (operator): hold sentinels are DEPRECATED. They existed to park jobs
+# behind the zeroclaw pre-submission gate, which is no longer enforced. Treat
+# these as unrestricted so their jobs are schedulable by capable workers.
+# ``rescue-superseded-hold`` is deliberately NOT in this set: those jobs are
+# superseded and must be cancelled rather than run.
+_HOLD_HOSTS = {
+    "codex-manual-rescue",
+    "rescue-guard-hold",
+    "completion-repair-hold",
+    "zcgate-release-sink",
+}
+
 # WORKSPACE AFFINITY — automatic required_capabilities injection + claim guard.
 # Workspace-scoped jobs must only be offered to workers that explicitly
 # advertise the matching workspace capability. This protects both newly
@@ -1189,6 +1202,7 @@ def job_agent_eligible(job: dict[str, Any], agent: dict[str, Any]) -> tuple[bool
         return False, f"agent kind aliases={sorted(eligible_aliases)!r} not in eligible_kinds={sorted(kinds)}"
 
     hosts = _norm_str_set(job.get("eligible_hosts"))
+    hosts = {h for h in hosts if h not in _HOLD_HOSTS}
     if hosts and "*" not in hosts and agent_host not in hosts:
         return False, f"agent host={agent_host!r} not in eligible_hosts={sorted(hosts)}"
 
@@ -2461,6 +2475,12 @@ async def list_hosts(include_stale: bool = False):
     Agents that last heartbeated > 60s ago are flagged as stale unless
     include_stale=true, in which case all are returned.
     Used by workers to make resource-aware routing decisions.
+
+    Also the single source of truth for host ADDRESSES: `ip` is the routable
+    LAN address a peer SSHes to, `addresses` lists every reachable IPv4, and
+    `network` carries the raw block (ipv6, all_addresses). The system watcher
+    reports these, so an agent can refresh its own infrastructure notes from
+    this response instead of sweeping the segment and guessing.
     """
     cutoff = time.time() - 60  # 60s stale threshold
     sql = ("SELECT urn, host, status, last_heartbeat, capabilities, metadata, subscription_pools "
@@ -2482,7 +2502,13 @@ async def list_hosts(include_stale: bool = False):
                 specs = meta.get("specs", {})
                 load  = meta.get("load", {})
                 age_s = time.time() - (r[3] or 0)
+                # Addresses arrive in specs at registration and are refreshed in load on
+                # every heartbeat; prefer load so a DHCP change is picked up promptly.
+                net = load.get("network") or specs.get("network") or {}
                 seen_hosts[h] = {
+                    "ip":               net.get("primary_ip"),
+                    "addresses":        net.get("addresses") or [],
+                    "network":          net,
                     "host":           h,
                     "urn":            r[0],
                     "status":         r[2],
@@ -3455,9 +3481,59 @@ async def update_job(job_id: str, req: JobUpdate):
 
 
 
+@app.post("/v1/jobs/{job_id}/auto-retry")
+async def auto_retry_job(job_id: str):
+    """Recheck stored retry policy under a row lock before consuming a retry."""
+    async with connect_db() as db:
+        try:
+            if HIVE_BACKEND == "sqlite":
+                await db.execute("BEGIN IMMEDIATE")
+            lock_clause = {
+                "sqlite": "",
+                "oracle": " FOR UPDATE",
+                "db2": " FOR UPDATE WITH RS USE AND KEEP UPDATE LOCKS",
+            }[HIVE_BACKEND]
+            async with db.execute(
+                "SELECT status, kind, max_retries, retry_count, result "
+                "FROM jobs WHERE id=?" + lock_clause,
+                (job_id,),
+            ) as cur:
+                row = await cur.fetchone()
+            if row is None:
+                raise HTTPException(404, "job not found")
+            status, kind, max_retries, retry_count, raw_result = row
+            try:
+                result = json.loads(raw_result) if raw_result else None
+            except (ValueError, TypeError):
+                result = None
+            job = {
+                "status": status,
+                "kind": kind,
+                "max_retries": max_retries,
+                "retry_count": retry_count,
+                "result": result,
+            }
+            if not retry_policy.auto_retry_allowed(job):
+                raise HTTPException(409, "job is not eligible for automatic retry")
+            await db.execute(
+                "UPDATE jobs SET status='queued', retry_count=retry_count+1, "
+                "claimed_by=NULL, claimed_at=NULL, claimed_runtime=NULL, "
+                "claimed_model=NULL, claimed_provider=NULL, claimed_cost_tier=NULL, "
+                "claim_lease_expires_at=NULL, ended_at=NULL, retry_backoff_until=NULL "
+                "WHERE id=?",
+                (job_id,),
+            )
+            await db.commit()
+        except BaseException:
+            await db.rollback()
+            raise
+    return {"ok": True, "id": job_id, "retry_count": retry_count + 1}
+
+
 class RequeueRequest(BaseModel):
     job_ids: list[str]
     reason: str = "manual-requeue"
+
 
 @app.post("/v1/admin/jobs/requeue")
 async def admin_requeue_jobs(req: RequeueRequest):
@@ -4573,7 +4649,7 @@ async def list_jobs(
             )
     sql = ("SELECT id, submitter_urn, parent_job_id, kind, description, priority, status, "
            "claimed_by, started_at, ended_at, result, estimated_cost_usd, "
-           "required_capabilities, eligible_kinds, eligible_hosts, site, repo, head_branch, pr_number FROM jobs WHERE 1=1")
+           "required_capabilities, eligible_kinds, eligible_hosts, site, repo, head_branch, pr_number, max_retries, retry_count FROM jobs WHERE 1=1")
     args: list = []
     cnt_sql = "SELECT COUNT(*) FROM jobs WHERE 1=1"
     cnt_args: list = []
@@ -4627,6 +4703,7 @@ async def list_jobs(
                     "eligible_hosts": json.loads(r[14]) if r[14] else None,
                     "site": r[15], "repo": r[16],
                     "head_branch": r[17], "pr_number": r[18],
+                    "max_retries": r[19], "retry_count": r[20],
                 })
     return {"count": len(rows), "total": total, "jobs": rows}
 
@@ -4639,7 +4716,7 @@ async def get_job(job_id: str):
         async with db.execute(
             "SELECT id, submitter_urn, parent_job_id, kind, description, priority, status, "
             "claimed_by, started_at, ended_at, result, estimated_cost_usd, "
-            "required_capabilities, eligible_kinds, eligible_hosts, site, repo, head_branch, pr_number FROM jobs WHERE id=?",
+            "required_capabilities, eligible_kinds, eligible_hosts, site, repo, head_branch, pr_number, max_retries, retry_count FROM jobs WHERE id=?",
             (job_id,)) as cur:
             r = await cur.fetchone()
     if not r:
@@ -4656,6 +4733,7 @@ async def get_job(job_id: str):
         "eligible_hosts": json.loads(r[14]) if r[14] else None,
         "site": r[15], "repo": r[16],
         "head_branch": r[17], "pr_number": r[18],
+        "max_retries": r[19], "retry_count": r[20],
     }
 
 

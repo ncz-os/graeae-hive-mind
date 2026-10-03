@@ -212,23 +212,54 @@ class WorkspaceRetentionTests(unittest.TestCase):
                 worker.register()
             http.assert_not_called()
 
-    def test_existing_workspace_is_never_erased_on_reclaim(self):
-        with tempfile.TemporaryDirectory(prefix="hive workspace '") as root:
+    def test_existing_workspace_is_moved_aside_intact_and_job_proceeds(self):
+        """2026-10-03: failing on an existing workspace killed every retry on
+        that host (23 jobs). The old checkout is now moved to .rescued/ intact
+        and the job clones fresh."""
+        with tempfile.TemporaryDirectory() as root:
             checkout = Path(root, JOB_ID)
             checkout.mkdir()
             (checkout / "unfinished.patch").write_text("rescue me")
+            cloned = []
+            calls = []
+
+            def fake_run(cmd, **kwargs):
+                calls.append(cmd)
+                if cmd[:4] == ["git", "-C", str(checkout), "log"]:
+                    return subprocess.CompletedProcess(cmd, 0, "abc123 unpushed work\n", "")
+                if cmd[:2] == ["git", "clone"]:
+                    cloned.append(cmd)
+                    raise subprocess.CalledProcessError(128, cmd)  # stop after the clone
+                return subprocess.CompletedProcess(cmd, 128, "", "not a git repo")
+
             with (
                 patch.object(worker, "WORKSPACE_ROOT", root),
+                patch.object(worker, "patch_job", return_value=True),
+                patch.object(worker.subprocess, "run", side_effect=fake_run),
+            ):
+                worker._run_job_inner(JOB)
+            pushes = [c for c in calls if c[3:4] == ["push"]]
+            self.assertTrue(all(worker.REPO_MAP["graeae-hive"] in c for c in pushes))
+            self.assertFalse(any("origin" in c for c in pushes), "never push to the checkout's own origin")
+            rescued = list(Path(root, ".rescued").glob(f"{JOB_ID}-*"))
+            self.assertEqual(len(rescued), 1, "old checkout must be moved, not erased")
+            self.assertEqual((rescued[0] / "unfinished.patch").read_text(), "rescue me")
+            self.assertTrue(cloned, "job must proceed to a fresh clone")
+
+    def test_rescue_move_failure_keeps_old_fail_and_preserve(self):
+        with tempfile.TemporaryDirectory() as root:
+            checkout = Path(root, JOB_ID)
+            checkout.mkdir()
+            with (
+                patch.object(worker, "WORKSPACE_ROOT", root),
+                patch.object(worker, "_rescue_workspace", return_value=None),
                 patch.object(worker, "patch_job", return_value=True) as recorded,
                 patch.object(worker.subprocess, "run") as clone,
             ):
                 worker._run_job_inner(JOB)
-            self.assertEqual((checkout / "unfinished.patch").read_text(), "rescue me")
             clone.assert_not_called()
             self.assertEqual(recorded.call_args.args[1], "failed")
-            self.assertEqual(
-                recorded.call_args.args[2]["workspace_preserved"], str(checkout)
-            )
+            self.assertEqual(recorded.call_args.args[2]["workspace_preserved"], str(checkout))
 
     def _run_driver(self, exit_code, recorded):
         with tempfile.TemporaryDirectory(prefix="hive workspace '") as root:
