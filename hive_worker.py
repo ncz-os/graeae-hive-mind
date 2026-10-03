@@ -298,6 +298,10 @@ def _quiet_windows(spec: str) -> list[tuple[int, int]]:
             bh, bm = (int(x) for x in b.split(":"))
         except ValueError:
             continue
+        # Reject out-of-range times: a typo like 99:00-100:00 would otherwise
+        # create a window that never matches and silently disable the switch.
+        if not (0 <= ah < 24 and 0 <= bh <= 24 and 0 <= am < 60 and 0 <= bm < 60):
+            continue
         out.append((ah * 60 + am, bh * 60 + bm))
     return out
 

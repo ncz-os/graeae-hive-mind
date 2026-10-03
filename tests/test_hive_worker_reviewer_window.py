@@ -45,3 +45,12 @@ def test_malformed_window_spec_is_ignored(monkeypatch):
     monkeypatch.setattr(worker, "REVIEWER_QUIET_WINDOWS", "junk,18:00-19:30")
     assert worker.review_model(at(8, 0)) == "gemma4-31b"
     assert worker.review_model(at(18, 30)) == "nvidia/nemotron-3-ultra-550b-a55b"
+
+
+def test_out_of_range_window_is_ignored_not_silently_applied(monkeypatch):
+    monkeypatch.setattr(
+        worker, "REVIEWER_QUIET_WINDOWS", "99:00-100:00,07:75-09:00,18:00-19:30"
+    )
+    assert worker._quiet_windows(worker.REVIEWER_QUIET_WINDOWS) == [
+        (18 * 60, 19 * 60 + 30)
+    ]
