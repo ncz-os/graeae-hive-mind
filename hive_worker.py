@@ -300,7 +300,12 @@ def deepseek_peak(now_utc=None) -> bool:
 
 def escalation_agent(job: dict, now_utc=None) -> str:
     """Return the zoder engine agent for this attempt of `job`, or "" to defer
-    to the host's own routing (no ladder, no host pin)."""
+    to the host's own routing (no ladder, no host pin).
+
+    Contract: `route:<alias>` names the STARTING rung. Each retry climbs one
+    rung from there and the top rung repeats once reached. An alias that is
+    not on the ladder becomes a rung of its own ahead of the paid rungs (the
+    local coder is skipped, since an explicit route outranks it)."""
     caps = job.get("required_capabilities") or []
     pinned = [
         c.split(":", 1)[1]
