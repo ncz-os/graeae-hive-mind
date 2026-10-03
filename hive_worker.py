@@ -304,6 +304,10 @@ def _quiet_windows(spec: str) -> list[tuple[int, int]]:
             continue
         if bh == 24 and bm != 0:  # only 24:00 is a valid end-of-day boundary
             continue
+        # Overnight windows are not supported: a reversed or empty interval would
+        # never match, so drop it instead of silently disabling the switch.
+        if bh * 60 + bm <= ah * 60 + am:
+            continue
         out.append((ah * 60 + am, bh * 60 + bm))
     return out
 
