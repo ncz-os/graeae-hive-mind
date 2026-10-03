@@ -313,7 +313,9 @@ def escalation_agent(job: dict, now_utc=None) -> str:
         if pinned[0] in ladder:
             start = ladder.index(pinned[0])
         else:
-            ladder = [pinned[0]] + ladder
+            # An explicit route outranks the local coder, so a retry climbs to
+            # the next paid rung rather than dropping back to qwen38.
+            ladder = [pinned[0]] + [r for r in ladder if r != "coder"]
     if not ladder:
         return ZODER_AGENT
     try:

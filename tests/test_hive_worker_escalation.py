@@ -63,10 +63,13 @@ def test_route_capability_starts_higher_on_the_ladder():
     assert worker.escalation_agent(job, SAT) == "minimax"
 
 
-def test_unknown_route_capability_runs_first_then_rejoins_ladder():
-    job = {"id": "a", "retry_count": 0, "required_capabilities": ["route:special"]}
+def test_unknown_route_capability_runs_first_then_climbs_past_coder():
+    job = job_with_flash_hash(
+        False, retry_count=0, required_capabilities=["route:special"]
+    )
     assert worker.escalation_agent(job, SAT) == "special"
-    assert worker.escalation_agent({**job, "retry_count": 1}, SAT) == "coder"
+    assert worker.escalation_agent({**job, "retry_count": 1}, SAT) == "minimax_flash"
+    assert worker.escalation_agent({**job, "retry_count": 2}, SAT) == "minimax"
 
 
 def test_garbage_retry_count_is_attempt_zero():
