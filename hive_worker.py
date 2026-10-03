@@ -136,6 +136,10 @@ REPO_MAP = {
     "ic-engine": "ssh://root@192.168.207.101/mnt/datapool/git/ic-engine.git",
     "florida-licenses": "ssh://root@192.168.207.101/mnt/datapool/git/florida-licenses.git",
     "graeae-hive": "ssh://root@192.168.207.101/mnt/datapool/git/graeae-hive.git",
+    # GitLab's ncz-os/graeae-hive-mind is this same codebase; ARGONAS keeps it as
+    # graeae-hive.git. Without this alias a job naming the GitLab repo was
+    # declined with no_repo_mapping.
+    "graeae-hive-mind": "ssh://root@192.168.207.101/mnt/datapool/git/graeae-hive.git",
     "zoder": "https://gitlab.com/ncz-os/zoder.git",
     "artistpack": "https://gitlab.com/ncz-os/artistpack.git",
     "ncz-screensavers": "ssh://root@192.168.207.101/mnt/datapool/git/ncz-screensavers.git",
