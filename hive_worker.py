@@ -275,6 +275,53 @@ ZODER_REVIEWER = os.environ.get("HIVE_ZODER_REVIEWER") or os.environ.get(
     "ZODER_REVIEWER", ""
 )
 
+# Reviewer quiet windows (2026-10-03): gemma4-31b on CERBERUS has 4 slots and
+# is shared with the RiskyEats narrator. Every zeroclaw slot reviewing on it
+# during the publish aggregate bursts starved the narrator ("all healthy
+# endpoints failed" rose from ~30/day to 387). Inside these local-time windows
+# the review goes to HIVE_ZODER_REVIEWER_ALT (EIH Nemotron) instead.
+ZODER_REVIEWER_ALT = os.environ.get(
+    "HIVE_ZODER_REVIEWER_ALT", "nvidia/nemotron-3-ultra-550b-a55b"
+)
+REVIEWER_QUIET_WINDOWS = os.environ.get(
+    "HIVE_ZODER_REVIEWER_QUIET_WINDOWS", "07:30-09:00,18:00-19:30"
+)
+REVIEWER_QUIET_TZ = os.environ.get("HIVE_ZODER_REVIEWER_QUIET_TZ", "America/New_York")
+
+
+def _quiet_windows(spec: str) -> list[tuple[int, int]]:
+    out = []
+    for part in spec.split(","):
+        try:
+            a, b = part.strip().split("-")
+            ah, am = (int(x) for x in a.split(":"))
+            bh, bm = (int(x) for x in b.split(":"))
+        except ValueError:
+            continue
+        out.append((ah * 60 + am, bh * 60 + bm))
+    return out
+
+
+def review_model(now_local=None) -> str:
+    """Reviewer for this run: the pinned one, or the alternate inside a quiet
+    window. Returns "" when no reviewer is pinned (zoder decides)."""
+    if not ZODER_REVIEWER:
+        return ""
+    if now_local is None:
+        try:
+            from datetime import datetime
+            from zoneinfo import ZoneInfo
+
+            now_local = datetime.now(ZoneInfo(REVIEWER_QUIET_TZ))
+        except Exception:  # noqa: BLE001 -- no tzdata: keep the pinned reviewer
+            return ZODER_REVIEWER
+    minute = now_local.hour * 60 + now_local.minute
+    for start, end in _quiet_windows(REVIEWER_QUIET_WINDOWS):
+        if start <= minute < end and ZODER_REVIEWER_ALT:
+            return ZODER_REVIEWER_ALT
+    return ZODER_REVIEWER
+
+
 # Escalation ladder (operator 2026-10-03): a retried job moves up a rung instead
 # of re-running the same model. Before this, every slot was pinned to `coder`
 # (qwen38), so a job the local coder could not do failed on every attempt with
@@ -996,8 +1043,9 @@ def _run_job_inner(job: dict) -> None:
                     f"(retry_count={job.get('retry_count') or 0})",
                     flush=True,
                 )
-            if ZODER_REVIEWER:
-                cmd += ["--reviewer", ZODER_REVIEWER]
+            reviewer = review_model()
+            if reviewer:
+                cmd += ["--reviewer", reviewer]
     else:
         cmd = [
             _find_driver("codex"),
