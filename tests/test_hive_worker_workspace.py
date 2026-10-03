@@ -33,8 +33,12 @@ class WorkspaceRetentionTests(unittest.TestCase):
             checkout.mkdir()
             (checkout / "unfinished.patch").write_text("rescue me")
             cloned = []
+            calls = []
 
             def fake_run(cmd, **kwargs):
+                calls.append(cmd)
+                if cmd[:4] == ["git", "-C", str(checkout), "log"]:
+                    return subprocess.CompletedProcess(cmd, 0, "abc123 unpushed work\n", "")
                 if cmd[:2] == ["git", "clone"]:
                     cloned.append(cmd)
                     raise subprocess.CalledProcessError(128, cmd)  # stop after the clone
@@ -46,6 +50,9 @@ class WorkspaceRetentionTests(unittest.TestCase):
                 patch.object(worker.subprocess, "run", side_effect=fake_run),
             ):
                 worker._run_job_inner(JOB)
+            pushes = [c for c in calls if c[3:4] == ["push"]]
+            self.assertTrue(all(worker.REPO_MAP["graeae-hive"] in c for c in pushes))
+            self.assertFalse(any("origin" in c for c in pushes), "never push to the checkout's own origin")
             rescued = list(Path(root, ".rescued").glob(f"{JOB_ID}-*"))
             self.assertEqual(len(rescued), 1, "old checkout must be moved, not erased")
             self.assertEqual((rescued[0] / "unfinished.patch").read_text(), "rescue me")

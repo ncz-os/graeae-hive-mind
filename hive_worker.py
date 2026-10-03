@@ -420,13 +420,14 @@ def run_job(job: dict) -> None:
         _current_job_id = None
 
 
-def _rescue_workspace(job_id: str, workdir: str) -> dict | None:
+def _rescue_workspace(job_id: str, workdir: str, repo_url: str) -> dict | None:
     """Move an existing job checkout aside without losing anything.
 
     Returns a description of what was preserved, or None if the move itself
     failed (the caller then keeps the old fail-and-preserve behaviour).
     Unpushed commits on the checked-out branch are also pushed to
-    rescue/hive-<job_id>-<ts> on the checkout's own origin, best effort, so a
+    rescue/hive-<job_id>-<ts> on the job's REPO_MAP URL (never the checkout's
+    own `origin`, which an earlier job could have rewritten), best effort, so a
     re-imaged host (HYDRA, 2026-10-03) cannot take them with it. Uncommitted
     edits stay in the moved directory; nothing is staged, stashed or deleted.
     """
@@ -442,7 +443,7 @@ def _rescue_workspace(job_id: str, workdir: str) -> dict | None:
         if unpushed.returncode == 0 and unpushed.stdout.strip():
             branch = f"rescue/hive-{job_id}-{ts}"
             pushed = subprocess.run(
-                ["git", "-C", workdir, "push", "--quiet", "origin", f"HEAD:refs/heads/{branch}"],
+                ["git", "-C", workdir, "push", "--quiet", repo_url, f"HEAD:refs/heads/{branch}"],
                 capture_output=True, text=True, timeout=300,
             )
             info["unpushed_commits"] = len(unpushed.stdout.strip().splitlines())
@@ -496,7 +497,7 @@ def _run_job_inner(job: dict) -> None:
         # were stuck as workspace_exists_needs_rescue on 2026-10-03. Move the
         # old checkout aside intact, push any unpushed commits to a rescue
         # branch so they survive host loss, then clone fresh.
-        rescued = _rescue_workspace(job_id, workdir)
+        rescued = _rescue_workspace(job_id, workdir, repo_url)
         if rescued is None:
             patch_job(
                 job_id,
