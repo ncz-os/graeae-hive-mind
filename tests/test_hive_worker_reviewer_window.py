@@ -54,3 +54,8 @@ def test_out_of_range_window_is_ignored_not_silently_applied(monkeypatch):
     assert worker._quiet_windows(worker.REVIEWER_QUIET_WINDOWS) == [
         (18 * 60, 19 * 60 + 30)
     ]
+
+
+def test_only_2400_is_a_valid_end_of_day():
+    assert worker._quiet_windows("07:30-24:30") == []
+    assert worker._quiet_windows("22:00-24:00") == [(22 * 60, 24 * 60)]

@@ -302,6 +302,8 @@ def _quiet_windows(spec: str) -> list[tuple[int, int]]:
         # create a window that never matches and silently disable the switch.
         if not (0 <= ah < 24 and 0 <= bh <= 24 and 0 <= am < 60 and 0 <= bm < 60):
             continue
+        if bh == 24 and bm != 0:  # only 24:00 is a valid end-of-day boundary
+            continue
         out.append((ah * 60 + am, bh * 60 + bm))
     return out
 
