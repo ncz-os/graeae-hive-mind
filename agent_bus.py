@@ -927,7 +927,10 @@ STATUS_TRANSITIONS: dict[str, set[str]] = {
     "running": {"queued", "running", "done", "failed", "cancelled", "needs-review"},
     "needs-review": {"needs-review", "done", "failed", "cancelled"},  # awaiting review; promotable
     "done": {"done", "cancelled"},  # allow cancelling fake/duplicate completions out of done
-    "failed": {"failed"},
+    # A failed job may be RETIRED as cancelled (superseded work), never
+    # reopened -- same exception as done -> cancelled. Without it a
+    # superseded failure stayed "failed" forever (2026-10-03).
+    "failed": {"failed", "cancelled"},
     "cancelled": {"cancelled"},
     "dead-letter": {"dead-letter"},  # terminal; idempotent same-status PATCH only
 }
@@ -3136,7 +3139,7 @@ async def update_job(job_id: str, req: JobUpdate):
                 )
 
             if (old_status in TERMINAL_JOB_STATUSES and req.status != old_status
-                    and not (old_status == "done" and req.status == "cancelled")):  # allow cancelling fake/dup completions
+                    and not (old_status in {"done", "failed"} and req.status == "cancelled")):  # retire fake/dup completions and superseded failures
                 await db.execute("ROLLBACK")
                 raise HTTPException(409, f"terminal job status {old_status!r} cannot be reopened by PATCH")
 
