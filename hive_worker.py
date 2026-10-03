@@ -274,9 +274,29 @@ def heartbeat_loop() -> None:
 # (which inherits this host's SSH agent / credential helpers) at an arbitrary
 # host. Only resolve against the known-repo map; never trust a bare URL from
 # the job (codex review finding, 2026-09-14).
+# URL forms are accepted ONLY when they normalize to a name already in
+# REPO_MAP; the clone then uses the REPO_MAP URL, never the job's string. That
+# keeps the 2026-09-14 guarantee (no arbitrary hosts) while letting jobs that
+# name the repo by its GitLab or ARGONAS URL resolve (4 jobs sat queued as
+# no_repo_mapping on 2026-10-03 for exactly this).
+_REPO_URL_RES = (
+    re.compile(r"^https://gitlab\.com/(?:ncz-os|argonautsystems)/([A-Za-z0-9._-]+?)(?:\.git)?/?$"),
+    re.compile(r"^git@gitlab\.com:(?:ncz-os|argonautsystems)/([A-Za-z0-9._-]+?)(?:\.git)?$"),
+    re.compile(r"^(?:ssh://)?(?:root|jasonperlow)@192\.168\.207\.101[:/]+mnt/datapool/git/([A-Za-z0-9._-]+?)\.git/?$"),
+)
+
+
 def resolve_repo_url(job: dict) -> str | None:
     repo = (job.get("repo") or "").strip()
-    return REPO_MAP.get(repo) if repo else None
+    if not repo:
+        return None
+    if repo in REPO_MAP:
+        return REPO_MAP[repo]
+    for rx in _REPO_URL_RES:
+        m = rx.match(repo)
+        if m and m.group(1) in REPO_MAP:
+            return REPO_MAP[m.group(1)]
+    return None
 
 
 # Bus job ids are UUIDv7 (see agent_bus.py uuidv7()). Enforced here because
@@ -400,6 +420,50 @@ def run_job(job: dict) -> None:
         _current_job_id = None
 
 
+def _rescue_workspace(job_id: str, workdir: str) -> dict | None:
+    """Move an existing job checkout aside without losing anything.
+
+    Returns a description of what was preserved, or None if the move itself
+    failed (the caller then keeps the old fail-and-preserve behaviour).
+    Unpushed commits on the checked-out branch are also pushed to
+    rescue/hive-<job_id>-<ts> on the checkout's own origin, best effort, so a
+    re-imaged host (HYDRA, 2026-10-03) cannot take them with it. Uncommitted
+    edits stay in the moved directory; nothing is staged, stashed or deleted.
+    """
+    ts = time.strftime("%Y%m%dT%H%M%S")
+    rescue_root = os.path.join(WORKSPACE_ROOT, ".rescued")
+    dest = os.path.join(rescue_root, f"{job_id}-{ts}")
+    info: dict = {"moved_to": dest}
+    try:
+        unpushed = subprocess.run(
+            ["git", "-C", workdir, "log", "--oneline", "HEAD", "--not", "--remotes"],
+            capture_output=True, text=True, timeout=60,
+        )
+        if unpushed.returncode == 0 and unpushed.stdout.strip():
+            branch = f"rescue/hive-{job_id}-{ts}"
+            pushed = subprocess.run(
+                ["git", "-C", workdir, "push", "--quiet", "origin", f"HEAD:refs/heads/{branch}"],
+                capture_output=True, text=True, timeout=300,
+            )
+            info["unpushed_commits"] = len(unpushed.stdout.strip().splitlines())
+            info["rescue_branch"] = branch if pushed.returncode == 0 else None
+        dirty = subprocess.run(
+            ["git", "-C", workdir, "status", "--porcelain"],
+            capture_output=True, text=True, timeout=60,
+        )
+        info["uncommitted_entries"] = len(dirty.stdout.splitlines()) if dirty.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError) as exc:
+        info["inspect_error"] = str(exc)[:200]
+    try:
+        os.makedirs(rescue_root, exist_ok=True)
+        os.rename(workdir, dest)
+    except OSError as exc:
+        print(f"[hive-worker:{WORKER_KIND}] job {job_id}: rescue move failed: {exc}", flush=True)
+        return None
+    print(f"[hive-worker:{WORKER_KIND}] job {job_id}: rescued prior workspace {info}", flush=True)
+    return info
+
+
 def _run_job_inner(job: dict) -> None:
     job_id = job["id"]
     kind = job.get("kind", "")
@@ -427,17 +491,23 @@ def _run_job_inner(job: dict) -> None:
     os.makedirs(WORKSPACE_ROOT, exist_ok=True)
     if os.path.exists(workdir):
         # A restored claim may carry unfinished edits from an earlier run.
-        # Never erase those edits to make room for another clone.
-        patch_job(
-            job_id,
-            "failed",
-            {
-                "via": "hive_worker",
-                "error": "workspace_exists_needs_rescue",
-                "workspace_preserved": workdir,
-            },
-        )
-        return
+        # Never erase them -- but failing the job outright (the old behaviour)
+        # made every retry/reclaim on the same host permanently dead: 23 jobs
+        # were stuck as workspace_exists_needs_rescue on 2026-10-03. Move the
+        # old checkout aside intact, push any unpushed commits to a rescue
+        # branch so they survive host loss, then clone fresh.
+        rescued = _rescue_workspace(job_id, workdir)
+        if rescued is None:
+            patch_job(
+                job_id,
+                "failed",
+                {
+                    "via": "hive_worker",
+                    "error": "workspace_exists_needs_rescue",
+                    "workspace_preserved": workdir,
+                },
+            )
+            return
 
     clone_cmd = ["git", "clone", "--quiet", repo_url, workdir]
     if head_branch:
