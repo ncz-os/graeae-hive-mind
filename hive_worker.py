@@ -275,6 +275,61 @@ ZODER_REVIEWER = os.environ.get("HIVE_ZODER_REVIEWER") or os.environ.get(
     "ZODER_REVIEWER", ""
 )
 
+# Escalation ladder (operator 2026-10-03): a retried job moves up a rung instead
+# of re-running the same model. Before this, every slot was pinned to `coder`
+# (qwen38), so a job the local coder could not do failed on every attempt with
+# "loop ended unresolved" and zero edits. Rung = the job's retry_count.
+#   coder   -> local qwen38 on TYDEUS (or the host's HIVE_ZODER_AGENT)
+#   flash   -> MiniMax-M3.1-Flash, balanced with deepseek-flash off-peak
+#   minimax -> MiniMax-M3
+# A job may start on a given rung with the capability `route:<alias>`.
+ZODER_LADDER = [
+    rung.strip()
+    for rung in os.environ.get("HIVE_ZODER_LADDER", "coder,flash,minimax").split(",")
+    if rung.strip()
+]
+
+
+def deepseek_peak(now_utc=None) -> bool:
+    """DeepSeek bills 2x 01:00-04:00 and 06:00-10:00 UTC, Mon-Fri (UTC weekday)."""
+    now_utc = now_utc or time.gmtime()
+    if now_utc.tm_wday >= 5:
+        return False
+    return 1 <= now_utc.tm_hour < 4 or 6 <= now_utc.tm_hour < 10
+
+
+def escalation_agent(job: dict, now_utc=None) -> str:
+    """Return the zoder engine agent for this attempt of `job`, or "" to defer
+    to the host's own routing (no ladder, no host pin)."""
+    caps = job.get("required_capabilities") or []
+    pinned = [
+        c.split(":", 1)[1]
+        for c in caps
+        if isinstance(c, str) and c.startswith("route:")
+    ]
+    ladder = list(ZODER_LADDER)
+    start = 0
+    if pinned and pinned[0]:
+        if pinned[0] in ladder:
+            start = ladder.index(pinned[0])
+        else:
+            ladder = [pinned[0]] + ladder
+    if not ladder:
+        return ZODER_AGENT
+    try:
+        retries = max(0, int(job.get("retry_count") or 0))
+    except (TypeError, ValueError):
+        retries = 0
+    rung = ladder[min(start + retries, len(ladder) - 1)]
+    if rung == "coder" and ZODER_AGENT:
+        return ZODER_AGENT
+    if rung == "flash":
+        digest = hashlib.sha256(str(job.get("id", "")).encode()).digest()
+        if digest[0] % 2 == 0 and not deepseek_peak(now_utc):
+            return "deepseek"
+        return "minimax_flash"
+    return rung
+
 # ARGONAS canonical bare repos. Extend as needed -- a job whose `repo` field
 # isn't a URL and isn't in this map gets DECLINED, never guessed at.
 REPO_MAP = {
@@ -926,8 +981,14 @@ def _run_job_inner(job: dict) -> None:
                 routes["reviewer_pool_routes"],
             ]
         else:
-            if ZODER_AGENT:
-                cmd += ["--agent", ZODER_AGENT, "--allow-paid"]
+            agent = escalation_agent(job)
+            if agent:
+                cmd += ["--agent", agent, "--allow-paid"]
+                print(
+                    f"[hive-worker:{WORKER_KIND}] job {job_id}: agent={agent} "
+                    f"(retry_count={job.get('retry_count') or 0})",
+                    flush=True,
+                )
             if ZODER_REVIEWER:
                 cmd += ["--reviewer", ZODER_REVIEWER]
     else:
